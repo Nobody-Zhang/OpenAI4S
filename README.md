@@ -29,6 +29,11 @@
 
 ---
 
+> [!TIP]
+> **Why "two cuts"?** OpenAI4S needs no pricey frontier-model key — it runs on **Doubao (豆包)** models from the cheapest tier of **Volcengine Ark (火山方舟)**'s Agent Plan: the **"Small" plan at ¥9.9 / month (≈ US$1.4)** — 20,000 Agent-fuel credits per month, multimodal (language · vision · embeddings) models, and built-in web search. Pick the `ark` provider in the UI, point OpenAI4S at that endpoint, and you get a Claude-Science-class Code-as-Action agent for less than a cup of coffee. *That's* the two cuts.
+
+---
+
 ## 🧬 Code-as-Action, not ReAct
 
 Most "AI agents" are **ReAct + `tool_use`**: each step the model emits one `tool_use` JSON, the host runs that single tool, and the loop repeats — the action space is a fixed menu. **OpenAI4S** instead emits **a cell of real Python/R code** that runs in a **persistent kernel**; every "tool" is a plain function on an in-kernel `host` object. The action space is a **Turing-complete language** — one turn can loop, branch, and call libraries while big objects stay resident in kernel memory.
@@ -78,12 +83,16 @@ host.save_artifact(plot(frames))             # ...only "<DataFrame 100000×20>" 
 
 <table>
 <tr>
-  <td width="50%"><b>Scientific API / MCP workflow</b><br/><img src="readme-gifs-hd/demo-01-hd.gif" alt="Scientific API / MCP workflow"></td>
-  <td width="50%"><b>Visual artifact editing</b><br/><img src="readme-gifs-hd/demo-02-hd.gif" alt="Visual artifact editing"></td>
+  <td width="50%"><b>Live API workflow</b> — from UniProt / RCSB to a 3D structure &amp; report<br/><img src="readme-gifs-hd/demo-01-hd.gif" alt="Live API workflow: from UniProt / RCSB to a 3D structure and report"></td>
+  <td width="50%"><b>Real-data analysis</b> — human insulin INS (P01308): from UniProt / RCSB to a reproducible report<br/><img src="readme-gifs-hd/demo-05-hd.gif" alt="Real-data analysis: human insulin INS / UniProt P01308 from UniProt / RCSB to a reproducible report"></td>
 </tr>
 <tr>
-  <td width="50%"><b>Plan-mode scientific analysis</b><br/><img src="readme-gifs-hd/demo-03-hd.gif" alt="Plan mode scientific analysis"></td>
-  <td width="50%"><b>Protein engineering</b><br/><img src="readme-gifs-hd/demo-04-hd.gif" alt="Protein engineering"></td>
+  <td width="50%"><b>Visual artifact editing</b> — “raise the confidence cutoff to 75” in one line<br/><img src="readme-gifs-hd/demo-02-hd.gif" alt="Visual artifact editing: raise the confidence cutoff to 75 in one line"></td>
+  <td width="50%"><b>Annotation-driven chart editing</b> — lasso a region &amp; recolor the legend<br/><img src="readme-gifs-hd/demo-06-hd.gif" alt="Annotation-driven chart editing: lasso a region and recolor the legend"></td>
+</tr>
+<tr>
+  <td width="50%"><b>Plan-mode research</b> — artemisinin &amp; paclitaxel solubility prediction<br/><img src="readme-gifs-hd/demo-03-hd.gif" alt="Plan-mode research: artemisinin and paclitaxel solubility prediction"></td>
+  <td width="50%"><b>Protein engineering</b> — from sequence to ranked mutants &amp; structural rationale<br/><img src="readme-gifs-hd/demo-04-hd.gif" alt="Protein engineering: from sequence to ranked mutants and structural rationale"></td>
 </tr>
 </table>
 

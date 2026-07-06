@@ -29,6 +29,11 @@
 
 ---
 
+> [!TIP]
+> **为什么是 9.9 元?** OpenAI4S 不需要昂贵的前沿模型 Key —— 它跑在**豆包**模型上,用的是 **火山方舟** Agent Plan 里最便宜的一档:**「体验版 Small」套餐,¥9.9 / 月** —— 每月 20,000 Agent 燃料值、语言 / 图像 / 向量化等多模态模型、开箱即用的联网搜索。在 UI 里把供应商选成 `ark`、指向这个接口,你就用不到一杯咖啡的钱得到了一个 Claude Science 级的 Code-as-Action 智能体。这,就是那「9.9 元」。
+
+---
+
 ## 🧬 代码即 Agent,而非 ReAct
 
 如今绝大多数「AI Agent」是 **ReAct + `tool_use`**:每一步,模型返回一个 `tool_use` JSON,宿主执行**单个**工具,再循环，也就是动作空间是一份固定菜单。**OpenAI4S** 则产出**一段真正的 Python/R 代码 cell**,在**持久内核**里执行;所有「工具」都是内核内 `host` 对象上的普通函数。它的动作空间是**一门图灵完备语言** —— 一个 turn 内即可循环、分支、调用库,而大对象常驻在内核内存里。
@@ -78,12 +83,16 @@ host.save_artifact(plot(frames))             # ……上下文里只留 "<DataFr
 
 <table>
 <tr>
-  <td width="50%"><b>科学 API / MCP 工作流</b><br/><img src="readme-gifs-hd/demo-01-hd.gif" alt="科学 API / MCP 工作流"></td>
-  <td width="50%"><b>可视化产物编辑</b><br/><img src="readme-gifs-hd/demo-02-hd.gif" alt="可视化产物编辑"></td>
+  <td width="50%"><b>Live API 工作流</b>:从 UniProt / RCSB 到 3D 结构和报告<br/><img src="readme-gifs-hd/demo-01-hd.gif" alt="Live API 工作流:从 UniProt / RCSB 到 3D 结构和报告"></td>
+  <td width="50%"><b>真实数据分析</b>:人胰岛素 INS 从 UniProt / RCSB 到可复现报告<br/><img src="readme-gifs-hd/demo-05-hd.gif" alt="真实数据分析:人胰岛素 INS 从 UniProt / RCSB 到可复现报告"></td>
 </tr>
 <tr>
-  <td width="50%"><b>计划模式科研分析</b><br/><img src="readme-gifs-hd/demo-03-hd.gif" alt="计划模式科研分析"></td>
-  <td width="50%"><b>蛋白质工程</b><br/><img src="readme-gifs-hd/demo-04-hd.gif" alt="蛋白质工程"></td>
+  <td width="50%"><b>可视化产物编辑</b>:一句话把 confidence 阈值线抬到 75<br/><img src="readme-gifs-hd/demo-02-hd.gif" alt="可视化产物编辑:一句话把 confidence 阈值线抬到 75"></td>
+  <td width="50%"><b>注释驱动图表编辑</b>:圈选区域并重绘图例配色<br/><img src="readme-gifs-hd/demo-06-hd.gif" alt="注释驱动图表编辑:圈选区域并重绘图例配色"></td>
+</tr>
+<tr>
+  <td width="50%"><b>计划模式科研分析</b>:青蒿素与紫杉醇溶解度预测<br/><img src="readme-gifs-hd/demo-03-hd.gif" alt="计划模式科研分析:青蒿素与紫杉醇溶解度预测"></td>
+  <td width="50%"><b>蛋白质工程</b>:从序列到突变候选与结构解释<br/><img src="readme-gifs-hd/demo-04-hd.gif" alt="蛋白质工程:从序列到突变候选与结构解释"></td>
 </tr>
 </table>
 
