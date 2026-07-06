@@ -30,7 +30,13 @@
 ---
 
 > [!TIP]
-> **为什么是 9.9 元?** OpenAI4S 不需要昂贵的前沿模型 Key —— 它跑在**豆包**模型上,用的是 **火山方舟** Agent Plan 里最便宜的一档:**「体验版 Small」套餐,¥9.9 / 月** —— 每月 20,000 Agent 燃料值、语言 / 图像 / 向量化等多模态模型、开箱即用的联网搜索。在 UI 里把供应商选成 `ark`、指向这个接口,你就用不到一杯咖啡的钱得到了一个 Claude Science 级的 Code-as-Action 智能体。这,就是那「9.9 元」。
+> **为什么是 9.9 元?** 不需要昂贵的前沿模型 Key —— OpenAI4S 跑在**豆包**上,用的是 **火山方舟** 最便宜的**「Small」套餐:¥9.9 / 月**。在 UI 里把供应商选成 `ark`,你就用不到一杯咖啡的钱得到了一个 Claude Science 级的智能体。
+
+<div align="center">
+<img src="docs/ark-agent-plan-9.9.png" alt="火山方舟 · Agent Plan —— Small 套餐 ¥9.9/月" width="760"/>
+<br/>
+<sub>火山方舟 · Agent Plan(个人版)—— 入门的 <b>Small</b> 套餐仅 <b>¥9.9 / 月</b>。</sub>
+</div>
 
 ---
 

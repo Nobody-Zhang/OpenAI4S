@@ -30,7 +30,13 @@
 ---
 
 > [!TIP]
-> **Why "two cuts"?** OpenAI4S needs no pricey frontier-model key — it runs on **Doubao (豆包)** models from the cheapest tier of **Volcengine Ark (火山方舟)**'s Agent Plan: the **"Small" plan at ¥9.9 / month (≈ US$1.4)** — 20,000 Agent-fuel credits per month, multimodal (language · vision · embeddings) models, and built-in web search. Pick the `ark` provider in the UI, point OpenAI4S at that endpoint, and you get a Claude-Science-class Code-as-Action agent for less than a cup of coffee. *That's* the two cuts.
+> **Why "two cuts"?** No pricey frontier-model key needed — OpenAI4S runs on **Doubao (豆包)** via the cheapest **"Small" plan on Volcengine Ark (火山方舟)**: **¥9.9 / month (≈ US$1.4)**. Pick the `ark` provider in the UI and you get a Claude-Science-class agent for less than a cup of coffee.
+
+<div align="center">
+<img src="docs/ark-agent-plan-9.9.png" alt="Volcengine Ark · Agent Plan — Small tier at ¥9.9/month" width="760"/>
+<br/>
+<sub>Volcengine Ark · Agent Plan (Personal) — the entry <b>Small</b> tier is <b>¥9.9 / month</b>.</sub>
+</div>
 
 ---
 
