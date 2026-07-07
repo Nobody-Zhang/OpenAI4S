@@ -1324,4 +1324,3 @@ If this document later becomes too large, split it mechanically into:
 - `docs/package-architecture.md` for sections B-E;
 - `docs/refactor-pr-roadmap.md` for sections G-K;
 - keep `docs/refactor-plan.md` as the executive index.
-

@@ -1,7 +1,10 @@
 """Tests for the opencode-style tool-call permission gate: rule resolution
 (store) + the blocking broker round-trip."""
+import json
 import threading
 import time
+
+import pytest
 
 from openai4s.config import Config, LLMConfig
 from openai4s.permissions import PermissionBroker, broker, suggest_patterns
@@ -410,3 +413,63 @@ def test_grep_and_glob_skip_secret_files(tmp_path):
     assert not any(".env" in (m.get("file") or "") for m in grep.get("matches", []))
     glob = disp("glob", [{"pattern": "*"}])
     assert not any(m.endswith(".env") for m in glob.get("matches", []))
+
+
+# --- secret reads/logs through the real dispatcher (PR 01) ----------------
+_SYNTH_SECRET = "sk-SYNTHETIC-SECRET-DO-NOT-LEAK-4f2a9c"
+
+
+def test_agent_query_cannot_read_settings_secret(tmp_path):
+    # A secret persisted under `settings` (the gateway stores the live API key
+    # there) must not be reachable through host.query. The handler raises
+    # PermissionError, which the worker turns into the soft-fail RuntimeError the
+    # agent sees; the secret never appears in the error.
+    disp, _frame, st = _dispatcher(tmp_path)
+    st.set_setting("llm_api_key", _SYNTH_SECRET)
+    with pytest.raises(PermissionError) as exc:
+        disp("query", [{"sql": "SELECT value FROM settings"}])
+    assert _SYNTH_SECRET not in str(exc.value)
+    # schema introspection also hides the secret-bearing table.
+    schema = disp("query_schema", [])
+    assert "settings" not in schema and "connectors" not in schema
+
+
+def test_credentials_set_secret_never_in_host_call_log(tmp_path):
+    # credentials_set runs (headless dispatcher passes the gate) and stores the
+    # value in the in-memory vault, but its plaintext must never reach the
+    # host_call_log preview.
+    disp, _frame, st = _dispatcher(tmp_path)
+    out = disp("credentials_set", [{"name": "HF_TOKEN", "value": _SYNTH_SECRET}])
+    assert out.get("ok") is True
+    # the value round-trips in-process…
+    got = disp("credentials_get", ["HF_TOKEN"])
+    assert got["value"] == _SYNTH_SECRET
+    # …but is nowhere in the persisted audit log.
+    rows = st._conn.execute("SELECT method, args_preview FROM host_call_log").fetchall()
+    assert not any(_SYNTH_SECRET in (r["args_preview"] or "") for r in rows)
+    # credentials_get is not logged at all; credentials_set is logged, redacted.
+    methods = {r["method"] for r in rows}
+    assert "credentials_get" not in methods
+
+
+def test_recorder_never_tapes_credentials_set(tmp_path):
+    # The replay-tape recorder must skip SECRET_ARG_HOST_CALLS: an exported
+    # notebook tape must never carry a plaintext credential.
+    from openai4s.replay import TapeRecorder
+
+    disp, _frame, _st = _dispatcher(tmp_path)
+    rec = TapeRecorder(tmp_path / "openai4s_tape.json")
+    disp.recorder = rec
+
+    # a benign successful call IS taped — proves the recorder is live…
+    disp("glob", [{"pattern": "*.py"}])
+    assert any(r["method"] == "glob" for r in rec.records)
+
+    # …but a successful credentials_set never reaches the tape.
+    out = disp("credentials_set", [{"name": "HF_TOKEN", "value": _SYNTH_SECRET}])
+    assert out.get("ok") is True
+    assert not any(r["method"] == "credentials_set" for r in rec.records)
+    # and the plaintext secret appears nowhere in the tape, in memory or on disk.
+    assert _SYNTH_SECRET not in json.dumps(rec.records, ensure_ascii=False)
+    tape_file = rec.flush()
+    assert _SYNTH_SECRET not in tape_file.read_text()

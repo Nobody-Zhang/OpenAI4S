@@ -14,7 +14,13 @@ as turns/cells/artifacts/compactions happen. Schema and write paths:
   managed_endpoints local model endpoints
   notes             project notes
   lineage_edges     object-level data lineage: input_version -> output_version
-  host_call_log     RPC audit (DERIVABLE_HOST_CALLS are NOT logged —)
+  host_call_log     RPC audit (DERIVABLE_HOST_CALLS are NOT logged; the args of
+                    SECRET_ARG_HOST_CALLS are redacted before write)
+
+Secret-bearing tables (`settings` holds the LLM API key + model profiles,
+`connectors` holds MCP server env/command) plus the internal audit/memory tables
+are on QUERY_DENYLIST, so `host.query` refuses to read them and `host.query`'s
+schema view hides them.
 
 All timestamps are epoch-ms. Booleans are 0/1. One DB per data_dir.
 """
@@ -311,11 +317,45 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_perm ON permission_rules(scope, scope_id, t
 CREATE INDEX IF NOT EXISTS ix_perm_scope ON permission_rules(scope, scope_id);
 """
 
-# host.* methods that must NEVER be persisted to host_call_log (credentials)
+# host.* methods that must NEVER be persisted to host_call_log (credential
+# reads: the value is already returned to the caller, logging it only duplicates
+# the secret at rest).
 DERIVABLE_HOST_CALLS = frozenset({"credentials_get", "credentials_list"})
 
-# tables host.query must refuse to read (secrets/memory) — denylist
-QUERY_DENYLIST = frozenset({"memories", "host_call_log", "permission_rules"})
+# host.* methods whose ARGS carry a raw secret value. The method name is still
+# logged for audit, but the args preview is redacted before it reaches
+# host_call_log (and such calls are excluded from the replay tape) so a plaintext
+# credential can never be serialized into SQLite or an exported notebook.
+SECRET_ARG_HOST_CALLS = frozenset({"credentials_set"})
+
+# Tables host.query must refuse to read. These hold secrets or
+# internal audit/memory state that is not part of the agent-visible data model:
+#   settings          -> LLM API key + model profiles (which embed API keys)
+#   connectors        -> MCP server env vars / launch command (may embed tokens)
+#   memories          -> memory blocks (surfaced through host.remember, not SQL)
+#   host_call_log     -> RPC audit trail
+#   permission_rules  -> permission broker state
+QUERY_DENYLIST = frozenset(
+    {"settings", "connectors", "memories", "host_call_log", "permission_rules"}
+)
+
+# Single-quoted string literals and SQL comments are stripped before the denylist
+# substring test so a denied table name that appears only inside a *literal*
+# (e.g. SELECT 'see settings' AS note) is not falsely rejected — a real table
+# reference can never live inside a string literal. Double-quoted / bracketed /
+# backtick spans are left intact because SQL uses them to quote identifiers
+# (e.g. FROM "settings"), which must still trip the denylist.
+_SQL_LITERAL_RE = re.compile(
+    r"'(?:[^']|'')*'"  # single-quoted string (with '' escape)
+    r"|--[^\n]*"  # line comment
+    r"|/\*.*?\*/",  # block comment
+    re.DOTALL,
+)
+
+
+def _strip_sql_literals(sql: str) -> str:
+    """Blank out single-quoted string literals and comments for denylist checks."""
+    return _SQL_LITERAL_RE.sub(" ", sql or "")
 
 
 def _now_ms() -> int:
@@ -2382,10 +2422,14 @@ class Store:
     ) -> None:
         if method in DERIVABLE_HOST_CALLS:
             return  # never persisted (credentials scrubber)
-        try:
-            preview = json.dumps(args, ensure_ascii=False)[:500]
-        except (TypeError, ValueError):
-            preview = "<unserializable>"
+        if method in SECRET_ARG_HOST_CALLS:
+            # audit that the call happened, but never the secret payload.
+            preview = "<redacted secret args>"
+        else:
+            try:
+                preview = json.dumps(args, ensure_ascii=False)[:500]
+            except (TypeError, ValueError):
+                preview = "<unserializable>"
         self._exec(
             "INSERT INTO host_call_log(call_id,frame_id,method,args_preview,ok,"
             "created_at) VALUES(?,?,?,?,?,?)",
@@ -2409,8 +2453,12 @@ class Store:
     ) -> list[dict]:
         """Run a read-only SELECT/CTE. Enforces denylist + timeout."""
         lowered = sql.lower()
+        # Denylist check runs against a literal-stripped copy so a denied name
+        # inside a string literal/comment is not a false positive, while a real
+        # (possibly identifier-quoted) table reference still trips it.
+        deny_scan = _strip_sql_literals(lowered)
         for bad in QUERY_DENYLIST:
-            if bad in lowered:
+            if bad in deny_scan:
                 raise PermissionError(f"host.query: table '{bad}' is not readable")
         stripped = lowered.lstrip()
         if not (stripped.startswith("select") or stripped.startswith("with")):

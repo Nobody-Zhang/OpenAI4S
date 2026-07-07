@@ -14,6 +14,15 @@ The daemon runs agent-authored code with **no OS-level sandbox** (no Seatbelt / 
 
 Additional enforcement: an opencode-style **permission broker** gates risk-bearing tools, a **secret-file guard** blocks `.env` / `*.key` / `id_rsa` from all file tools, and every file/shell op is **workspace-jailed**.
 
+### Secret reads and secret logs
+
+The agent can introspect its own SQLite store through the read-only `host.query`, so secret-bearing tables are **denylisted** and never reach it:
+
+- `host.query` refuses any statement that references `settings` (the live LLM API key + saved model profiles), `connectors` (MCP server env / launch command), `memories`, `host_call_log`, or `permission_rules`. `host.query.schema()` also hides these tables. The check runs against a copy with single-quoted string literals and comments stripped, so a denied word appearing only inside a literal (e.g. `SELECT 'settings' AS note`) is not falsely rejected, while an identifier-quoted table reference (`FROM "settings"`) still trips it.
+- Because the denylist is a table-name match, a query that reads the unrelated `agents.connectors` *column* is also refused; no bundled skill relies on that read.
+
+Credential values passed to `host.credentials.set(name, value)` are held only in an in-memory vault (never persisted). To keep that true end to end, the **RPC audit log** redacts them: `credentials_get` / `credentials_list` are not logged at all, and `credentials_set` is logged for audit **with its args redacted** — the plaintext value never enters `host_call_log`. The replay tape recorder likewise skips `credentials_set`, so an exported notebook cannot carry a plaintext credential.
+
 ## Remote access
 
 The daemon binds `127.0.0.1` by default. Reach the UI over an SSH tunnel — **never** expose `0.0.0.0` on an untrusted network:

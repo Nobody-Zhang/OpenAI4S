@@ -8,6 +8,7 @@ Covers the four re-implemented report layers, all offline (LLM mocked):
   * their integration into the agent loop and the config toggles.
 """
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -352,3 +353,108 @@ def test_agent_loop_runs_safe_cell(monkeypatch):
     result = agent.run("compute 6*7")
     assert result["stop_reason"] == "submitted"
     assert result["submitted_output"]["output"] == {"answer": 42}
+
+
+# --- secret-read / secret-log blockers (PR 01) --------------------------- #
+# A synthetic secret that must never surface through host.query results or the
+# host_call_log. Distinctive so a leak is unambiguous when grepping outputs.
+_SYNTH_SECRET = "sk-SYNTHETIC-SECRET-DO-NOT-LEAK-4f2a9c"
+
+
+def _secret_store(tmp_path):
+    from openai4s.config import LLMConfig
+    from openai4s.store import get_store
+
+    cfg = Config(data_dir=tmp_path, llm=LLMConfig(provider="deepseek", api_key="k"))
+    return get_store(cfg.db_path)
+
+
+def test_query_denylist_blocks_settings_api_key(tmp_path):
+    # The gateway persists the live API key + model profiles under `settings`.
+    st = _secret_store(tmp_path)
+    st.set_setting("llm_api_key", _SYNTH_SECRET)
+    st.set_model_profiles([{"provider": "deepseek", "api_key": _SYNTH_SECRET}])
+
+    for sql in (
+        "SELECT value FROM settings",
+        "SELECT value FROM settings WHERE key='llm_api_key'",
+        'SELECT value FROM "settings"',  # identifier-quoted table still trips
+        "WITH s AS (SELECT * FROM settings) SELECT * FROM s",
+    ):
+        with pytest.raises(PermissionError):
+            st.query(sql)
+
+    # A non-secret table stays readable, and no secret is reachable via it.
+    st.new_frame(kind="turn")
+    rows = st.query("SELECT frame_id FROM frames LIMIT 5")
+    assert not any(_SYNTH_SECRET in str(r) for r in rows)
+
+
+def test_query_denylist_blocks_connectors(tmp_path):
+    st = _secret_store(tmp_path)
+    with pytest.raises(PermissionError):
+        st.query("SELECT env FROM connectors")
+
+
+def test_query_schema_hides_secret_tables(tmp_path):
+    st = _secret_store(tmp_path)
+    st.set_setting("llm_api_key", _SYNTH_SECRET)
+    schema = st.schema()
+    for hidden in ("settings", "connectors", "memories", "host_call_log"):
+        assert hidden not in schema
+    # the agent-visible data model is still exposed
+    assert "frames" in schema and "execution_log" in schema
+
+
+def test_query_denylist_allows_literal_mention(tmp_path):
+    # A denied *word* appearing only inside a string literal is data, not a
+    # table reference, so it must not be falsely rejected.
+    st = _secret_store(tmp_path)
+    rows = st.query("SELECT 'settings are fine as text' AS note")
+    assert rows and rows[0]["note"] == "settings are fine as text"
+
+
+def test_credentials_set_args_redacted_in_host_call_log(tmp_path):
+    from openai4s.store import DERIVABLE_HOST_CALLS
+
+    st = _secret_store(tmp_path)
+    # credentials_get/list are never logged at all…
+    assert "credentials_get" in DERIVABLE_HOST_CALLS
+    # …and credentials_set is logged for audit but with its secret args redacted.
+    st.log_host_call(
+        method="credentials_set",
+        args=[{"name": "HF_TOKEN", "value": _SYNTH_SECRET}],
+        ok=True,
+        frame_id="frame-x",
+    )
+    rows = st._conn.execute(
+        "SELECT method, args_preview FROM host_call_log WHERE method='credentials_set'"
+    ).fetchall()
+    assert rows, "credentials_set should still be audited (method logged)"
+    for r in rows:
+        assert _SYNTH_SECRET not in (r["args_preview"] or "")
+    # belt-and-suspenders: the secret is nowhere in the whole log table.
+    dump = st._conn.execute("SELECT args_preview FROM host_call_log").fetchall()
+    assert not any(_SYNTH_SECRET in (r["args_preview"] or "") for r in dump)
+
+
+def test_query_split_identifier_bypass_does_not_leak_secret(tmp_path):
+    # Comment/concat tricks that split the denied identifier — `set/**/tings`
+    # slips past the substring denylist because the comment-stripper turns the
+    # block comment into whitespace ("set tings"), and `"set"||"tings"` never
+    # forms the substring at all. Neither may reach the secret: SQLite likewise
+    # treats the comment as whitespace (no `settings` reference ever forms) and
+    # `||` is invalid in a FROM clause, so both die as syntax errors. Whatever
+    # the failure mode — denylist refusal or SQLite error — the synthetic
+    # secret must never appear in a result row or the error message.
+    st = _secret_store(tmp_path)
+    st.set_setting("llm_api_key", _SYNTH_SECRET)
+
+    for sql in (
+        "SELECT * FROM set/**/tings",
+        'SELECT * FROM "set"||"tings"',
+        "SELECT value FROM set/**/tings WHERE key='llm_api_key'",
+    ):
+        with pytest.raises((PermissionError, sqlite3.Error)) as exc:
+            st.query(sql)
+        assert _SYNTH_SECRET not in str(exc.value)

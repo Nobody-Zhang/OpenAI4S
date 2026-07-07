@@ -27,7 +27,7 @@ from typing import Any, Callable
 
 from openai4s.config import Config, get_config
 from openai4s.llm import chat
-from openai4s.store import get_store
+from openai4s.store import SECRET_ARG_HOST_CALLS, get_store
 
 # frames client-side status enum (host silently returns empty on typo)
 _OP_FRAMES_VALID_STATUS = frozenset(
@@ -600,8 +600,10 @@ class HostDispatcher:
                 except Exception:  # noqa: BLE001
                     pass
             # : record to tape only on success (a failed call did not
-            # produce a reproducible value to replay).
-            if self.recorder is not None and ok:
+            # produce a reproducible value to replay). Secret-bearing args
+            # (credentials_set) are never taped — an exported notebook must not
+            # carry a plaintext credential.
+            if self.recorder is not None and ok and method not in SECRET_ARG_HOST_CALLS:
                 try:
                     self.recorder.record(method, args, result)
                 except Exception:  # noqa: BLE001 - taping must never break a run
