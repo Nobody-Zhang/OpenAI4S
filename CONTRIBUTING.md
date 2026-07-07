@@ -27,13 +27,17 @@ policy. The technical conventions live in [`CLAUDE.md`](CLAUDE.md) /
 
 | Prefix | Use for |
 | --- | --- |
-| `feature/runtime/<name>` | Agent loop, kernel, host API, store |
-| `feature/web/<name>` | Gateway, REST/WebSocket API, web UI |
-| `feature/science/<name>` | Skills, science recipes, envs |
-| `feature/harness/<name>` | Test harness, evals, fakes, golden traces |
-| `feature/platform/<name>` | Compute providers, endpoints, worker runtime |
+| `feat/<name>` | New features (runtime, platform, compute, ...) |
 | `fix/<name>` | Bug fixes |
 | `docs/<name>` | Documentation-only changes |
+| `test/<name>` | Tests, contract coverage, fixtures |
+| `refactor/<name>` | Refactors with no behavior change |
+| `chore/<name>` | Tooling, CI, maintenance |
+| `ui/<name>` | Web UI / frontend |
+| `harness/<name>` | Test harness, evals, fakes, golden traces |
+| `science/<name>` | Skills, science recipes, envs |
+| `release/<name>` | Release preparation |
+| `hotfix/<name>` | Urgent fixes on top of a release |
 
 External PRs should target `main` (or a specific, announced `next` branch
 during a coordinated integration window — never anything else).

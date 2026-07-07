@@ -206,7 +206,7 @@ uv run pre-commit run --all-files   # 全量格式化 + lint
 ## 🤝 社区贡献者
 
 <a href="https://github.com/PKU-YuanGroup/OpenAI4S/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=PKU-YuanGroup/OpenAI4S" alt="OpenAI4S contributors" />
+  <img src="https://contrib.rocks/image?repo=PKU-YuanGroup/OpenAI4S&v=20260707" alt="OpenAI4S contributors" />
 </a>
 
 ---

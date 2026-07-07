@@ -1,0 +1,81 @@
+name: Feature request
+description: Suggest a public, engineering-level improvement.
+title: "[Feature]: "
+labels: ["type/feature", "status/needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please keep feature requests public-safe and engineering-focused.
+        Do not include internal plans, private data, or unpublished research details.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Web UI / frontend
+        - Agent / loop / delegation
+        - Kernel / host RPC / runtime
+        - Server / gateway / API
+        - Store / provenance / artifacts
+        - Skills / science runtime
+        - Compute / remote execution
+        - CLI / config / packaging
+        - Tests / harness / CI
+        - Docs
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or motivation
+      description: What user-facing or engineering problem should this solve?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the desired behavior or interface.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Optional. What other approaches were considered?
+
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation
+      description: How should we know this works?
+      placeholder: |
+        Tests:
+        Manual checks:
+        Acceptance criteria:
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options:
+        - P0 - release blocker
+        - P1 - important
+        - P2 - normal
+        - P3 - nice to have
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: disclosure
+    attributes:
+      label: Public disclosure check
+      options:
+        - label: This request does not disclose private data, internal assignments, unpublished plans, or unreleased results.
+          required: true

@@ -1,0 +1,83 @@
+name: Engineering task
+description: Track a concrete implementation, cleanup, test, or documentation task.
+title: "[Task]: "
+labels: ["type/task", "status/needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for scoped engineering work. Keep the issue public-safe.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Web UI / frontend
+        - Agent / loop / delegation
+        - Kernel / host RPC / runtime
+        - Server / gateway / API
+        - Store / provenance / artifacts
+        - Skills / science runtime
+        - Compute / remote execution
+        - CLI / config / packaging
+        - Tests / harness / CI
+        - Docs
+        - Release / packaging
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: objective
+    attributes:
+      label: Objective
+      description: What should be completed?
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: What files, modules, or behavior are in scope?
+
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+      description: What should this task intentionally avoid?
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: What must be true for this task to be done?
+      placeholder: |
+        - ...
+        - ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: validation
+    attributes:
+      label: Verification plan
+      description: Tests, smoke checks, or manual validation expected.
+      placeholder: |
+        - uv run pytest ...
+        - manual check ...
+
+  - type: textarea
+    id: risks
+    attributes:
+      label: Risks or reviewer focus
+      description: Hotspot files, protocol changes, compatibility concerns, or security-sensitive areas.
+
+  - type: checkboxes
+    id: disclosure
+    attributes:
+      label: Public disclosure check
+      options:
+        - label: This issue only contains public engineering information.
+          required: true

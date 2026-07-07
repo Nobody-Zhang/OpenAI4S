@@ -210,7 +210,7 @@ Released under the **MIT License** — see [`LICENSE`](LICENSE).
 ## 🤝 Community contributors
 
 <a href="https://github.com/PKU-YuanGroup/OpenAI4S/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=PKU-YuanGroup/OpenAI4S" alt="OpenAI4S contributors" />
+  <img src="https://contrib.rocks/image?repo=PKU-YuanGroup/OpenAI4S&v=20260707" alt="OpenAI4S contributors" />
 </a>
 
 ---

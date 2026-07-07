@@ -1,0 +1,115 @@
+name: Bug report
+description: Report a reproducible problem in OpenAI4S.
+title: "[Bug]: "
+labels: ["type/bug", "status/needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. OpenAI4S is a public repository.
+        Do not include secrets, private data, unpublished research plans, or unreleased results.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of the project is affected?
+      options:
+        - Web UI / frontend
+        - Agent / loop / delegation
+        - Kernel / host RPC / runtime
+        - Server / gateway / API
+        - Store / provenance / artifacts
+        - Skills / science runtime
+        - Compute / remote execution
+        - CLI / config / packaging
+        - Tests / harness / CI
+        - Docs
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: current_behavior
+    attributes:
+      label: Current behavior
+      description: What happened?
+      placeholder: Describe the observed behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected_behavior
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Provide the smallest public reproduction you can.
+      placeholder: |
+        1. Run ...
+        2. Open ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Commit SHA, tag, branch, or package version.
+      placeholder: "e.g. main@abc1234 or v0.1.0"
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python version, uv version, browser, and relevant env vars without secrets.
+      placeholder: |
+        OS:
+        Python:
+        uv:
+        Browser:
+        Relevant env:
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: Paste minimal logs or attach screenshots. Redact secrets and private paths.
+      render: text
+
+  - type: textarea
+    id: verification
+    attributes:
+      label: Checks already tried
+      description: Commands or manual checks you already ran.
+      placeholder: |
+        Ran:
+        Not run:
+        Notes:
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      options:
+        - P0 - blocks main workflow or release
+        - P1 - important bug
+        - P2 - normal bug
+        - P3 - minor issue
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: disclosure
+    attributes:
+      label: Public disclosure check
+      options:
+        - label: I have removed secrets, private data, local absolute paths, and unreleased research details.
+          required: true

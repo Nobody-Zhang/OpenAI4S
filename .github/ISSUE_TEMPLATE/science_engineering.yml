@@ -1,0 +1,78 @@
+name: Science engineering support
+description: Request public engineering work related to skills, harnesses, runtime, or examples.
+title: "[Science]: "
+labels: ["area/science", "status/needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template only for public engineering work.
+        Do not include unpublished workflow details, internal assignments, private data,
+        benchmark details, or unreleased experimental results.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Engineering area
+      options:
+        - Skill runtime / loading
+        - Input / output schema
+        - Artifacts / provenance
+        - Harness / evaluation plumbing
+        - Dependency / environment handling
+        - Compute / GPU execution
+        - Docs / examples
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: Public engineering goal
+      description: Describe the engineering change without disclosing internal research plans.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected_interface
+    attributes:
+      label: Expected interface or behavior
+      description: What should users or developers be able to do?
+
+  - type: textarea
+    id: minimal_example
+    attributes:
+      label: Minimal public example
+      description: Provide a toy, synthetic, or public example if possible.
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies and runtime impact
+      description: New packages, optional imports, GPU needs, external tools, or environment changes.
+      placeholder: |
+        New dependencies:
+        Optional or required:
+        GPU needed:
+        Runtime notes:
+
+  - type: textarea
+    id: validation
+    attributes:
+      label: Verification plan
+      description: How can reviewers validate this without private data or unreleased results?
+      placeholder: |
+        Tests:
+        Public fixture:
+        Smoke check:
+
+  - type: checkboxes
+    id: disclosure
+    attributes:
+      label: Public disclosure check
+      options:
+        - label: This issue does not disclose unpublished workflow details, internal assignments, benchmark details, or unreleased results.
+          required: true
+        - label: No private data, model weights, secrets, or local absolute paths are included.
+          required: true
