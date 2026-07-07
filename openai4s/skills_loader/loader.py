@@ -32,29 +32,74 @@ _READONLY_ORIGINS = ("openai4s",)
 _WORD = re.compile(r"[a-z0-9]+")
 
 
+def _strip_scalar(v: str) -> str:
+    """Normalize an inline YAML scalar: drop inline comments and surrounding
+    quotes. Only strips a `#` comment on *unquoted* values so a `#` inside a
+    quoted description survives."""
+    v = v.strip()
+    if len(v) >= 2 and v[0] in "\"'" and v[-1] == v[0]:
+        return v[1:-1]
+    # unquoted: a ` #` starts a trailing comment
+    return v.split(" #", 1)[0].strip()
+
+
 def _parse_frontmatter(text: str) -> tuple[dict, str]:
-    """Split an optional leading `--- ... ---` frontmatter block off the body."""
+    """Split an optional leading `--- ... ---` frontmatter block off the body.
+
+    Understands a deliberately small YAML subset — enough for skill
+    frontmatter, not a general parser:
+
+      * top-level `key: scalar` (quoted or unquoted, with inline comments);
+      * top-level `key: >` / `key: |` **block scalars** (folded/literal), whose
+        value is the following more-indented lines. Folded (`>`) joins lines
+        with spaces; literal (`|`) preserves newlines. Chomping indicators
+        (`-`/`+`) are accepted and ignored — descriptions are collapsed anyway.
+
+    Indented lines that are NOT a block-scalar continuation belong to a nested
+    mapping/sequence (e.g. metadata.third_party[].name) and are ignored so they
+    cannot clobber a top-level key of the same name.
+    """
     if not text.startswith("---"):
         return {}, text
     end = text.find("\n---", 3)
     if end == -1:
         return {}, text
-    raw = text[3:end].strip()
+    raw = text[3:end].strip("\n")
     body = text[end + 4 :].lstrip("\n")
     meta: dict = {}
-    for line in raw.splitlines():
-        # Only capture TOP-LEVEL scalar keys (column 0). Indented lines belong
-        # to a nested mapping/sequence (e.g. metadata.third_party[].name) and
-        # must not clobber a top-level key of the same name. Comments and list
-        # items are skipped too. This is a deliberately small YAML subset —
-        # enough for skill frontmatter, not a general parser.
+    lines = raw.splitlines()
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        # Only TOP-LEVEL keys start at column 0. Skip blanks, comments, list
+        # items, and any indented (nested) lines.
         if not line or line[0] in (" ", "\t", "#", "-"):
+            i += 1
             continue
-        if ":" in line:
-            k, _, v = line.partition(":")
-            # strip trailing inline comments from the scalar value
-            v = v.split(" #", 1)[0]
-            meta[k.strip().lower()] = v.strip()
+        if ":" not in line:
+            i += 1
+            continue
+        k, _, v = line.partition(":")
+        key = k.strip().lower()
+        marker = v.strip()
+        # strip an optional chomping indicator to detect a block scalar
+        if marker and marker[0] in "|>" and marker[1:] in ("", "-", "+"):
+            folded = marker[0] == ">"
+            block: list[str] = []
+            i += 1
+            while i < n and (lines[i] == "" or lines[i][0] in (" ", "\t")):
+                block.append(lines[i])
+                i += 1
+            # dedent by the minimum indent of the non-blank block lines
+            indents = [len(ln) - len(ln.lstrip(" \t")) for ln in block if ln.strip()]
+            pad = min(indents) if indents else 0
+            dedented = [ln[pad:] if ln.strip() else "" for ln in block]
+            sep = " " if folded else "\n"
+            meta[key] = sep.join(x.strip() if folded else x for x in dedented).strip()
+            continue
+        meta[key] = _strip_scalar(v)
+        i += 1
     return meta, body
 
 
@@ -98,10 +143,25 @@ class Skill:
 
     @property
     def import_hint(self) -> str | None:
-        """How the agent imports this skill's sidecar inside a kernel cell."""
+        """How the agent imports this skill's sidecar inside a kernel cell.
+
+        The sidecar lives on disk under the *directory* name (which is what
+        `bootstrap_code` puts on `sys.path`), so imports must use the dir name,
+        not the declared frontmatter `name`. Directory names may contain
+        hyphens (e.g. `pdf-explore`), which are not valid Python identifiers —
+        `from pdf-explore.kernel import *` is a SyntaxError. For those, emit an
+        `importlib.import_module(...)` hint, which resolves the sidecar as a
+        namespace submodule and works with hyphenated dir names.
+        """
         if not self.has_kernel:
             return None
-        return f"from {self.name}.kernel import * # or: import {self.name}.kernel as k"
+        mod = self.root.name
+        if mod.isidentifier():
+            return f"from {mod}.kernel import * # or: import {mod}.kernel as k"
+        return (
+            f'import importlib; k = importlib.import_module("{mod}.kernel") '
+            f"# '{mod}' isn't a valid identifier; import * won't work"
+        )
 
     def summary_line(self) -> str:
         return f"- {self.name}: {self.description or '(no description)'}"

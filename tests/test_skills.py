@@ -1,7 +1,10 @@
 """Skill loader + example_stats sidecar tests (offline)."""
+import ast
+
 import pytest
 
 from openai4s.skills_loader import SkillLoader
+from openai4s.skills_loader.loader import _parse_frontmatter
 
 
 def test_discovers_example_stats():
@@ -187,6 +190,105 @@ def test_skills_read_only_origin_blocked(tmp_path, monkeypatch):
                 }
             ],
         )
+
+
+# ---- frontmatter parsing: folded / literal / quoted scalars --------------
+
+
+def test_folded_description_not_literal_gt():
+    """`description: >` folded block scalars must parse to real text, never `>`."""
+    meta, _ = _parse_frontmatter(
+        "---\n"
+        "name: demo\n"
+        "description: >\n"
+        "  First folded line describing the\n"
+        "  skill across two source lines.\n"
+        "origin: openai4s\n"
+        "---\n"
+        "# body\n"
+    )
+    assert meta["description"] != ">"
+    assert meta["description"] == (
+        "First folded line describing the skill across two source lines."
+    )
+    assert meta["origin"] == "openai4s"  # key after the block still parsed
+
+
+def test_literal_description_preserves_newlines():
+    meta, _ = _parse_frontmatter(
+        "---\n" "name: demo\n" "description: |\n" "  line one\n" "  line two\n" "---\n"
+    )
+    assert meta["description"] == "line one\nline two"
+
+
+def test_folded_chomping_indicator_accepted():
+    meta, _ = _parse_frontmatter("---\ndescription: >-\n  hello\n  world\n---\n")
+    assert meta["description"] == "hello world"
+
+
+def test_quoted_description_strips_quotes_keeps_hash():
+    meta, _ = _parse_frontmatter(
+        '---\nname: demo\ndescription: "read a #tag off a chart"\n---\n'
+    )
+    assert meta["description"] == "read a #tag off a chart"
+
+
+def test_inline_comment_stripped_on_unquoted_scalar():
+    meta, _ = _parse_frontmatter("---\norigin: openai4s  # trusted\n---\n")
+    assert meta["origin"] == "openai4s"
+
+
+def test_no_bundled_skill_summary_is_literal_gt():
+    """Regression: folded-scalar skills must not show up as `>` in the catalog."""
+    loader = SkillLoader()
+    loader.discover()
+    for c in loader.catalog():
+        assert c["description"] != ">", f"{c['name']} summary is literal '>'"
+        assert c["description"], f"{c['name']} has an empty summary"
+
+
+# ---- import-hint validity for hyphenated skill dirs ----------------------
+
+
+def test_all_import_hints_are_valid_python():
+    """Every kernel-bearing skill's import hint must be executable Python,
+    including hyphenated dirs like `pdf-explore` (import * would be a
+    SyntaxError there)."""
+    loader = SkillLoader()
+    for s in loader.discover().values():
+        hint = s.import_hint
+        if hint is None:
+            assert not s.has_kernel
+            continue
+        # strip a trailing ` # comment` and any ` # or: ...` alt form
+        code = hint.split(" #", 1)[0]
+        ast.parse(code)  # raises SyntaxError if the hint is invalid Python
+
+
+def test_hyphenated_skill_uses_importlib_hint(tmp_path, monkeypatch):
+    from openai4s.config import get_config
+
+    cfg = get_config()
+    skills_dir = tmp_path / "skills"
+    d = skills_dir / "pdf-explore"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(
+        "---\nname: pdf-explore\norigin: openai4s\n---\n# pdf\n", "utf-8"
+    )
+    (d / "kernel.py").write_text("X = 1\n", "utf-8")
+    monkeypatch.setattr(cfg, "skills_dir", skills_dir)
+
+    s = SkillLoader(cfg=cfg).discover()["pdf-explore"]
+    assert s.has_kernel
+    hint = s.import_hint
+    assert "from pdf-explore" not in hint  # not invalid `import *`
+    assert "importlib.import_module" in hint
+    ast.parse(hint.split(" #", 1)[0])
+
+
+def test_identifier_skill_uses_import_star_hint():
+    s = SkillLoader().discover()["example_stats"]
+    assert s.import_hint.startswith("from example_stats.kernel import *")
 
 
 if __name__ == "__main__":
