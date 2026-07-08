@@ -4291,16 +4291,34 @@ function renderMd(src) {
   var fenceRe = /^(\s*)(`{3,}|~{3,})[ \t]*([\w+#.\-]*)[ \t]*$/;
   var listRe = /^(\s*)([-*+]|\d+[.)])[ \t]+/;
   var hrRe = /^\s*([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
-  var delimRe = /^\s*\|?[ \t]*:?-+:?[ \t]*(\|[ \t]*:?-*:?[ \t]*)*\|?\s*$/;
-  var looksTable = function (idx) { return lines[idx].indexOf("|") !== -1 && idx + 1 < n && delimRe.test(lines[idx + 1]) && lines[idx + 1].indexOf("-") !== -1; };
+  // Table delimiter row, matched cell-by-cell so there is no nested-quantifier
+  // regex to catastrophically backtrack (ReDoS-safe). A cell is `:?-+:?` padded.
+  var cellDelimRe = /^[ \t]*:?-+:?[ \t]*$/;
+  var isDelimRow = function (s) {
+    var tr = s.trim();
+    if (tr.indexOf("-") === -1) return false;
+    if (tr.charAt(0) === "|") tr = tr.slice(1);
+    if (tr.charAt(tr.length - 1) === "|") tr = tr.slice(0, -1);
+    var parts = tr.split("|");
+    for (var j = 0; j < parts.length; j++) if (!cellDelimRe.test(parts[j])) return false;
+    return true;
+  };
+  var looksTable = function (idx) { return lines[idx].indexOf("|") !== -1 && idx + 1 < n && isDelimRow(lines[idx + 1]); };
   while (i < n) {
     var line = lines[i];
     var fm = line.match(fenceRe);
     if (fm) {
       var fchar = fm[2][0], flen = fm[2].length, lang = fm[3] || "";
       var code = []; i++;
-      var closeRe = new RegExp("^\\s*" + (fchar === "`" ? "`" : "~") + "{" + flen + ",}[ \\t]*$");
-      while (i < n && !closeRe.test(lines[i])) { code.push(lines[i]); i++; }
+      // Closing fence detected without a dynamically-built RegExp (regex-injection
+      // safe): a line that trims to >= flen of the same fence char and nothing else.
+      var isClose = function (s) {
+        var tr = s.trim();
+        if (tr.length < flen) return false;
+        for (var j = 0; j < tr.length; j++) if (tr.charAt(j) !== fchar) return false;
+        return true;
+      };
+      while (i < n && !isClose(lines[i])) { code.push(lines[i]); i++; }
       if (i < n) i++; // consume the closing fence when it exists (unclosed = stream still open)
       html += mdCodeBlock(code.join("\n"), lang);
       continue;
