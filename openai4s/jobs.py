@@ -10,6 +10,7 @@ registry (bounded), live output capture.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import threading
@@ -86,7 +87,16 @@ class JobManager:
         if not command:
             return {"error": "empty command"}
         kind = kind if kind in ("bash", "python") else "bash"
-        wd = cwd or str(self.root)
+        # Confine the working directory to the jobs root: normalize a caller-supplied
+        # cwd and require the result to stay inside the root, so it cannot escape via
+        # ".." or an absolute path (no path injection).
+        root_dir = os.path.realpath(str(self.root))
+        if cwd:
+            wd = os.path.normpath(os.path.join(root_dir, cwd))
+            if wd != root_dir and not wd.startswith(root_dir + os.sep):
+                return {"error": "cwd escapes the jobs root"}
+        else:
+            wd = root_dir
         Path(wd).mkdir(parents=True, exist_ok=True)
         job = Job(kind, command, wd)
         with self._lock:
