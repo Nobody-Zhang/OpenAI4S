@@ -280,7 +280,11 @@ def extract_dois(text: str) -> list[str]:
         d = m.split("</")[0]
         if d.count("<") != d.count(">"):
             d = d.split("<")[0]
-        d = re.sub(r"(?:\*\*|__|[_\]\*>`,;:])+$", "", d)
+        # Strip trailing markdown/punct chars. The old regex `(?:\*\*|__|[...])+$`
+        # was ambiguous (`*`/`_` sat in both the alternation and the class) and
+        # backtracked catastrophically on long `**` runs; str.rstrip over the same
+        # character set is exactly equivalent and unconditionally linear.
+        d = d.rstrip("_]*>`,;:")
         if d.endswith("."):
             d = d[:-1]
         while d.endswith(")") and d.count("(") < d.count(")"):
