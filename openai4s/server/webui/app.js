@@ -68,6 +68,10 @@ const iconEl = (name, size, cls) => { const s = el("span", "ic"); s.innerHTML = 
 function paintIcons(root) { (root || document).querySelectorAll("[data-icon]").forEach(e => { if (e._painted) return; e.innerHTML = icon(e.dataset.icon, +e.dataset.iconSize || 16); e._painted = true; }); }
 function setTitle(name) { const ct = $("#conv-title"); if (!ct) return; ct.value = name || t("conv.title.default"); ct.size = Math.max(6, Math.min(40, (name || t("conv.title.default")).length + 1)); }
 const api = async (p, o = {}) => {
+  // `p` must be an internal, same-origin API path: a single leading slash and no
+  // scheme/host. Rejecting "//host" (protocol-relative) and non-string input keeps
+  // an untrusted id interpolated into `p` from redirecting the request off-origin.
+  if (typeof p !== "string" || p[0] !== "/" || p[1] === "/") throw new Error("invalid api path");
   const r = await fetch("/api" + p, { headers: { "content-type": "application/json" }, ...o });
   const t = await r.text(); let j = null; try { j = t ? JSON.parse(t) : null; } catch { j = t; }
   if (!r.ok) throw new Error((j && j.detail) || ("HTTP " + r.status)); return j;
@@ -1992,7 +1996,7 @@ function renderPermissionCard(m) {
     const body = { decision_id: m.decision_id, allow: ok, scope };
     if (scope !== "once") body.pattern = patIn.value.trim() || "*";
     if (!ok && fb.value.trim()) body.message = fb.value.trim();
-    try { await api(`/frames/${m.frame_id}/decision`, { method: "POST", body: JSON.stringify(body) }); }
+    try { await api(`/frames/${encodeURIComponent(m.frame_id)}/decision`, { method: "POST", body: JSON.stringify(body) }); }
     catch (e) { allow.disabled = deny.disabled = false; hint(t("toast.submitFailed", e.message), true); return; }
     markPermCard(m.decision_id, ok, scope);
   };
