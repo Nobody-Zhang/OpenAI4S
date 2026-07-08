@@ -1953,7 +1953,7 @@ function permActionLine(m) {
   return { mono: true, text: m.target || "" };
 }
 function renderPermissionCard(m) {
-  S.permCards = S.permCards || {};
+  S.permCards = S.permCards || Object.create(null);  // null-proto: keys like __proto__ can't pollute
   const prev = S.permCards[m.decision_id];
   if (prev && prev.card && prev.card.isConnected) return;  // idempotent (reconnect re-emit)
   let host; try { host = ensure().wrap; } catch (e) { host = null; }
@@ -2016,7 +2016,9 @@ function renderPermissionCard(m) {
   down();
 }
 function markPermCard(id, allowed, scope) {
-  const h = (S.permCards || {})[id]; if (!h) return; h.resolved = true;
+  const reg = S.permCards || {};
+  if (!Object.prototype.hasOwnProperty.call(reg, id)) return;  // ignore __proto__/constructor keys
+  const h = reg[id]; h.resolved = true;
   if (h.allow) h.allow.disabled = true; if (h.deny) h.deny.disabled = true;
   h.card.classList.add("resolved", allowed ? "allowed" : "denied");
   let st = h.card.querySelector(".perm-status");
@@ -2024,7 +2026,9 @@ function markPermCard(id, allowed, scope) {
   st.textContent = allowed ? ((scope && scope !== "once") ? t("perm.status.allowedScope", permScopeCn(scope)) : t("perm.status.allowed")) : t("perm.status.denied");
 }
 function resolvePermissionCard(m) {
-  const h = (S.permCards || {})[m.decision_id]; if (!h) return;
+  const reg = S.permCards || {};
+  if (!Object.prototype.hasOwnProperty.call(reg, m.decision_id)) return;  // ignore __proto__/constructor keys
+  const h = reg[m.decision_id];
   if (!h.resolved) markPermCard(m.decision_id, !!m.allow, m.scope || null);
 }
 
@@ -2251,7 +2255,7 @@ async function openConversation(fid, pid) {
   S._tbl = {}; invalidateKernelCache();  // drop the prior session's table + kernel-state caches
   S.openTabs = []; S.activeTab = "notebook"; S.provMode = false; S.lineage = null; S._lineageFor = null;
   S.stepEls = {};  // fresh step registry so reopen-then-replay dedupes by step_id
-  S.permCards = {};  // fresh permission-card registry (drop cards from the prior conversation)
+  S.permCards = Object.create(null);  // fresh permission-card registry (null-proto; drop cards from the prior conversation)
   S.planReady = null; S.planStatus = null; S.planPending = false;  // fresh plan state per session
   S.annotations = []; closeAnnotDraft(); closeAnnotPop(); updateAnnotBadge();
   edacTeardown(); S._editing = null;  // stop any live editor autocomplete + clear edit state when switching sessions
