@@ -29,6 +29,7 @@ class Kernel:
         python: str | None = None,
         env_root: str | None = None,
         env_name: str | None = None,
+        argv: list[str] | None = None,
     ):
         self.dispatcher = dispatcher
         self.mode = mode
@@ -39,12 +40,17 @@ class Kernel:
         self.python = python or sys.executable
         self.env_root = env_root
         self.env_name = env_name
+        # Full worker command override. The frame protocol is language-neutral;
+        # a non-python worker (kernel/r_kernel.py) supplies its own argv and the
+        # manager loop (execute/host_call routing/restart/interrupt) is reused
+        # verbatim. Kept across restart() so a respawn preserves the language.
+        self.argv = argv
         self.generation = 0  # bumped on every (re)spawn
         self._proc = self._spawn()
 
     def _spawn(self) -> "subprocess.Popen":
         return subprocess.Popen(
-            [self.python, "-u", str(_WORKER)],
+            self.argv or [self.python, "-u", str(_WORKER)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -214,6 +220,14 @@ class Kernel:
             self._proc.wait(timeout=5)
         except Exception:  # noqa: BLE001
             self._proc.kill()
+        finally:
+            # close the pipe wrappers now — a dead worker's buffered stdin
+            # otherwise raises BrokenPipeError at GC-time flush
+            for stream in (self._proc.stdin, self._proc.stdout, self._proc.stderr):
+                try:
+                    stream and stream.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
     def __enter__(self) -> "Kernel":
         return self
