@@ -1,138 +1,143 @@
-"""Outer loop: search over configs, score by reconstruction residual (blind),
-validate against ground truth, keep the best, log every iteration."""
+"""Iterative peak-driven spectral-subtraction loop.
+
+The spectrum is preprocessed exactly once (upstream, in ``run.py``) and the
+cleaned spectrum is passed in here. This loop then repeats, on the *residual*:
+
+    1. detect significant peaks on the current residual (2nd derivative)
+    2. peak-driven match -> best-correlating library component
+    3. NNLS-refit ALL selected components against the clean spectrum (OMP) and
+       subtract -> new residual
+
+Removing a dominant phase exposes the weaker/overlapping components hiding under
+it, which the next iteration's peak search then picks up. The loop stops when the
+residual has no significant peaks left, the best match falls below the
+correlation threshold, or adding a component no longer reduces the residual
+enough. Ground truth is never seen here — evaluation happens once, afterwards,
+in ``src/evaluate.py``.
+"""
 from __future__ import annotations
 
-import copy
 import json
 from dataclasses import dataclass, field
 
 import numpy as np
+from scipy.optimize import nnls
 
-from . import metrics
-from .config import SEARCH_SPACE, default_config
+from . import diagnose as diag
+from . import matching, unmix
 from .data import Library
-from .pipeline import PipelineResult, run_pipeline
-from .synth import SynthCase
-
-# parsimony penalty (in units of relative residual) so the fit isn't improved
-# by piling on spectrally-similar spurious components
-PARSIMONY = 0.01
+from .preprocess import detect_peaks_2nd_deriv
 
 
-def objective(result: PipelineResult) -> float:
-    """Blind score to minimise: scale-invariant relative residual + parsimony.
-
-    Uses relative residual (not raw RMSE) so configs with different
-    normalisation methods are compared on the same footing.
-    """
-    n = len(result.fractions)
-    return result.diagnostics["rel_residual"] + PARSIMONY * n
-
-
-def gt_score(result: PipelineResult, case: SynthCase) -> dict:
-    """Ground-truth validation metrics (not used for selection)."""
-    prf = metrics.component_prf(case.true_names, list(result.fractions))
-    mae = metrics.fraction_mae(case.true_fractions, result.fractions)
-    return {**prf, "fraction_mae": mae}
-
-
-def mutate(base: dict, hints: list, rng: np.random.Generator) -> dict:
-    """Produce a new config: hint-guided greedy tweaks + random exploration."""
-    cfg = copy.deepcopy(base)
-
-    if "possible_missing_component" in hints:
-        cfg["top_k"] = min(cfg["top_k"] + 4, 24)
-        cfg["corr_threshold"] = max(cfg["corr_threshold"] - 0.1, 0.1)
-    if "poor_baseline_or_denoise" in hints:
-        cfg["baseline_method"] = rng.choice(SEARCH_SPACE["baseline_method"])
-        cfg["denoise_method"] = rng.choice(SEARCH_SPACE["denoise_method"])
-        cfg["baseline_lam"] = float(rng.choice(SEARCH_SPACE["baseline_lam"]))
-
-    # random exploration: perturb a couple of random knobs
-    keys = rng.choice(list(SEARCH_SPACE), size=2, replace=False)
-    for k in keys:
-        v = rng.choice(SEARCH_SPACE[k])
-        cfg[k] = v.item() if hasattr(v, "item") else v
-    return cfg
+@dataclass
+class PipelineResult:
+    processed: np.ndarray                 # the clean spectrum the loop consumed
+    recon: np.ndarray
+    candidate_names: list
+    fractions: dict                       # name -> fraction
+    used_idx: np.ndarray
+    used_coef: np.ndarray
+    diagnostics: dict
+    peaks: np.ndarray = field(default_factory=lambda: np.array([]))  # clean-spectrum 2nd-deriv peaks
+    support: dict = field(default_factory=dict)   # name -> [supporting peak positions]
 
 
 @dataclass
 class LoopOutcome:
-    best_config: dict
     best_result: PipelineResult
-    best_objective: float
-    history: list = field(default_factory=list)
+    history: list = field(default_factory=list)   # one record per subtraction step
 
 
-def search(case: SynthCase, lib: Library, seed: int = 0, budget: int = 20,
-           patience: int = 8, tol: float = 0.03, log_path: str = None,
+def search(clean: np.ndarray, lib: Library, config: dict, log_path: str = None,
            verbose: bool = True) -> LoopOutcome:
-    """Iterate: run pipeline with a config, score, mutate toward better configs."""
-    rng = np.random.default_rng(seed)
-    cfg = default_config()
+    """Iterative peak-find -> match -> subtract loop on the (already cleaned)
+    spectrum. Returns the identified components + per-step history."""
+    clean = np.asarray(clean, dtype=float)
+    grid = lib.grid
+    max_components = config["top_k"]
+    corr_thr = config["corr_threshold"]
+    min_gain = config.get("greedy_min_gain", 0.01)
+    tgt_norm = float(np.linalg.norm(clean)) or 1e-12
 
-    best = None
-    best_obj = np.inf
-    best_cfg = None
-    best_hints: list = []
+    selected: list[int] = []
+    residual = clean.copy()
+    prev_relres = 1.0
     history = []
-    since_improve = 0
     logf = open(log_path, "w") if log_path else None
 
-    for it in range(budget):
-        if it == 0:
-            trial_cfg = cfg
-        else:
-            # explore from best config, guided by best diagnostics' hints
-            trial_cfg = mutate(best_cfg, best_hints, rng)
+    for step in range(max_components):
+        # 1. re-detect peaks on the CURRENT residual
+        peaks = detect_peaks_2nd_deriv(residual, grid, config)
+        if len(peaks) == 0:
+            if verbose:
+                print(f"[{step:02d}] no significant residual peaks -> stop")
+            break
 
-        result = run_pipeline(case.spectrum, lib, trial_cfg)
-        obj = objective(result)
-        gt = gt_score(result, case)
+        # 2. peak-driven pick of the next best component
+        best, corr = matching.best_next_component(residual, peaks, lib, config, exclude=selected)
+        if best is None or (corr < corr_thr and selected):
+            if verbose:
+                print(f"[{step:02d}] best corr {corr:.3f} < {corr_thr} -> stop")
+            break
 
-        improved = obj < best_obj - 1e-9
-        if improved:
-            best, best_obj, best_cfg = result, obj, trial_cfg
-            best_hints = result.diagnostics["hints"]
-            since_improve = 0
-        else:
-            since_improve += 1
+        # 3. OMP: refit all selected + candidate against the clean spectrum, subtract
+        trial = selected + [best]
+        A = lib.A[:, trial]
+        coef, _ = nnls(A, clean)
+        recon = A @ coef
+        relres = float(np.linalg.norm(clean - recon) / tgt_norm)
+
+        if selected and (prev_relres - relres) < min_gain:
+            if verbose:
+                print(f"[{step:02d}] gain {prev_relres - relres:.4f} < {min_gain} -> stop")
+            break
+
+        selected = trial
+        residual = clean - recon
+        prev_relres = relres
+        res_rmse = float(np.sqrt(np.mean((clean - recon) ** 2)))
 
         record = {
-            "iteration": it,
-            "objective": round(obj, 6),
-            "is_best": improved,
-            "rel_residual": round(result.diagnostics["rel_residual"], 5),
-            "residual_rmse": round(result.diagnostics["residual_rmse"], 6),
-            "fit_corr": round(result.diagnostics["fit_corr"], 4),
-            "reliability": result.diagnostics["reliability"],
-            "n_residual_peaks": result.diagnostics["n_residual_peaks"],
-            "hints": result.diagnostics["hints"],
-            "identified": {k: round(v, 3) for k, v in result.fractions.items()},
-            "gt": {k: round(v, 4) for k, v in gt.items()},
-            "config": {k: trial_cfg[k] for k in (
-                "denoise_method", "denoise_window", "baseline_method",
-                "baseline_lam", "normalise_method", "top_k",
-                "corr_threshold", "fraction_threshold")},
+            "step": step,
+            "added_component": lib.names[best],
+            "match_corr": round(corr, 4),
+            "rel_residual": round(relres, 5),
+            "residual_rmse": round(res_rmse, 6),
+            "n_residual_peaks": int(len(peaks)),
+            "residual_peak_positions": [round(float(p), 1) for p in peaks[:12]],
+            "cumulative_components": [lib.names[j] for j in selected],
         }
         history.append(record)
         if logf:
             logf.write(json.dumps(record, ensure_ascii=False) + "\n")
             logf.flush()
         if verbose:
-            flag = "*" if improved else " "
-            print(f"[{it:02d}]{flag} obj={obj:.4f} relres={record['rel_residual']:.4f} "
-                  f"corr={record['fit_corr']:.3f} F1={gt['f1']:.2f} "
-                  f"MAE={gt['fraction_mae']:.3f} rel={record['reliability']} "
-                  f"-> {list(result.fractions)}")
-
-        if best_obj <= tol or since_improve >= patience:
-            break
+            print(f"[{step:02d}]+ add {lib.names[best]:<22} corr={corr:.3f} "
+                  f"relres={relres:.4f} peaks={len(peaks)} -> {record['cumulative_components']}")
 
     if logf:
         logf.close()
 
-    # recompute best result with supporting peaks for the report
-    best = run_pipeline(case.spectrum, lib, best_cfg, with_support=True)
-    return LoopOutcome(best_config=best_cfg, best_result=best,
-                       best_objective=best_obj, history=history)
+    # --- finalize: NNLS unmix over the discovered components ---
+    if selected:
+        fractions, used_idx, used_coef = unmix.unmix(clean, lib, np.array(selected), config)
+        recon = unmix.reconstruct(lib, used_idx, used_coef)
+        cand_names = [lib.names[j] for j in selected]
+    else:
+        fractions, used_idx, used_coef = {}, np.array([], dtype=int), np.array([])
+        recon = np.zeros_like(clean)
+        cand_names = []
+
+    diagnostics = diag.diagnose(clean, recon, grid, config)
+    peaks_clean = detect_peaks_2nd_deriv(clean, grid, config)  # initial clean-spectrum peaks (report)
+
+    support = {}
+    for name in fractions:
+        support[name] = diag.supporting_peaks(clean, lib, name, grid)
+
+    result = PipelineResult(
+        processed=clean, recon=recon, candidate_names=cand_names,
+        fractions=fractions, used_idx=used_idx, used_coef=used_coef,
+        diagnostics=diagnostics, peaks=peaks_clean, support=support,
+    )
+    return LoopOutcome(best_result=result, history=history)
