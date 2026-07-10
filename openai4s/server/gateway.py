@@ -26,7 +26,6 @@ import mimetypes
 import os
 import queue
 import re
-import shutil
 import struct
 import sys
 import tempfile
@@ -59,6 +58,7 @@ from openai4s.review import review_evidence
 from openai4s.server.agent_run import EventCancellation
 from openai4s.server.agent_run import ProseStreamer as _ProseStreamer
 from openai4s.server.agent_run import WebActionExecutor, WebEventSink
+from openai4s.server.artifacts import ArtifactManager
 from openai4s.server.cell_run import CellExecutionPorts, CellExecutionService
 from openai4s.skills_loader import SkillLoader
 from openai4s.store import Store, get_store
@@ -520,25 +520,6 @@ class MessageJob:
         }
 
 
-def _capture_snippet(idx: int) -> str:
-    return (
-        "import json as __oj\n"
-        "__osfigs=[]\n"
-        "try:\n"
-        " import sys as __sys\n"
-        " if 'matplotlib' in __sys.modules:\n"
-        "  import matplotlib.pyplot as __plt\n"
-        "  for __n in list(__plt.get_fignums()):\n"
-        f"   __nm='figure_cell{idx}_'+str(__n)+'.png'\n"
-        "   try:\n"
-        "    __plt.figure(__n).savefig(__nm,dpi=130,bbox_inches='tight')\n"
-        "    __plt.close(__n); __osfigs.append(__nm)\n"
-        "   except Exception: pass\n"
-        "except Exception: pass\n"
-        "print('__OSFIGS__'+__oj.dumps(__osfigs))\n"
-    )
-
-
 def _maybe_call(v):
     """Return v() if v is callable (property vs. method tolerant), else v or ''."""
     try:
@@ -882,24 +863,6 @@ _SUBMIT_NUDGE = (
 )
 
 
-_JUNK_DIR_SEGMENTS = frozenset({"__pycache__", "node_modules", "site-packages", "venv"})
-
-
-def _ignored_file(p: Path) -> bool:
-    """True for files that are dependencies/scratch, NOT deliverables, so they
-    are never registered as artifacts. Cloned-repo trees are pruned separately
-    in _snapshot (by locating .git roots)."""
-    parts = p.parts
-    if any(seg.startswith(".") for seg in parts):
-        return True
-    if any(
-        seg in _JUNK_DIR_SEGMENTS or seg.endswith((".egg-info", ".dist-info"))
-        for seg in parts
-    ):
-        return True
-    return p.name.endswith((".pyc", ".pyo"))
-
-
 class SessionRunner:
     def __init__(self, cfg: Config, hub: WSHub) -> None:
         self.cfg = cfg
@@ -913,6 +876,19 @@ class SessionRunner:
         self._lock = threading.Lock()
         self._ws_root = cfg.data_dir / "agent-workspaces"
         self._ws_root.mkdir(parents=True, exist_ok=True)
+        self.artifacts = ArtifactManager(
+            data_dir=cfg.data_dir,
+            store=self.store,
+            workspace_for=self.workspace_for,
+            broadcast=getattr(
+                self.hub,
+                "broadcast",
+                lambda root_frame_id, event: self.hub.emitter(root_frame_id)(event),
+            ),
+            environment_snapshot=_environment_snapshot,
+            guess_content_type=_guess_ctype,
+            checksum=_sha256,
+        )
         self.cells = CellExecutionService(
             CellExecutionPorts(
                 prepare_language=lambda st, language: (
@@ -923,8 +899,8 @@ class SessionRunner:
                     if language == "r"
                     else self._kernel_id(st)
                 ),
-                snapshot=self._snapshot,
-                protect_versions=self._protect_latest_version_snapshots,
+                snapshot=self.artifacts.snapshot,
+                protect_versions=self.artifacts.protect_latest,
                 safety_refusal=lambda code, origin: self._safety_refusal(code, origin),
                 run=lambda st, request, on_chunk, lease: self._execute_with_watchdog(
                     st,
@@ -934,16 +910,7 @@ class SessionRunner:
                     language=request.language,
                     lease=lease,
                 ),
-                capture=lambda st, index, cell_id, before, emit, language: CaptureResult(
-                    *self._capture(
-                        st,
-                        index,
-                        cell_id,
-                        before,
-                        emit,
-                        language=language,
-                    )
-                ),
+                capture=self._capture_artifacts,
                 emit_artifact_step=self._emit_artifact_step,
                 record_cell=self.store.log_cell,
             )
@@ -956,13 +923,10 @@ class SessionRunner:
 
     # --- artifact version snapshots --------------------------------------
     def _versions_dir(self) -> Path:
-        d = self.cfg.data_dir / "artifact-versions"
-        d.mkdir(parents=True, exist_ok=True)
-        return d
+        return self.artifacts.versions_dir()
 
     def live_artifact_path(self, a: dict) -> Path:
-        """The live workspace file the agent reads/writes (always latest bytes)."""
-        return self.workspace_for(a.get("root_frame_id") or "default") / a["filename"]
+        return self.artifacts.live_path(a)
 
     def _write_version_snapshot(
         self,
@@ -972,98 +936,19 @@ class SessionRunner:
         src_path: Path | None = None,
         data: bytes | None = None,
     ) -> None:
-        """Persist an IMMUTABLE per-version copy of a version's bytes under
-        ``data_dir/artifact-versions`` and bind it via ``snapshot_path``. This is
-        what makes version history real: the version's ``path`` keeps pointing at
-        the (mutable) live workspace file — so a later cell overwriting that file
-        does NOT rewrite history, and the provenance reverse-lookup on the live
-        path still resolves. Best-effort; a failure just leaves the path-only
-        fallback (old behaviour)."""
-        try:
-            safe = re.sub(r"[^A-Za-z0-9._-]+", "_", filename or "artifact")
-            snap = self._versions_dir() / f"{version_id}__{safe}"
-            if data is not None:
-                snap.write_bytes(data)
-            elif src_path is not None:
-                shutil.copyfile(src_path, snap)
-            else:
-                return
-            self.store.set_version_snapshot(version_id, str(snap))
-        except OSError:
-            pass
+        self.artifacts.write_version_snapshot(
+            version_id, filename, src_path=src_path, data=data
+        )
 
     def _protect_latest_version_snapshots(self, st: SessionState) -> None:
-        """Freeze any current latest artifacts that still lack immutable bytes.
-
-        Older installs recorded only the live workspace path for artifact
-        versions. If a later cell overwrites that path, the old version silently
-        becomes unrecoverable. Before running a cell, snapshot each artifact's
-        current latest version while its live bytes are still intact.
-        """
-        try:
-            artifacts = self.store.list_artifacts({"root_frame_id": st.root_frame_id})
-        except Exception:  # noqa: BLE001
-            return
-        for art in artifacts:
-            version_id = art.get("latest_version_id")
-            if not version_id:
-                continue
-            try:
-                meta = self.store.version_meta(version_id)
-                if not meta or meta.get("snapshot_path") or not meta.get("path"):
-                    continue
-                path = Path(meta["path"])
-                if path.is_file():
-                    self._write_version_snapshot(
-                        version_id,
-                        meta.get("filename") or art.get("filename") or "artifact",
-                        src_path=path,
-                    )
-            except Exception:  # noqa: BLE001
-                continue
+        self.artifacts.protect_latest(st)
 
     def restore_version(self, artifact_id: str, version_id: str) -> dict:
-        """Make an old version current AND copy its (immutable) bytes back into the
-        live workspace file so the agent sees the restored content too. History is
-        preserved (the previously-latest version stays in the list)."""
-        a = self.store.get_artifact(artifact_id)
-        v = self.store.version_meta(version_id)
-        if not a or not v or v.get("artifact_id") != artifact_id:
-            return {"error": "version not found"}
-        src = v.get("snapshot_path") or v.get("path")
-        if not src:
-            return {"error": "version has no stored bytes"}
-        try:
-            data = Path(src).read_bytes()
-            live = self.live_artifact_path(a)
-            # protect a pre-fix latest that lacks an immutable snapshot before we
-            # overwrite the live file (post-fix versions already have one)
-            cur_vid = a.get("latest_version_id")
-            cur_meta = self.store.version_meta(cur_vid) if cur_vid else None
-            if (
-                cur_meta
-                and not cur_meta.get("snapshot_path")
-                and cur_meta.get("path")
-                and Path(cur_meta["path"]).resolve() == live.resolve()
-                and live.exists()
-            ):
-                self._write_version_snapshot(
-                    cur_vid, a["filename"], data=live.read_bytes()
-                )
-            live.parent.mkdir(parents=True, exist_ok=True)
-            live.write_bytes(data)
-        except OSError as e:  # noqa: BLE001
-            return {"error": f"restore failed: {e}"}
-        self.store.set_latest_version(artifact_id, version_id)
-        if a.get("root_frame_id"):
-            self.hub.broadcast(
-                a["root_frame_id"],
-                {"type": "artifact_created", "root_frame_id": a["root_frame_id"]},
-            )
-        return {
-            "ok": True,
-            "artifact": _artifact_json(self.store.get_artifact(artifact_id)),
-        }
+        result = self.artifacts.restore(artifact_id, version_id)
+        if result.get("ok") and result.get("artifact"):
+            result = dict(result)
+            result["artifact"] = _artifact_json(result["artifact"])
+        return result
 
     def _state(self, root_frame_id: str, project_id: str) -> SessionState:
         with self._lock:
@@ -2008,25 +1893,7 @@ class SessionRunner:
 
     # -- capture figures + written files after a cell -> artifacts ---------
     def _snapshot(self, ws: Path) -> dict[str, int]:
-        # Cloned repos / installed tool trees (a `git clone ProteinMPNN` dumping
-        # weights + LICENSE + examples, etc.) are dependencies, NOT deliverables —
-        # locate their roots (any dir holding a `.git`) and skip every file under
-        # them, so they never balloon the artifact list.
-        try:
-            repo_roots = {g.parent for g in ws.rglob(".git")}
-        except OSError:
-            repo_roots = set()
-        out: dict[str, int] = {}
-        for p in ws.rglob("*"):
-            if not p.is_file() or _ignored_file(p.relative_to(ws)):
-                continue
-            if repo_roots and any(root in p.parents for root in repo_roots):
-                continue
-            try:
-                out[str(p)] = p.stat().st_mtime_ns
-            except OSError:
-                pass
-        return out
+        return self.artifacts.snapshot(ws)
 
     def _register_file(
         self,
@@ -2036,63 +1903,13 @@ class SessionRunner:
         emit,
         env_snapshot_id: str | None = None,
     ) -> dict | None:
-        """Persist one produced file as a (versioned) artifact and notify the UI.
-        Returns the reference-style metadata for the saved version, or None if the
-        file vanished mid-turn. ``env_snapshot_id`` binds this version to the
-        kernel environment that produced it (Provenance → Environment)."""
-        rel = str(path.relative_to(st.workspace))
-        try:
-            size = path.stat().st_size
-            checksum = _sha256(path)  # inside guard: kernel may delete mid-turn
-        except OSError:
-            return None
-        existing = self.store.artifact_by_filename(rel, st.root_frame_id, strict=True)
-        rec = self.store.save_artifact(
-            path=str(path),
-            filename=rel,
-            content_type=_guess_ctype(rel),
-            size_bytes=size,
-            checksum=checksum,
-            producing_cell_id=cell_id,
-            frame_id=st.root_frame_id,
-            project_id=st.project_id,
-            artifact_id=(existing["artifact_id"] if existing else None),
+        return self.artifacts.register_file(
+            st,
+            path,
+            cell_id,
+            emit,
             env_snapshot_id=env_snapshot_id,
         )
-        # freeze THIS version's bytes immutably so a later cell overwriting the
-        # live file can't rewrite history (view/restore serve the right bytes)
-        self._write_version_snapshot(rec["version_id"], rel, src_path=path)
-        emit(
-            {
-                "type": "artifact_created",
-                "artifact": {
-                    "id": rec["artifact_id"],
-                    "artifact_id": rec["artifact_id"],
-                    "version_id": rec[
-                        "version_id"
-                    ],  # lets the UI bust its stale image cache
-                    "filename": rel,
-                    "content_type": rec.get("content_type"),
-                    "size_bytes": size,
-                    "project_id": st.project_id,
-                    "root_frame_id": st.root_frame_id,
-                },
-            }
-        )
-        try:
-            version_number = len(self.store.list_versions(rec["artifact_id"]))
-        except Exception:  # noqa: BLE001
-            version_number = 1
-        return {
-            "artifact_id": rec["artifact_id"],
-            "version_id": rec["version_id"],
-            "version_number": version_number,
-            "filename": rel,
-            "content_type": rec.get("content_type"),
-            "size_bytes": size,
-            "checksum": checksum,
-            "storage_path": rec.get("path"),
-        }
 
     def _capture(
         self,
@@ -2103,60 +1920,55 @@ class SessionRunner:
         emit,
         language: str = "python",
     ) -> tuple[list, list, list]:
-        figures: list[str] = []
-        # 1) save any open matplotlib figures (separate, unlogged cell). Python
-        # kernel only — an R cell's plots are captured through the workspace
-        # diff below (ggsave / the default Rplots.pdf device write into cwd).
-        if language == "python":
-            try:
-                cap = st.kernel.execute(_capture_snippet(cell_index), origin="system")
-                for line in (cap.get("stdout") or "").splitlines():
-                    if line.startswith("__OSFIGS__"):
-                        try:
-                            figures = json.loads(line[len("__OSFIGS__") :]) or []
-                        except (ValueError, TypeError):
-                            figures = []
-            except Exception:
-                figures = []
-        # 2) diff the workspace for new / changed files
-        after = self._snapshot(st.workspace)
-        changed = [Path(p) for p, m in after.items() if before.get(p) != m]
-        figset = set(figures)
-        files_written: list[str] = []
-        saved: list[dict] = []
-        # capture the kernel environment ONCE per producing cell (full freeze is
-        # a site-packages scan) and bind every artifact from this cell to it, so a
-        # figure records the env at PRODUCTION time — not whatever is live later.
-        env_sid = self._capture_env_snapshot(st) if changed else None
-        # figures first, then other written files — matches the visual timeline
-        for p in sorted(
-            changed,
-            key=lambda q: (str(q.relative_to(st.workspace)) not in figset, str(q)),
-        ):
-            rel = str(p.relative_to(st.workspace))
-            meta = self._register_file(st, p, cell_id, emit, env_snapshot_id=env_sid)
-            if meta is not None:
-                saved.append(meta)
-            if rel not in figset:
-                files_written.append(rel)
-        return figures, files_written, saved
+        captured = self._capture_artifacts(
+            st,
+            cell_index,
+            cell_id,
+            before,
+            emit,
+            language,
+        )
+        return captured.figures, captured.files_written, captured.artifacts
+
+    def _capture_artifacts(
+        self,
+        st: SessionState,
+        cell_index: int,
+        cell_id: str,
+        before: dict[str, int],
+        emit,
+        language: str,
+    ) -> CaptureResult:
+        kernel = st.kernel
+        run_system_cell = (
+            (lambda code: kernel.execute(code, origin="system"))
+            if kernel is not None
+            else None
+        )
+        return self.artifacts.capture(
+            st,
+            cell_index,
+            cell_id,
+            before,
+            emit,
+            language=language,
+            run_system_cell=run_system_cell,
+            drain_remote_provenance=self._remote_provenance_drain(st),
+        )
 
     def _capture_env_snapshot(self, st=None) -> str | None:
-        """Freeze the current kernel env and store it (deduped); return its id.
-        Also folds in any remote-GPU job provenance (remote env + code git +
-        model weights) buffered by the dispatcher during this cell, so a
-        remotely-computed artifact records what actually produced it and is
-        reproducible. Best-effort — never let provenance capture break saving."""
-        try:
-            snap = _environment_snapshot()
-            disp = getattr(st, "dispatcher", None)
-            if disp is not None and hasattr(disp, "pop_remote_provenance"):
-                remote = disp.pop_remote_provenance()
-                if remote:
-                    snap["remote"] = remote
-            return self.store.upsert_env_snapshot(snap)
-        except Exception:  # noqa: BLE001
-            return None
+        return self.artifacts.capture_environment(
+            self._remote_provenance_drain(st)
+        )
+
+    @staticmethod
+    def _remote_provenance_drain(st):
+        dispatcher = getattr(st, "dispatcher", None)
+        if dispatcher is not None and hasattr(
+            dispatcher, "pop_remote_provenance"
+        ):
+            return dispatcher.pop_remote_provenance
+        return None
 
     # -- run one user message ---------------------------------------------
     def effective_api_key(self) -> str:

@@ -1,0 +1,259 @@
+"""Direct contracts for versioned workspace artifact capture."""
+
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+from types import SimpleNamespace
+
+from openai4s.config import Config, LLMConfig
+from openai4s.server.artifacts import ArtifactManager
+from openai4s.store import get_store
+
+
+class ArtifactHarness:
+    def __init__(self, tmp_path: Path) -> None:
+        cfg = Config(
+            data_dir=tmp_path / "data",
+            llm=LLMConfig(provider="deepseek", api_key="test-key"),
+        )
+        self.store = get_store(cfg.db_path)
+        self.frame_id = self.store.new_frame(
+            kind="turn", project_id="default", status="ready"
+        )
+        self.workspace = tmp_path / "workspace"
+        self.workspace.mkdir(parents=True)
+        self.broadcasts: list[tuple[str, dict]] = []
+        self.environment_calls = 0
+        self.manager = ArtifactManager(
+            data_dir=cfg.data_dir,
+            store=self.store,
+            workspace_for=lambda frame_id: self.workspace,
+            broadcast=lambda frame_id, event: self.broadcasts.append(
+                (frame_id, event)
+            ),
+            environment_snapshot=self.environment_snapshot,
+            guess_content_type=lambda name: "text/csv" if name.endswith(".csv") else "application/octet-stream",
+            checksum=lambda path: hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+        self.session = SimpleNamespace(
+            root_frame_id=self.frame_id,
+            project_id="default",
+            workspace=self.workspace,
+        )
+
+    def environment_snapshot(self) -> dict:
+        self.environment_calls += 1
+        return {
+            "kind": "python",
+            "python_version": "3.14.0",
+            "implementation": "CPython",
+            "platform": "test",
+            "packages": [{"name": "numpy", "version": "2.0"}],
+            "package_count": 1,
+        }
+
+
+def test_register_freezes_version_before_emitting_event(tmp_path):
+    harness = ArtifactHarness(tmp_path)
+    path = harness.workspace / "result.csv"
+    observed = []
+
+    def emit(event):
+        version_id = event["artifact"]["version_id"]
+        meta = harness.store.version_meta(version_id)
+        snapshot = Path(meta["snapshot_path"])
+        observed.append((version_id, snapshot.read_bytes()))
+
+    path.write_bytes(b"ALPHA")
+    first = harness.manager.register_file(harness.session, path, "cell-1", emit)
+    path.write_bytes(b"BETA")
+    second = harness.manager.register_file(harness.session, path, "cell-2", emit)
+
+    assert first["artifact_id"] == second["artifact_id"]
+    assert observed == [
+        (first["version_id"], b"ALPHA"),
+        (second["version_id"], b"BETA"),
+    ]
+    assert Path(
+        harness.store.version_meta(first["version_id"])["snapshot_path"]
+    ).read_bytes() == b"ALPHA"
+
+
+def test_protect_latest_backfills_live_bytes_for_legacy_version(tmp_path):
+    harness = ArtifactHarness(tmp_path)
+    path = harness.workspace / "legacy.txt"
+    path.write_bytes(b"ALPHA")
+    legacy = harness.store.save_artifact(
+        path=str(path),
+        filename=path.name,
+        content_type="text/plain",
+        size_bytes=5,
+        checksum=hashlib.sha256(b"ALPHA").hexdigest(),
+        producing_cell_id="cell-legacy",
+        frame_id=harness.frame_id,
+        project_id="default",
+    )
+
+    harness.manager.protect_latest(harness.session)
+
+    metadata = harness.store.version_meta(legacy["version_id"])
+    assert Path(metadata["snapshot_path"]).read_bytes() == b"ALPHA"
+
+
+def test_restore_backfills_legacy_latest_before_broadcast(tmp_path):
+    harness = ArtifactHarness(tmp_path)
+    path = harness.workspace / "report.txt"
+    path.write_bytes(b"ALPHA")
+    first = harness.manager.register_file(
+        harness.session, path, "cell-1", lambda event: None
+    )
+
+    # Simulate a pre-snapshot version: latest points at the mutable live path.
+    path.write_bytes(b"BETA")
+    legacy = harness.store.save_artifact(
+        path=str(path),
+        filename=path.name,
+        content_type="text/plain",
+        size_bytes=4,
+        checksum=hashlib.sha256(b"BETA").hexdigest(),
+        producing_cell_id="cell-2",
+        frame_id=harness.frame_id,
+        project_id="default",
+        artifact_id=first["artifact_id"],
+    )
+    checked_during_broadcast = []
+
+    def broadcast(frame_id, event):
+        legacy_meta = harness.store.version_meta(legacy["version_id"])
+        checked_during_broadcast.append(
+            (
+                path.read_bytes(),
+                Path(legacy_meta["snapshot_path"]).read_bytes(),
+                harness.store.get_artifact(first["artifact_id"])[
+                    "latest_version_id"
+                ],
+            )
+        )
+
+    harness.manager.broadcast = broadcast
+    result = harness.manager.restore(first["artifact_id"], first["version_id"])
+
+    assert result["ok"] is True
+    assert checked_during_broadcast == [(b"ALPHA", b"BETA", first["version_id"])]
+
+
+def test_python_capture_uses_one_environment_and_orders_figure_first(tmp_path):
+    harness = ArtifactHarness(tmp_path)
+    before = harness.manager.snapshot(harness.workspace)
+    (harness.workspace / "table.csv").write_text("x\n1\n")
+    remote_calls = 0
+    events = []
+
+    def run_system_cell(code):
+        assert "matplotlib" in code
+        (harness.workspace / "figure_cell1_1.png").write_bytes(b"PNG")
+        return {"stdout": '__OSFIGS__["figure_cell1_1.png"]\n'}
+
+    def drain_remote():
+        nonlocal remote_calls
+        remote_calls += 1
+        return [{"provider": "gpu-test", "job_id": "job-1"}]
+
+    def emit(event):
+        version = harness.store.version_meta(event["artifact"]["version_id"])
+        assert Path(version["snapshot_path"]).is_file()
+        events.append(event)
+
+    captured = harness.manager.capture(
+        harness.session,
+        1,
+        "cell-1",
+        before,
+        emit,
+        language="python",
+        run_system_cell=run_system_cell,
+        drain_remote_provenance=drain_remote,
+    )
+
+    assert harness.environment_calls == remote_calls == 1
+    assert captured.figures == ["figure_cell1_1.png"]
+    assert captured.files_written == ["table.csv"]
+    assert [item["filename"] for item in captured.artifacts] == [
+        "figure_cell1_1.png",
+        "table.csv",
+    ]
+    assert [event["artifact"]["filename"] for event in events] == [
+        "figure_cell1_1.png",
+        "table.csv",
+    ]
+    env_ids = {
+        harness.store.version_meta(item["version_id"])["env_snapshot_id"]
+        for item in captured.artifacts
+    }
+    assert len(env_ids) == 1
+    snapshot = harness.store.get_env_snapshot(env_ids.pop())
+    assert snapshot["remote"] == [{"provider": "gpu-test", "job_id": "job-1"}]
+
+
+def test_r_capture_never_runs_python_figure_probe(tmp_path):
+    harness = ArtifactHarness(tmp_path)
+    before = harness.manager.snapshot(harness.workspace)
+    (harness.workspace / "Rplots.pdf").write_bytes(b"PDF")
+
+    def forbidden_probe(code):
+        raise AssertionError("R capture must not execute a Python system cell")
+
+    captured = harness.manager.capture(
+        harness.session,
+        1,
+        "cell-r",
+        before,
+        lambda event: None,
+        language="r",
+        run_system_cell=forbidden_probe,
+    )
+
+    assert captured.figures == []
+    assert captured.files_written == ["Rplots.pdf"]
+    assert [item["filename"] for item in captured.artifacts] == ["Rplots.pdf"]
+
+
+def test_no_changes_skip_environment_and_remote_provenance(tmp_path):
+    harness = ArtifactHarness(tmp_path)
+    before = harness.manager.snapshot(harness.workspace)
+    remote_calls = 0
+
+    def drain_remote():
+        nonlocal remote_calls
+        remote_calls += 1
+        return [{"job_id": "should-remain-buffered"}]
+
+    captured = harness.manager.capture(
+        harness.session,
+        1,
+        "cell-empty",
+        before,
+        lambda event: None,
+        language="r",
+        drain_remote_provenance=drain_remote,
+    )
+
+    assert captured.artifacts == []
+    assert harness.environment_calls == remote_calls == 0
+
+
+def test_snapshot_ignores_hidden_junk_and_nested_git_repositories(tmp_path):
+    harness = ArtifactHarness(tmp_path)
+    (harness.workspace / "deliverable.txt").write_text("keep")
+    (harness.workspace / ".hidden.txt").write_text("ignore")
+    junk = harness.workspace / "node_modules"
+    junk.mkdir()
+    (junk / "dependency.js").write_text("ignore")
+    nested = harness.workspace / "cloned-tool"
+    (nested / ".git").mkdir(parents=True)
+    (nested / "weights.bin").write_bytes(b"ignore")
+
+    snapshot = harness.manager.snapshot(harness.workspace)
+
+    assert set(snapshot) == {str(harness.workspace / "deliverable.txt")}
