@@ -122,13 +122,18 @@ class Kernel:
         code: str,
         origin: str = "agent",
         on_chunk: Callable[[str], None] | None = None,
+        *,
+        cell_id: str | None = None,
     ) -> dict:
         """Run one cell; block until the response frame, servicing host_calls.
 
         `on_chunk` (if given) is invoked with each live stdout chunk — used by
         the background executor to expose a running cell's output to exec_peek.
+        A caller that owns the cell transaction may provide ``cell_id`` so the
+        kernel protocol, provenance records, artifact versions, and execution
+        log all refer to the same identity.
         """
-        cell_id = str(uuid.uuid4())
+        cell_id = str(cell_id or uuid.uuid4())
         self._send({"type": "execute", "id": cell_id, "code": code, "origin": origin})
 
         stdout_chunks: list[str] = []

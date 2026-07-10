@@ -36,7 +36,7 @@ class CellExecutionPorts:
     protect_versions: Callable[[CellSession], None]
     safety_refusal: Callable[[str, str], str | None]
     run: Callable[
-        [CellSession, CellRequest, ChunkSink | None, KernelLease | None],
+        [CellSession, CellRequest, str, ChunkSink | None, KernelLease | None],
         dict[str, Any],
     ]
     capture: Callable[
@@ -99,7 +99,7 @@ class CellExecutionService:
 
         lease = session.kernels.lease("r") if request.language == "r" else None
         try:
-            result = self.ports.run(session, request, on_chunk, lease)
+            result = self.ports.run(session, request, cell_id, on_chunk, lease)
         except BaseException:
             # A live R process can still be protocol-desynchronized when its
             # reader exits through a callback/parse error. Close only this lease;

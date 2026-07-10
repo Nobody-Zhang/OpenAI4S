@@ -132,6 +132,18 @@ def test_stdout_chunks_stream_via_on_chunk():
         assert r["stdout"] == "live\n"
 
 
+def test_explicit_cell_id_roundtrips_through_worker_response():
+    with Kernel(dispatcher=_echo_dispatcher) as kernel:
+        result = kernel.execute("print('identified')", cell_id="cell-shared")
+        automatic_one = kernel.execute("pass")
+        automatic_two = kernel.execute("pass")
+
+    assert result["id"] == "cell-shared"
+    assert result["stdout"] == "identified\n"
+    assert automatic_one["id"]
+    assert automatic_one["id"] != automatic_two["id"]
+
+
 def test_host_call_soft_fail_single_key_error_dict():
     """Dispatcher returning {'error': msg} (and nothing else) surfaces in the
     kernel as a RuntimeError('host.<method> error: <msg>') — the soft-fail

@@ -143,7 +143,10 @@ figures/files, and finally append the execution log. Its request/result values
 live in [`execution/models.py`](../openai4s/execution/models.py). This ordering is
 intentional: even when `host.submit_output()` fires mid-cell, artifact capture
 and logging finish before control returns to `AgentEngine`, which then observes
-the completion signal.
+the completion signal. The transaction-allocated cell ID is passed into the
+kernel execute frame, so worker provenance, captured artifacts, and the
+execution log share one identity; background and system cells that are outside
+this transaction continue to receive independent kernel-generated IDs.
 
 [`server/artifacts.py`](../openai4s/server/artifacts.py) owns the durable
 workspace side of that transaction: deliverable diffing, Python figure export,

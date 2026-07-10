@@ -56,7 +56,7 @@ class _RecordingKernel:
     def is_alive(self) -> bool:
         return self.live
 
-    def execute(self, code, origin="agent", on_chunk=None):
+    def execute(self, code, origin="agent", on_chunk=None, *, cell_id=None):
         self.events.append(f"{self.name}:execute-enter")
         self.execute_entered.set()
         assert self.execute_release.wait(2)
@@ -436,7 +436,7 @@ def test_r_execution_exception_shuts_down_the_exact_desynchronized_lease(tmp_pat
     st.dispatcher = SimpleNamespace(active_r_env=None)
 
     class BrokenR(_RecordingKernel):
-        def execute(self, code, origin="agent", on_chunk=None):
+        def execute(self, code, origin="agent", on_chunk=None, *, cell_id=None):
             raise RuntimeError("malformed protocol frame")
 
     kernel = BrokenR("r")
@@ -457,12 +457,45 @@ def test_r_execution_exception_shuts_down_the_exact_desynchronized_lease(tmp_pat
     assert kernel.shutdown_calls == 1
 
 
+def test_watchdog_passes_canonical_cell_id_to_kernel(tmp_path):
+    runner = _runner(tmp_path)
+    state = runner._state("frame-cell-id", "default")
+    seen = []
+
+    class ImmediateKernel:
+        def is_alive(self):
+            return True
+
+        def execute(self, code, origin="agent", on_chunk=None, *, cell_id=None):
+            seen.append((code, origin, cell_id))
+            return {"id": cell_id, "stdout": "", "stderr": "", "error": None}
+
+        def interrupt(self):
+            pass
+
+        def shutdown(self):
+            pass
+
+    state.kernels.ensure("python", "base", ImmediateKernel)
+
+    result = runner._execute_with_watchdog(
+        state,
+        "print('identified')",
+        "agent",
+        None,
+        cell_id="cell-shared",
+    )
+
+    assert result["id"] == "cell-shared"
+    assert seen == [("print('identified')", "agent", "cell-shared")]
+
+
 def test_watchdog_hard_kill_restarts_exact_python_lease(monkeypatch, tmp_path):
     runner = _runner(tmp_path)
     st = runner._state("frame-watchdog", "default")
 
     class HungKernel(_RecordingKernel):
-        def execute(self, code, origin="agent", on_chunk=None):
+        def execute(self, code, origin="agent", on_chunk=None, *, cell_id=None):
             self.execute_entered.set()
             assert self.execute_release.wait(2)
             raise RuntimeError("worker pipe closed")

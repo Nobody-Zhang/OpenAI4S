@@ -23,6 +23,8 @@ class Harness:
         self.fail_run: BaseException | None = None
         self.run_hook = None
         self.seen_lease = None
+        self.run_cell_id = None
+        self.capture_cell_id = None
 
     def ports(self) -> CellExecutionPorts:
         return CellExecutionPorts(
@@ -56,8 +58,9 @@ class Harness:
         self.order.append("safety")
         return self.refusal
 
-    def run(self, session, request, on_chunk, lease):
+    def run(self, session, request, cell_id, on_chunk, lease):
         self.order.append("run")
+        self.run_cell_id = cell_id
         self.seen_lease = lease
         if self.run_hook is not None:
             self.run_hook(session, request, lease)
@@ -73,6 +76,7 @@ class Harness:
     def capture(self, session, index, cell_id, before, emit, language):
         assert self.completion is not None
         self.order.append("capture")
+        self.capture_cell_id = cell_id
         return self.capture_result
 
     def emit_artifact_step(self, session, title, artifacts, emit):
@@ -122,6 +126,7 @@ def test_submit_output_does_not_skip_capture_or_execution_log(tmp_path):
         "record",
     ]
     assert result.result["id"] == "cell-1"
+    assert harness.run_cell_id == harness.capture_cell_id == result.cell_id
     assert result.capture.files_written == ["result.csv"]
     assert harness.records[0]["result"] is result.result
     assert harness.records[0]["figures"] == ["figure-1.png"]

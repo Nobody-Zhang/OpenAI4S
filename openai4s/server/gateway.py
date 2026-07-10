@@ -902,13 +902,16 @@ class SessionRunner:
                 snapshot=self.artifacts.snapshot,
                 protect_versions=self.artifacts.protect_latest,
                 safety_refusal=lambda code, origin: self._safety_refusal(code, origin),
-                run=lambda st, request, on_chunk, lease: self._execute_with_watchdog(
-                    st,
-                    request.code,
-                    request.origin,
-                    on_chunk,
-                    language=request.language,
-                    lease=lease,
+                run=lambda st, request, cell_id, on_chunk, lease: (
+                    self._execute_with_watchdog(
+                        st,
+                        request.code,
+                        request.origin,
+                        on_chunk,
+                        language=request.language,
+                        lease=lease,
+                        cell_id=cell_id,
+                    )
                 ),
                 capture=self._capture_artifacts,
                 emit_artifact_step=self._emit_artifact_step,
@@ -2822,6 +2825,7 @@ class SessionRunner:
         on_chunk,
         language: str = "python",
         lease: KernelLease | None = None,
+        cell_id: str | None = None,
     ) -> dict:
         """Web adapter for the protocol-neutral exact-lease cell watchdog."""
         lease = lease or st.kernels.lease(language)
@@ -2853,7 +2857,10 @@ class SessionRunner:
             st.kernels,
             lease,
             lambda kernel: kernel.execute(
-                code, origin=origin, on_chunk=on_chunk
+                code,
+                origin=origin,
+                on_chunk=on_chunk,
+                cell_id=cell_id,
             ),
             policy=policy,
             cancelled=st.cancel.is_set,
