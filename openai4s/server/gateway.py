@@ -1437,6 +1437,13 @@ class SessionRunner:
                 st.kernel.interrupt()
             except Exception:
                 pass
+        # a running ```r cell blocks the turn thread on the R worker — Stop must
+        # reach BOTH kernels or the R channel is uncancellable until the watchdog
+        if st.r_kernel is not None:
+            try:
+                st.r_kernel.interrupt()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _run_bootstrap(self, st: SessionState) -> None:
         """(Re)run skill-sidecar bootstrap in the session kernel."""
@@ -3395,13 +3402,26 @@ class SessionRunner:
                 "files_written": [],
                 "saved": [],
             }
-        result = self._execute_with_watchdog(
-            st,
-            code,
-            origin,
-            on_chunk,
-            kernel_attr="r_kernel" if language == "r" else "kernel",
-        )
+        if language == "r":
+            try:
+                result = self._execute_with_watchdog(
+                    st, code, origin, on_chunk, kernel_attr="r_kernel"
+                )
+            except BaseException:
+                # a dead/desynced R worker must never poison the session:
+                # drop it so the next ```r cell respawns fresh. The turn still
+                # fails (uniform kernel-death contract) — but not every later
+                # R turn with it.
+                dead = st.r_kernel
+                st.r_kernel = None
+                if dead is not None:
+                    try:
+                        dead.shutdown()
+                    except Exception:  # noqa: BLE001
+                        pass
+                raise
+        else:
+            result = self._execute_with_watchdog(st, code, origin, on_chunk)
         result["id"] = cell_id
         if stream and result.get("error"):
             emit(
@@ -5466,6 +5486,11 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 if st and st.kernel is not None:
                     try:
                         st.kernel.interrupt()
+                    except Exception:  # noqa: BLE001
+                        pass
+                if st and st.r_kernel is not None:
+                    try:
+                        st.r_kernel.interrupt()
                     except Exception:  # noqa: BLE001
                         pass
                 self._json({"ok": True})

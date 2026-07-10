@@ -32,20 +32,60 @@
 .oai4s_esc <- function(s) {
   if (is.null(s) || length(s) == 0L) return('""')
   s <- paste(as.character(s), collapse = "\n")
-  s <- gsub("\\", "\\\\", s, fixed = TRUE)
-  s <- gsub('"', '\\"', s, fixed = TRUE)
-  s <- gsub("\n", "\\n", s, fixed = TRUE)
-  s <- gsub("\r", "\\r", s, fixed = TRUE)
-  s <- gsub("\t", "\\t", s, fixed = TRUE)
+  # Force VALID UTF-8 before escaping: sink text slurped with useBytes=TRUE can
+  # carry latin-1/binary bytes, on which a plain gsub raises 'input string is
+  # invalid in this locale' — an uncaught error here used to kill the worker.
+  # iconv(sub="byte") replaces invalid bytes with visible <xx> escapes.
+  s2 <- tryCatch(iconv(s, from = "", to = "UTF-8", sub = "byte"),
+                 error = function(e) NA_character_)
+  if (is.na(s2)) {
+    s2 <- tryCatch(iconv(s, from = "latin1", to = "UTF-8", sub = "byte"),
+                   error = function(e) NA_character_)
+  }
+  s <- if (is.na(s2)) "(unrepresentable output)" else s2
+  s <- gsub("\\", "\\\\", s, fixed = TRUE, useBytes = TRUE)
+  s <- gsub('"', '\\"', s, fixed = TRUE, useBytes = TRUE)
+  s <- gsub("\n", "\\n", s, fixed = TRUE, useBytes = TRUE)
+  s <- gsub("\r", "\\r", s, fixed = TRUE, useBytes = TRUE)
+  s <- gsub("\t", "\\t", s, fixed = TRUE, useBytes = TRUE)
   for (i in c(1:8, 11L, 12L, 14:31)) {
-    s <- gsub(intToUtf8(i), sprintf("\\u%04x", i), s, fixed = TRUE)
+    s <- gsub(intToUtf8(i), sprintf("\\u%04x", i), s, fixed = TRUE, useBytes = TRUE)
   }
   paste0('"', s, '"')
 }
 
 .oai4s_num <- function(x, digits = 4L) {
   if (is.null(x) || length(x) == 0L || is.na(x)) return("0")
-  formatC(as.numeric(x), format = "f", digits = digits, mode = "double")
+  # explicit marks: a user cell running options(OutDec=",") must not turn
+  # every usage number into invalid JSON ("wall_s":0,0049) for the session
+  formatC(as.numeric(x), format = "f", digits = digits, mode = "double",
+          big.mark = "", decimal.mark = ".")
+}
+
+# exactly ONE response frame per execute frame: the manager returns on the
+# FIRST response it reads, so a duplicate would desync the NEXT cell
+.oai4s_responded <- FALSE
+
+.oai4s_write_frame <- function(json) {
+  ok <- tryCatch({
+    writeLines(json, .oai4s_out, useBytes = TRUE)
+    flush(.oai4s_out)
+    TRUE
+  }, error = function(e) FALSE)
+  if (!ok) {
+    # user code closed our connection (closeAllConnections() is a common
+    # sink-recovery idiom) — the raw process fd 3 is still open: reopen once
+    con <- tryCatch(file("/dev/fd/3", open = "wt"), error = function(e) NULL)
+    if (!is.null(con)) {
+      .oai4s_out <<- con
+      ok <- tryCatch({
+        writeLines(json, .oai4s_out, useBytes = TRUE)
+        flush(.oai4s_out)
+        TRUE
+      }, error = function(e) FALSE)
+    }
+  }
+  invisible(ok)
 }
 
 .oai4s_respond <- function(id, stdout_txt, stderr_txt, error, interrupted,
@@ -64,8 +104,8 @@
     ',"peak_rss_kb":', sprintf("%d", as.integer(.oai4s_or(rss, 0L))),
     "}}"
   )
-  writeLines(json, .oai4s_out, useBytes = TRUE)
-  flush(.oai4s_out)
+  .oai4s_responded <<- TRUE
+  .oai4s_write_frame(json)
 }
 
 # --- capture helpers ---------------------------------------------------------
@@ -80,8 +120,12 @@
 .oai4s_cap <- function(s) {
   if (is.null(s) || !nzchar(s)) return("")
   if (nchar(s, type = "bytes") <= .oai4s_MAX_OUTPUT) return(s)
+  # truncate in the SAME units the gate compares (bytes) — substr counts
+  # characters and would keep up to 4x the cap for multibyte output. A split
+  # trailing multibyte char is repaired by .oai4s_esc's iconv(sub="byte").
+  head_bytes <- charToRaw(s)[seq_len(.oai4s_MAX_OUTPUT)]
   paste0(
-    substr(s, 1L, .oai4s_MAX_OUTPUT),
+    rawToChar(head_bytes),
     sprintf("\n...(truncated at %d bytes)", .oai4s_MAX_OUTPUT)
   )
 }
@@ -217,33 +261,25 @@ assign("quit", function(...) stop("quit() is disabled inside openai4s R cells; t
 assign("q", function(...) stop("q() is disabled inside openai4s R cells; the kernel stays alive"),
        envir = globalenv())
 
-repeat {
-  line <- tryCatch(
-    readLines(.oai4s_in, n = 1L, warn = FALSE),
-    interrupt = function(e) "",       # idle SIGINT: swallow, keep the worker alive
-    error = function(e) character(0)
-  )
-  if (length(line) == 0L) break       # EOF — the host closed the pipe
-  if (!nzchar(line)) next
-
+# parse one line and dispatch it; returns "shutdown" | "ok"
+.oai4s_handle_line <- function(line) {
   frame <- NULL
   if (.oai4s_have_jsonlite) {
     frame <- tryCatch(jsonlite::fromJSON(line, simplifyVector = TRUE),
                       error = function(e) NULL)
   }
   if (is.null(frame) || !is.list(frame)) {
-    if (grepl('"type"[[:space:]]*:[[:space:]]*"shutdown"', line)) break
+    if (grepl('"type"[[:space:]]*:[[:space:]]*"shutdown"', line)) return("shutdown")
     .oai4s_respond(
       .oai4s_regex_id(line), "", "",
       if (.oai4s_have_jsonlite) "invalid JSON request" else
         "openai4s R worker requires the 'jsonlite' package — install.packages(\"jsonlite\") or select the prebuilt 'r' environment",
       FALSE, NULL, NULL, 0, 0, 0L
     )
-    next
+    return("ok")
   }
-
   type <- as.character(.oai4s_or(frame$type, "execute"))
-  if (identical(type, "shutdown")) break
+  if (identical(type, "shutdown")) return("shutdown")
   if (identical(type, "execute")) {
     .oai4s_run(
       as.character(.oai4s_or(frame$code, "")),
@@ -252,4 +288,51 @@ repeat {
   }
   # host_response frames only follow a host_call, which this worker never
   # emits — a stray one is stale desync; ignore (worker.py parity).
+  "ok"
+}
+
+repeat {
+  line <- tryCatch(
+    readLines(.oai4s_in, n = 1L, warn = FALSE),
+    interrupt = function(e) "",       # idle SIGINT: swallow, keep the worker alive
+    error = function(e) NULL
+  )
+  if (is.null(line)) {
+    # read failed (user closeAllConnections()): the raw process fd 4 is still
+    # open — reopen once; a second failure means the host is really gone
+    .oai4s_in <- tryCatch(file("/dev/fd/4", open = "rt", blocking = TRUE),
+                          error = function(e) NULL)
+    if (is.null(.oai4s_in)) break
+    line <- tryCatch(readLines(.oai4s_in, n = 1L, warn = FALSE),
+                     interrupt = function(e) "",
+                     error = function(e) character(0))
+  }
+  if (length(line) == 0L) break       # EOF — the host closed the pipe
+  if (!nzchar(line)) next
+
+  # In non-interactive Rscript ANY uncaught condition halts the interpreter —
+  # including a latched idle SIGINT firing at the next checkpoint (before
+  # .oai4s_run's own handlers arm) and internal errors in parse/respond. One
+  # frame may fail; the worker itself must survive it, and each execute frame
+  # gets exactly ONE response (.oai4s_responded guards the fallback).
+  .oai4s_responded <- FALSE
+  outcome <- tryCatch(
+    .oai4s_handle_line(line),
+    interrupt = function(e) "interrupted",
+    error = function(e) paste0("internal error: ", conditionMessage(e))
+  )
+  if (identical(outcome, "shutdown")) break
+  if (!identical(outcome, "ok")) {
+    .oai4s_unwind_sinks()
+    if (!.oai4s_responded) {
+      if (identical(outcome, "interrupted")) {
+        .oai4s_respond(.oai4s_regex_id(line), "", "", "Interrupted", TRUE,
+                       NULL, NULL, 0, 0, 0L)
+      } else {
+        .oai4s_respond(.oai4s_regex_id(line), "", "",
+                       paste0("openai4s r_worker ", outcome), FALSE,
+                       NULL, NULL, 0, 0, 0L)
+      }
+    }
+  }
 }

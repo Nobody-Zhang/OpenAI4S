@@ -10,7 +10,9 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
 import uuid
+from collections import deque
 from pathlib import Path
 from typing import Any, Callable
 
@@ -49,7 +51,7 @@ class Kernel:
         self._proc = self._spawn()
 
     def _spawn(self) -> "subprocess.Popen":
-        return subprocess.Popen(
+        proc = subprocess.Popen(
             self.argv or [self.python, "-u", str(_WORKER)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -59,6 +61,23 @@ class Kernel:
             cwd=self.cwd,
             env=self._child_env(),
         )
+        # Drain stderr continuously into a bounded tail. Without this, a cell
+        # whose child processes write to inherited fd2 (R `system()`, an
+        # uncaptured subprocess in python) fills the 64KB pipe and deadlocks
+        # the cell forever — nothing used to read stderr until worker death.
+        # The tail keeps the death diagnostics the old blocking read provided.
+        tail: deque[str] = deque(maxlen=400)
+        self._stderr_tail = tail
+
+        def _drain(stream=proc.stderr, sink=tail) -> None:
+            try:
+                for line in stream:
+                    sink.append(line)
+            except Exception:  # noqa: BLE001 — EOF/close ends the drain
+                pass
+
+        threading.Thread(target=_drain, name="os-kernel-stderr", daemon=True).start()
+        return proc
 
     def _child_env(self) -> dict:
         import os
@@ -116,8 +135,12 @@ class Kernel:
         while True:
             frame = self._readline()
             if frame is None:
-                # Worker died; surface stderr for debugging.
-                err = self._proc.stderr.read() if self._proc.stderr else ""
+                # Worker died; surface the drained stderr tail for debugging
+                # (the drain thread owns the pipe — never read it here too).
+                import time as _time
+
+                _time.sleep(0.05)  # let the drain thread flush the last lines
+                err = "".join(getattr(self, "_stderr_tail", []) or [])
                 raise RuntimeError(f"kernel worker exited unexpectedly: {err}")
             ftype = frame.get("type")
             if ftype == "response":

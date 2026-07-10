@@ -225,6 +225,30 @@ def test_bash_allowlisted_domain_is_not_fenced(tmp_path, monkeypatch):
     assert r.get("exit_code") == 0
 
 
+def test_kernel_local_bash_sees_runtime_grants_via_host_verdict(tmp_path, monkeypatch):
+    """The request_network_access escape hatch must keep working for bash:
+    grants live only in the HOST process, so the kernel-local bash extracts
+    the domains and asks the host (egress_check) for the verdict instead of
+    trusting its own stale worker-side fence."""
+    from openai4s.sdk.host import build_host
+
+    _allowlist(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    disp, _frame, _ = _dispatcher(tmp_path)
+    host = build_host(lambda method, args: disp(method, args))
+
+    # blocked before any grant — the verdict comes from the host
+    with pytest.raises(RuntimeError):
+        host.bash("curl -s https://data.mycorp.io/f > out.txt")
+    assert not (tmp_path / "out.txt").exists()
+
+    # the host-side grant (what _m_request_network_access performs) must be
+    # visible to the next kernel-local bash call
+    egress.grant_domain("data.mycorp.io")
+    r = host.bash("echo would fetch https://data.mycorp.io/f")
+    assert r.get("exit_code") == 0
+
+
 def test_web_fetch_blocked_returns_proxy_403_soft_fail(tmp_path, monkeypatch):
     _allowlist(monkeypatch)
     disp, _frame, _ = _dispatcher(tmp_path)

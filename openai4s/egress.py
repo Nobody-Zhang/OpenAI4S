@@ -237,6 +237,21 @@ def check_url(url: str) -> None:
 _URL_RE = re.compile(r"https?://[^\s'\"|;>)`]+", re.I)
 
 
+def command_domains(command: str) -> list[str]:
+    """The unique http(s) URL-domains named in a shell command, policy-free.
+
+    Pure extraction (no mode/allowlist consultation) so the kernel-local
+    `host.bash` can collect the domains in the worker and ask the HOST for the
+    verdict — the runtime grants (`request_network_access`) and the live
+    `OPENAI4S_EGRESS` toggle exist only in the host process."""
+    out: list[str] = []
+    for m in _URL_RE.finditer(command or ""):
+        host = domain_of(m.group(0))
+        if host and host not in out:
+            out.append(host)
+    return out
+
+
 def scan_command(command: str) -> str | None:
     """Best-effort static egress check for host.bash: return the first http(s)
     URL-domain in `command` that the allowlist would block, else None.
@@ -247,8 +262,7 @@ def scan_command(command: str) -> str | None:
     `curl`/`wget`/`pip install <url>`/`git clone https://…` shapes."""
     if egress_mode() != "allowlist":
         return None
-    for m in _URL_RE.finditer(command or ""):
-        host = domain_of(m.group(0))
-        if host and not domain_allowed(host):
+    for host in command_domains(command):
+        if not domain_allowed(host):
             return host
     return None

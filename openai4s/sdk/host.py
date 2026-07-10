@@ -1257,17 +1257,41 @@ class _Host:
             reason = None
         if reason:
             raise RuntimeError(f"bash: blocked by static safety precheck: {reason}")
-        # Best-effort outbound-domain fence. No-op unless
-        # OPENAI4S_EGRESS=allowlist (env inherited from the host at spawn).
+        # Best-effort outbound-domain fence. The domains are extracted HERE
+        # (pure scan), but the verdict comes from the HOST via one read-only
+        # RPC: the live OPENAI4S_EGRESS toggle and the request_network_access
+        # grants exist only in the host process — this worker's env/grants are
+        # a stale snapshot from spawn time. Falls back to the local fence when
+        # the host is unreachable.
         blocked_msg = None
+        domains: list = []
         try:
             from openai4s import egress
 
-            blocked = egress.scan_command(command)
-            if blocked is not None:
-                blocked_msg = egress.blocked_error(blocked).get("error")
+            domains = egress.command_domains(command)
         except Exception:  # noqa: BLE001 — fence lookup must fail open
-            blocked_msg = None
+            domains = []
+        if domains:
+            verdict = None
+            try:
+                verdict = self._call("egress_check", [{"domains": domains}])
+            except Exception:  # noqa: BLE001 — host unreachable → local fence
+                verdict = None
+            if isinstance(verdict, dict):
+                if verdict.get("blocked"):
+                    blocked_msg = verdict.get("message") or (
+                        f"bash: domain {verdict['blocked']} is outside the "
+                        "egress allowlist"
+                    )
+            else:
+                try:
+                    from openai4s import egress
+
+                    blocked = egress.scan_command(command)
+                    if blocked is not None:
+                        blocked_msg = egress.blocked_error(blocked).get("error")
+                except Exception:  # noqa: BLE001
+                    blocked_msg = None
         if blocked_msg:
             raise RuntimeError(blocked_msg)
         cwd = os.getcwd()

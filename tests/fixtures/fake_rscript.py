@@ -13,6 +13,8 @@ aliased to stderr by the sh wrapper. Scripted behaviors, keyed on the cell code:
                 process serves every cell)
     NOISE    -> prints garbage to real stdout first (must land on stderr, never
                 the wire) then responds normally
+    FLOOD    -> writes 200KB to real stderr before responding (proves the
+                manager drains the stderr pipe: >64KB used to deadlock)
     DIE      -> exits 1 without responding (worker-death path)
     SLEEP    -> sleeps 30s; SIGINT -> interrupted=True response
     anything -> stdout "ran:<code>"
@@ -68,6 +70,11 @@ while True:
         print("garbage that must never reach the protocol wire")
         sys.stdout.flush()
         respond(rid, stdout="quiet")
+        continue
+    if code == "FLOOD":
+        sys.stderr.write("x" * 200_000)
+        sys.stderr.flush()
+        respond(rid, stdout="flooded")
         continue
     if code == "COUNT":
         counter += 1

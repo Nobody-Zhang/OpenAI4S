@@ -61,6 +61,22 @@ def test_execute_persistence_and_stray_stdout(fake_rscript, tmp_path):
     assert not k.is_alive()
 
 
+def test_child_stderr_flood_does_not_deadlock(fake_rscript, tmp_path):
+    """A cell whose process writes >64KB to inherited fd2 must not wedge the
+    kernel: the manager's drain thread keeps the stderr pipe empty (this used
+    to deadlock forever — nothing read stderr until worker death)."""
+    k = spawn_r_kernel(cwd=str(tmp_path), rscript=fake_rscript)
+    try:
+        box = {}
+        t = threading.Thread(target=lambda: box.update(r=k.execute("FLOOD")))
+        t.start()
+        t.join(15)
+        assert not t.is_alive(), "stderr flood deadlocked the cell"
+        assert box["r"]["stdout"] == "flooded"
+    finally:
+        k.shutdown()
+
+
 def test_worker_death_raises_with_stderr(fake_rscript, tmp_path):
     k = spawn_r_kernel(cwd=str(tmp_path), rscript=fake_rscript)
     try:
@@ -179,5 +195,38 @@ def test_real_r_persistent_namespace_error_lineno_and_quit_guard(tmp_path):
         k.execute('writeLines("data", "out.txt")')
         assert (tmp_path / "out.txt").read_text().strip() == "data"
         assert r1["usage"]["wall_s"] >= 0
+    finally:
+        k.shutdown()
+
+
+@pytest.mark.skipif(_REAL_R is None, reason="no Rscript resolvable on this machine")
+def test_real_r_worker_survives_hostile_cells(tmp_path):
+    """The adversarially-verified kill scenarios: each of these used to halt
+    the non-interactive interpreter (fatal uncaught condition) or poison the
+    wire — one frame may fail, the worker must survive them all."""
+    k = spawn_r_kernel(cwd=str(tmp_path), rscript=_REAL_R)
+    try:
+        # non-UTF-8 bytes in output (latin-1 'café') — .oai4s_esc iconv repair
+        r = k.execute("cat(rawToChar(as.raw(c(0x63, 0x61, 0x66, 0xe9))))")
+        assert r["error"] is None and k.is_alive()
+        # options(OutDec=",") must not corrupt usage numbers on the wire
+        k.execute('options(OutDec=",")')
+        assert isinstance(k.execute("1.5 * 2")["usage"]["wall_s"], float)
+        # closeAllConnections() closes the protocol connections — reopen path
+        assert k.execute("closeAllConnections(); 1 + 1")["error"] is None
+        assert "[1] 4" in k.execute("2 + 2")["stdout"]
+        # idle SIGINT is latched by R and fires at the next checkpoint — the
+        # per-frame guard absorbs it as an Interrupted response
+        k.interrupt()
+        time.sleep(0.3)
+        r = k.execute("41 + 1")
+        assert k.is_alive()
+        if r["interrupted"]:
+            r = k.execute("41 + 1")
+        assert "[1] 42" in r["stdout"]
+        # byte-true output cap: multibyte output must not leak 3-4x the cap
+        big = k.execute('cat(strrep("中", 600000))')  # 3 bytes/char ≈ 1.8MB
+        assert len(big["stdout"].encode("utf-8")) < 1_100_000
+        assert "truncated" in big["stdout"]
     finally:
         k.shutdown()

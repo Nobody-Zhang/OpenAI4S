@@ -1042,6 +1042,24 @@ class HostDispatcher:
     # `host.bash` (sdk/host.py), which keeps the static shell precheck and the
     # egress fence.
 
+    def _m_egress_check(self, spec: dict) -> dict:
+        """Read-only egress verdict for domains the kernel-local host.bash saw.
+
+        The live `OPENAI4S_EGRESS` toggle and the runtime allowlist grants
+        (`request_network_access`) exist only in THIS process — the worker's
+        copy of the env/grants is a stale snapshot. The worker extracts the
+        domains, the host rules on them. Judging is not executing: the host
+        still runs no shell."""
+        from openai4s import egress
+
+        domains = [d for d in (spec or {}).get("domains") or [] if isinstance(d, str)]
+        if egress.egress_mode() != "allowlist":
+            return {"blocked": None}
+        for host in domains:
+            if not egress.domain_allowed(host):
+                return {"blocked": host, "message": egress.blocked_message(host)}
+        return {"blocked": None}
+
     def _m_read_file(self, spec: dict) -> dict:
         path = self._resolve(spec.get("path", ""), must_exist=True)
         offset = max(0, int(spec.get("offset") or 0))  # clamp: negatives slice wrong
