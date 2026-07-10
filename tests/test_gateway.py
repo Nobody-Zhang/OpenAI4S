@@ -64,7 +64,7 @@ def test_gateway_plain_answer_is_nudged_until_structured_submit(monkeypatch, tmp
         st.messages = [{"role": "system", "content": "sys"}]
         st.booted = True
 
-    def fake_exec(st, code, origin, emit, stream=True):
+    def fake_exec(st, code, origin, emit, stream=True, language="python"):
         st.dispatcher.last_output = {"output": {"answer": "Short answer."}}
         return {"result": {"stdout": "", "stderr": "", "error": None}}
 
@@ -373,7 +373,7 @@ def test_midtask_prose_conclusion_still_requires_structured_submit(
         st.messages = [{"role": "system", "content": "sys"}]
         st.booted = True
 
-    def fake_exec(st, code, origin, emit, stream=True):
+    def fake_exec(st, code, origin, emit, stream=True, language="python"):
         if "host.submit_output" in code:
             st.dispatcher.last_output = {"output": {"answer": 42}}
         return {"result": {"stdout": "x\n", "stderr": "", "error": None}}
@@ -431,7 +431,7 @@ def test_batched_code_blocks_warn_only_first_ran(monkeypatch, tmp_path):
         st.messages = [{"role": "system", "content": "sys"}]
         st.booted = True
 
-    def fake_exec(st, code, origin, emit, stream=True):
+    def fake_exec(st, code, origin, emit, stream=True, language="python"):
         if "host.submit_output" in code:
             st.dispatcher.last_output = {"output": {"ok": True}}
         return {"result": {"stdout": "a\n", "stderr": "", "error": None}}
@@ -1412,8 +1412,8 @@ def test_restart_respawns_when_active_env_is_only_a_pin_fallback(monkeypatch, tm
     assert result["generation"] == 2
 
 
-def test_tool_batch_applies_env_switch_before_following_bash(monkeypatch, tmp_path):
-    """env_use then bash in one reply must use the rebuilt dispatcher."""
+def test_tool_batch_applies_env_switch_before_following_call(monkeypatch, tmp_path):
+    """env_use then another tool in one reply must use the rebuilt dispatcher."""
     cfg = _cfg(tmp_path)
     runner = gateway_mod.SessionRunner(cfg, _Hub())
     st = runner._state("f-env-batch", "default")
@@ -1436,7 +1436,7 @@ def test_tool_batch_applies_env_switch_before_following_bash(monkeypatch, tmp_pa
     replies = iter(
         [
             '```tool\n{"name":"env_use","arguments":{"name":"struct"}}\n```\n'
-            '```tool\n{"name":"bash","arguments":{"command":"python -V"}}\n```',
+            '```tool\n{"name":"list_dir","arguments":{"path":"."}}\n```',
             "```python\nhost.submit_output({'ok': True}, ['done'])\n```",
         ]
     )
@@ -1453,7 +1453,7 @@ def test_tool_batch_applies_env_switch_before_following_bash(monkeypatch, tmp_pa
     monkeypatch.setattr(gateway_mod, "chat", fake_chat)
     monkeypatch.setattr(runner, "_apply_pending_env", apply_pending)
 
-    def fake_exec(state, code, origin, emit, stream=True):
+    def fake_exec(state, code, origin, emit, stream=True, language="python"):
         state.dispatcher.last_output = {"output": {"ok": True}}
         return {"result": {"stdout": "", "stderr": "", "error": None}}
 
@@ -1461,7 +1461,7 @@ def test_tool_batch_applies_env_switch_before_following_bash(monkeypatch, tmp_pa
 
     runner._loop(st, lambda event: None, [])
 
-    assert calls == [("old", "env_use"), ("apply", "struct"), ("new", "bash")]
+    assert calls == [("old", "env_use"), ("apply", "struct"), ("new", "list_dir")]
 
 
 def test_env_summary_exposes_canonical_kernel_id(tmp_path):

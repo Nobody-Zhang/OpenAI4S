@@ -189,7 +189,9 @@ def test_review_evidence_refuses_omitted_artifacts_without_calling_model(monkeyp
     monkeypatch.setattr(
         review_mod,
         "chat",
-        lambda *_args, **_kwargs: pytest.fail("model must not review incomplete evidence"),
+        lambda *_args, **_kwargs: pytest.fail(
+            "model must not review incomplete evidence"
+        ),
     )
 
     with pytest.raises(review_mod.ReviewError, match="omitted changed artifacts"):
@@ -454,9 +456,7 @@ def test_run_reviewer_error_is_nonfatal_and_marks_step_unavailable(
     assert update["summary"] == "Review unavailable"
 
 
-def test_reviewer_keeps_metadata_beyond_twelve_changed_artifacts(
-    monkeypatch, tmp_path
-):
+def test_reviewer_keeps_metadata_beyond_twelve_changed_artifacts(monkeypatch, tmp_path):
     _cfg_obj, hub, runner, _store, fid, st = _review_context(tmp_path)
     for index in range(13):
         path = st.workspace / f"artifact-{index}.txt"

@@ -13,7 +13,6 @@ from collections import Counter
 from html.parser import HTMLParser
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 WEBUI = ROOT / "openai4s" / "server" / "webui"
 INDEX_PATH = WEBUI / "index.html"
@@ -162,9 +161,9 @@ def test_critical_dom_ids_are_present_and_unique() -> None:
     assert critical <= ids, f"missing critical web UI ids: {sorted(critical - ids)}"
 
     duplicates = sorted(name for name, count in Counter(SHELL.ids).items() if count > 1)
-    assert not duplicates, (
-        f"duplicate DOM ids make selector wiring ambiguous: {duplicates}"
-    )
+    assert (
+        not duplicates
+    ), f"duplicate DOM ids make selector wiring ambiguous: {duplicates}"
 
 
 def test_shell_keeps_minimal_controls() -> None:
@@ -236,22 +235,22 @@ def test_all_literal_icon_names_have_svg_definitions() -> None:
 
 def test_frontend_uses_backend_error_envelope() -> None:
     api_source = APP_JS[APP_JS.index("const api =") : APP_JS.index("const S =")]
-    assert re.search(r"\bj\s*(?:\?\.|\.)\s*error\b", api_source), (
-        "api() must surface the backend's {error: ...} message"
-    )
+    assert re.search(
+        r"\bj\s*(?:\?\.|\.)\s*error\b", api_source
+    ), "api() must surface the backend's {error: ...} message"
 
 
 def test_send_starts_an_async_background_turn() -> None:
     send_source = _extract_js_function(APP_JS, "send")
-    assert re.search(r"/message['\"`]", send_source), (
-        "send() must post to the frame message endpoint"
-    )
-    assert re.search(r"(?:\bwait\b|['\"]wait['\"])\s*:\s*false\b", send_source), (
-        "the browser must send wait:false so the POST returns while the turn streams"
-    )
-    assert not re.search(r"\bturnDone\(\s*['\"]completed['\"]", send_source), (
-        "a 202 acknowledgement is not completion; wait for the terminal WS event"
-    )
+    assert re.search(
+        r"/message['\"`]", send_source
+    ), "send() must post to the frame message endpoint"
+    assert re.search(
+        r"(?:\bwait\b|['\"]wait['\"])\s*:\s*false\b", send_source
+    ), "the browser must send wait:false so the POST returns while the turn streams"
+    assert not re.search(
+        r"\bturnDone\(\s*['\"]completed['\"]", send_source
+    ), "a 202 acknowledgement is not completion; wait for the terminal WS event"
 
 
 def test_review_is_a_streamed_step_with_manual_and_session_controls() -> None:

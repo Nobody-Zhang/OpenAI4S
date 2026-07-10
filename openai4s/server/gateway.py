@@ -39,8 +39,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
+from openai4s.agent.actions import MULTI_CELL_NOTE as _MULTI_CELL_NOTE
+from openai4s.agent.actions import NO_CODE_NUDGE as _NO_CODE_NUDGE
+from openai4s.agent.actions import count_code_blocks as _count_code_blocks
+from openai4s.agent.actions import extract_action as _extract_action
 from openai4s.agent.compaction import compact, should_compact
-from openai4s.agent.loop import SYSTEM_PROMPT, _extract_code, _format_observation
+from openai4s.agent.loop import SYSTEM_PROMPT, _format_observation
 from openai4s.config import Config, get_config, is_placeholder_api_key
 from openai4s.host_dispatch import build_dispatcher
 from openai4s.kernel import Kernel
@@ -54,7 +58,6 @@ from openai4s.tools import finalize_tool_batch as _finalize_tool_batch
 from openai4s.tools import parse_fence_delimiter as _parse_fence_delimiter
 from openai4s.tools import parse_tool_calls as _parse_tool_calls
 from openai4s.tools import render_tools_prompt as _render_tools_prompt
-from openai4s.tools import scan_fenced_blocks as _scan_fenced_blocks
 from openai4s.tools import strip_fenced_blocks as _strip_fenced_blocks
 
 os.environ.setdefault("MPLBACKEND", "Agg")  # headless matplotlib for figure capture
@@ -438,6 +441,13 @@ class SessionState:
         self.env_name: str | None = None
         self.desired_env: str | None = None
         self.pending_env: str | None = None
+        # R execution channel: the persistent R kernel serving ```r cells —
+        # spawned lazily on first use, retargeted when host.env.use() picks an
+        # R-only env (dispatcher.active_r_env), torn down with the session.
+        # `r_env_name` records which env the running R kernel resolved against
+        # (None = default resolution: the 'r' env, else Rscript on PATH).
+        self.r_kernel: Kernel | None = None
+        self.r_env_name: str | None = None
 
 
 class MessageJob:
@@ -656,7 +666,9 @@ every task. Call `host.env.list(["biotite","mafft"])` to see them + which alread
 what you need, then `host.env.use("struct")` to run the following cells in it (switch \
 in its own cell, import in the next). Rough guide: general data-science → `python`; \
 structure / mmCIF / PDB / biotite → `struct`; sequence alignment & trees with REAL \
-MAFFT/IQ-TREE/trimAl/FastTree → `phylo`; R/ggplot2 → `r` (via `host.bash` Rscript). \
+MAFFT/IQ-TREE/trimAl/FastTree → `phylo`; R/ggplot2/tidyverse → write ```r cells (they \
+run on a persistent R kernel that resolves the prebuilt `r` env automatically; \
+`host.env.use("r")` pins it explicitly, and ggsave() your plots so they are captured). \
 Only if NO prebuilt env has the package, `host.env.create(name, [pkgs])` to pip-install it.
 3. LOAD THE SKILL: `host.load_skill("scanpy")` pulls the full protocol and renders a \
 "Loading … skill guidance" card. Read it and follow its recipe. Use \
@@ -703,8 +715,9 @@ already has what you need; `host.env.use("struct")` — run the next cells in on
 kernel only when NO prebuilt env has the package.
 - `host.search_skills("...")` — find relevant skills; `host.load_skill("name")` — load \
 one skill's full protocol (SKILL.md) and follow it.
-- `host.bash(cmd, timeout=..., workdir=...)` — run a shell command in your working \
-directory (networking is on: curl/wget/git/pip all work).
+- `host.bash(cmd, timeout=..., workdir=...)` — run a shell command INSIDE the kernel \
+process, in your working directory (networking is on: curl/wget/git/pip all work; the \
+host itself never executes shell — only your python/R cells do).
 - `host.read_file / host.write_file / host.edit_file / host.glob / host.grep / \
 host.list_dir` — file tools scoped to your working directory (edit_file does an exact \
 string replace; grep/glob search your files).
@@ -1164,7 +1177,7 @@ class SessionRunner:
                 tag = (
                     " (current)"
                     if e.name == cur
-                    else ("" if e.interpreter else " [R — via host.bash]")
+                    else ("" if e.interpreter else " [R — use ```r cells]")
                 )
                 note = ", ".join(e.notable(6)) or e.description()
                 lines.append(f"- {e.name}{tag}: {note}")
@@ -1189,6 +1202,9 @@ class SessionRunner:
         # what the agent DID, not the Python it wrote to do it.
         disp.on_step = self._make_step_sink(st)
         disp.on_plan = self._make_plan_sink(st)
+        # keep the R-channel target across dispatcher rebuilds (env switches,
+        # kernel restarts) — the R kernel itself is lazy and session-scoped
+        disp.active_r_env = getattr(st.dispatcher, "active_r_env", None)
         st.dispatcher = disp
         self._wire_delegation(st)
         # Register this conversation's UI channel with the permission broker so
@@ -1211,7 +1227,7 @@ class SessionRunner:
         # the base kernel when the requested env is gone or is R-only (no Python
         # to host the notebook kernel). The agent can switch with host.env.use().
         env = self._resolve_env(st)
-        disp.active_env_bin = env.bin_dir  # so host.bash sees the env's CLI tools
+        disp.active_env_bin = env.bin_dir  # env-name reporting (host.env.list)
         disp.on_env_switch = self._make_env_switch_sink(st)
         st.kernel = Kernel(
             dispatcher=disp,
@@ -1442,6 +1458,14 @@ class SessionRunner:
         st = self._state(root_frame_id, project_id)
         emit = self.hub.emitter(root_frame_id)
         with st.turn_lock:
+            # the R kernel restarts with the session: drop it here and let the
+            # next ```r cell respawn it fresh (same lazy path as first use)
+            if st.r_kernel is not None:
+                try:
+                    st.r_kernel.shutdown()
+                except Exception:  # noqa: BLE001
+                    pass
+                st.r_kernel = None
             if st.kernel is None:
                 self._ensure_kernel(st)
             elif st.desired_env and st.desired_env != st.env_name:
@@ -1594,12 +1618,50 @@ class SessionRunner:
         return f"python — {name}"
 
     def _kernel_id(self, st: "SessionState | None") -> str:
-        """Runtime segment label for the cells a session's kernel runs."""
+        """Runtime segment label for the cells a session's python kernel runs."""
         return self._env_label(getattr(st, "env_name", None))
 
     def _kernel_language(self, st: "SessionState | None") -> str:
-        """Syntax language for a cell (the prebuilt envs all host a python kernel)."""
+        """Syntax language for a python-kernel cell (REPL/manual paths)."""
         return "python"
+
+    def _r_kernel_id(self, st: "SessionState | None") -> str:
+        """Runtime segment label for ```r cells: 'r' for the default resolution
+        (the prebuilt 'r' env or Rscript on PATH), 'r — <env>' when retargeted."""
+        name = (getattr(st, "r_env_name", None) or "").strip()
+        if not name or name == "r":
+            return "r"
+        return f"r — {name}"
+
+    def _ensure_r_kernel(self, st: SessionState) -> str | None:
+        """Make st.r_kernel live and targeted, or return a soft error string.
+
+        Mirrors agent/loop.py Agent._execute_r: respawn when the worker died or
+        host.env.use() retargeted the R channel (dispatcher.active_r_env). The
+        model sees a missing R as an error observation and can fall back to
+        python — this never raises.
+        """
+        want = getattr(st.dispatcher, "active_r_env", None)
+        k = st.r_kernel
+        if k is not None and (not k.is_alive() or st.r_env_name != want):
+            try:
+                k.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+            st.r_kernel = None
+            k = None
+        if k is None:
+            from openai4s.kernel.environments import get_environment
+            from openai4s.kernel.r_kernel import spawn_r_kernel
+
+            try:
+                st.r_kernel = spawn_r_kernel(
+                    cwd=str(st.workspace), env=get_environment(want)
+                )
+            except Exception as e:  # noqa: BLE001 — soft-fail into the observation
+                return f"R kernel unavailable: {e}"
+            st.r_env_name = want
+        return None
 
     def stop_kernel(self, root_frame_id: str, project_id: str = "default") -> dict:
         """Shut the kernel process down (free its resources) but keep the session
@@ -1615,6 +1677,12 @@ class SessionRunner:
             except Exception:  # noqa: BLE001
                 pass
             st.kernel = None
+        if st.r_kernel is not None:
+            try:
+                st.r_kernel.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+            st.r_kernel = None
         st.kernel_manual_stop = True
         st.cancel.clear()
         emit = self.hub.emitter(root_frame_id)
@@ -1670,7 +1738,8 @@ class SessionRunner:
         """Switch this session's kernel to a prebuilt environment (restarts the
         kernel into it — conversation + notebook history + workspace files are
         kept, but in-memory variables are cleared, same as a restart). Rejects an
-        unknown or R-only env (the notebook kernel needs Python)."""
+        unknown or R-only env (this selector drives the PYTHON notebook kernel;
+        R-only envs serve the ```r channel instead)."""
         from openai4s.kernel import environments as envmod
 
         env = envmod.get_environment(env_name)
@@ -1680,8 +1749,9 @@ class SessionRunner:
             return {
                 "error": (
                     f"'{env_name}' is a {env.language} environment with "
-                    "no Python — run it via host.bash (e.g. Rscript); "
-                    "the notebook kernel needs a Python interpreter."
+                    "no Python — the notebook kernel needs a Python "
+                    "interpreter. R-only envs run ```r cells (the agent can "
+                    'pin one with host.env.use("' + env_name + '")).'
                 )
             }
         st = self._state(root_frame_id, project_id)
@@ -1738,7 +1808,13 @@ class SessionRunner:
         from openai4s.kernel import environments as envmod
 
         env = envmod.get_environment(target)
-        if env is None or env.interpreter is None:
+        if env is None:
+            return
+        if env.interpreter is None:
+            # R-only env: the python kernel is untouched. The dispatcher already
+            # set active_r_env (host.env.use), and the next ```r cell's
+            # _ensure_r_kernel respawns the R kernel against it — nothing to do
+            # here beyond not treating it as a python switch.
             return
         st.desired_env = target
         if target == st.env_name:
@@ -2050,19 +2126,23 @@ class SessionRunner:
         cell_id: str,
         before: dict[str, int],
         emit,
+        language: str = "python",
     ) -> tuple[list, list, list]:
         figures: list[str] = []
-        # 1) save any open matplotlib figures (separate, unlogged cell)
-        try:
-            cap = st.kernel.execute(_capture_snippet(cell_index), origin="system")
-            for line in (cap.get("stdout") or "").splitlines():
-                if line.startswith("__OSFIGS__"):
-                    try:
-                        figures = json.loads(line[len("__OSFIGS__") :]) or []
-                    except (ValueError, TypeError):
-                        figures = []
-        except Exception:
-            figures = []
+        # 1) save any open matplotlib figures (separate, unlogged cell). Python
+        # kernel only — an R cell's plots are captured through the workspace
+        # diff below (ggsave / the default Rplots.pdf device write into cwd).
+        if language == "python":
+            try:
+                cap = st.kernel.execute(_capture_snippet(cell_index), origin="system")
+                for line in (cap.get("stdout") or "").splitlines():
+                    if line.startswith("__OSFIGS__"):
+                        try:
+                            figures = json.loads(line[len("__OSFIGS__") :]) or []
+                        except (ValueError, TypeError):
+                            figures = []
+            except Exception:
+                figures = []
         # 2) diff the workspace for new / changed files
         after = self._snapshot(st.workspace)
         changed = [Path(p) for p, m in after.items() if before.get(p) != m]
@@ -2906,7 +2986,7 @@ class SessionRunner:
                     output_tokens=usage.get("completion_tokens", 0) or 0,
                 )
             st.messages.append({"role": "assistant", "content": reply})
-            code = _extract_code(reply)
+            action = _extract_action(reply)
             # strip ALL fenced blocks (matches what the streamer hides live), so
             # the persisted bubble equals the streamed prose and no code leaks in
             prose = _strip_fenced_blocks(reply).strip()
@@ -2944,13 +3024,13 @@ class SessionRunner:
                 except Exception:  # noqa: BLE001 — never let plan capture break a turn
                     traceback.print_exc()
                 return "plan"
-            if code is None:
+            if action is None:
                 # ReAct tool surface: run any top-level ```tool calls
                 # (deterministic ops through the dispatcher — same activity-step
                 # cards, permission gate and injection screen as a host cell
-                # call). A ```python cell WINS over tools, so a ```tool token
-                # merely quoted inside a code cell never executes; tools are only
-                # honored when the reply has no code cell.
+                # call). A code cell (```python or ```r) WINS over tools, so a
+                # ```tool token merely quoted inside a code cell never executes;
+                # tools are only honored when the reply has no code cell.
                 tool_calls, tool_errors = _parse_tool_calls(reply)
                 if tool_calls or tool_errors:
                     parts: list[str] = []
@@ -2976,52 +3056,49 @@ class SessionRunner:
                     nudge = _EXPLORE_NUDGE if st.explore else _SUBMIT_NUDGE
                     st.messages.append({"role": "user", "content": nudge})
                     continue
-                nudge = (
-                    "[system] No python code block found. Reply with a "
-                    "```python block to act, and call host.submit_output(...) "
-                    "when the task is done."
-                )
-                st.messages.append({"role": "user", "content": nudge})
+                st.messages.append({"role": "user", "content": _NO_CODE_NUDGE})
                 continue
             # If the agent called host.env.use() during the previous cell, switch
             # the kernel into that prebuilt env now (before this cell's imports).
             if st.pending_env:
                 self._apply_pending_env(st, emit)
-            info = self._execute_and_log(st, code, "agent", emit, stream=True)
+            info = self._execute_and_log(
+                st,
+                action.code,
+                "agent",
+                emit,
+                stream=True,
+                language=action.language,
+            )
             obs = _format_observation(info["result"])
-            # One cell runs per step: if the model batched SEVERAL ```python
-            # blocks into this single reply, only the FIRST one just executed —
-            # `_extract_code` takes the first match and the rest were stripped as
-            # prose and silently dropped. Say so explicitly, or the model treats
-            # the un-run blocks (and any output it already narrated for them) as
-            # done and "concludes" the whole task after one cell — the
+            # One cell runs per step: if the model batched SEVERAL code cells
+            # into this single reply, only the FIRST one just executed —
+            # `extract_action` takes the first match and the rest were stripped
+            # as prose and silently dropped. Say so explicitly, or the model
+            # treats the un-run cells (and any output it already narrated for
+            # them) as done and "concludes" the whole task after one cell — the
             # false-completion bug where a deliverable task ends with an empty
             # working dir because cells 2..N never ran.
-            code_block_count = sum(
-                1
-                for block in _scan_fenced_blocks(reply)
-                if block.closed
-                and block.fence_char == "`"
-                and block.info in ("", "python", "py")
-            )
-            if code_block_count > 1:
-                obs += (
-                    "\n[system] NOTE: only the FIRST ```python block in your "
-                    "reply was executed — exactly ONE cell runs per step. The "
-                    "later blocks did NOT run, and any results you described "
-                    "for them are not real. Do not assume they succeeded: "
-                    "continue with the NEXT single ```python cell based on the "
-                    "real observation above."
-                )
+            if _count_code_blocks(reply) > 1:
+                obs += _MULTI_CELL_NOTE
             st.messages.append({"role": "user", "content": obs})
             if st.dispatcher.last_output is not None:
                 return "submitted"
         return "max_turns"
 
     def _execute_with_watchdog(
-        self, st: SessionState, code: str, origin: str, on_chunk
+        self,
+        st: SessionState,
+        code: str,
+        origin: str,
+        on_chunk,
+        kernel_attr: str = "kernel",
     ) -> dict:
         """Run one cell but NEVER let a wedged kernel hang the turn forever.
+
+        `kernel_attr` names the SessionState slot holding the target kernel —
+        "kernel" (python) or "r_kernel" — the SIGINT/kill/abandon ladder below
+        is language-neutral.
 
         The kernel read loop (`Kernel.execute` → `_readline`) blocks on the
         worker's stdout with no timeout, so if the worker wedges (e.g. a cell
@@ -3053,13 +3130,15 @@ class SessionRunner:
         except (TypeError, ValueError):
             cap = 900.0
         if not math.isfinite(cap) or cap <= 0:  # inf/nan/<=0 → disable (old behaviour)
-            return st.kernel.execute(code, origin=origin, on_chunk=on_chunk)
+            return getattr(st, kernel_attr).execute(
+                code, origin=origin, on_chunk=on_chunk
+            )
 
         box: dict = {}
 
         def _run() -> None:
             try:
-                box["result"] = st.kernel.execute(
+                box["result"] = getattr(st, kernel_attr).execute(
                     code, origin=origin, on_chunk=on_chunk
                 )
             except BaseException as e:  # noqa: BLE001 — relay to the caller thread
@@ -3097,7 +3176,7 @@ class SessionRunner:
         # Cap exceeded — try a gentle SIGINT first. It breaks a Python-level hang
         # and KEEPS the kernel + namespace, so the cell just comes back as an
         # interrupted (error) result and the turn continues.
-        kernel = st.kernel
+        kernel = getattr(st, kernel_attr)
         try:
             kernel.interrupt()
         except Exception:  # noqa: BLE001
@@ -3131,12 +3210,13 @@ class SessionRunner:
             # holds → frame corruption/steal. Abandon this Kernel instead; the
             # session lazily respawns a fresh one and the zombie dies harmlessly
             # against the dead old proc.
-            st.kernel = None
+            setattr(st, kernel_attr, None)
         else:
             # Helper is gone — safe to restart the shared Kernel in place.
             try:
                 kernel.restart()
-                self._run_bootstrap(st)
+                if kernel_attr == "kernel":
+                    self._run_bootstrap(st)  # skill sidecars are python-only
             except Exception:  # noqa: BLE001
                 pass
         raise TimeoutError(
@@ -3167,13 +3247,27 @@ class SessionRunner:
         return verdict.as_observation()
 
     def _execute_and_log(
-        self, st: SessionState, code: str, origin: str, emit, stream: bool = True
+        self,
+        st: SessionState,
+        code: str,
+        origin: str,
+        emit,
+        stream: bool = True,
+        language: str = "python",
     ) -> dict:
-        """Run one code cell in the persistent kernel; capture + persist it."""
+        """Run one code cell in the matching persistent kernel (python or R);
+        capture + persist it."""
         rid = st.root_frame_id
         st.cell_index += 1
         idx = st.cell_index
         cell_id = f"c-{uuid.uuid4().hex[:12]}"
+        # spawn/retarget the R kernel FIRST so the segment label below reflects
+        # the env the cell actually runs in; a missing R becomes a soft error
+        # observation after the safety gate (the model can fall back to python)
+        r_error: str | None = None
+        if language == "r":
+            r_error = self._ensure_r_kernel(st)
+        kernel_id = self._r_kernel_id(st) if language == "r" else self._kernel_id(st)
         title = _activity_title(code, idx)
         on_chunk = None
         if stream:
@@ -3184,8 +3278,8 @@ class SessionRunner:
                     "block_type": "tool",
                     "chunk": f"⚙{title}\n",
                     "cell_index": idx,
-                    "kernel_id": self._kernel_id(st),
-                    "language": self._kernel_language(st),
+                    "kernel_id": kernel_id,
+                    "language": language,
                 }
             )
             emit(
@@ -3242,8 +3336,8 @@ class SessionRunner:
                 cell_seq=idx,
                 cell_index=idx,
                 project_id=st.project_id,
-                kernel_id=self._kernel_id(st),
-                language=self._kernel_language(st),
+                kernel_id=kernel_id,
+                language=language,
                 figures=[],
                 files_written=[],
                 files_read=[],
@@ -3256,7 +3350,58 @@ class SessionRunner:
                 "files_written": [],
                 "saved": [],
             }
-        result = self._execute_with_watchdog(st, code, origin, on_chunk)
+        if r_error is not None:
+            # no R interpreter (or spawn failed): a soft error result, logged
+            # and streamed exactly like a failed cell — never a crashed turn
+            result = {
+                "type": "response",
+                "id": cell_id,
+                "stdout": "",
+                "stderr": "",
+                "error": r_error,
+                "interrupted": False,
+                "trace": {"error_lineno": None, "error_call": None},
+                "usage": {},
+            }
+            if stream:
+                emit(
+                    {
+                        "type": "text_chunk",
+                        "frame_id": rid,
+                        "block_type": "tool",
+                        "chunk": "\n" + r_error,
+                    }
+                )
+            self.store.log_cell(
+                frame_id=rid,
+                root_frame_id=rid,
+                code=code,
+                result=result,
+                origin=origin,
+                cell_seq=idx,
+                cell_index=idx,
+                project_id=st.project_id,
+                kernel_id=kernel_id,
+                language=language,
+                figures=[],
+                files_written=[],
+                files_read=[],
+            )
+            return {
+                "result": result,
+                "idx": idx,
+                "cell_id": cell_id,
+                "figures": [],
+                "files_written": [],
+                "saved": [],
+            }
+        result = self._execute_with_watchdog(
+            st,
+            code,
+            origin,
+            on_chunk,
+            kernel_attr="r_kernel" if language == "r" else "kernel",
+        )
         result["id"] = cell_id
         if stream and result.get("error"):
             emit(
@@ -3267,7 +3412,9 @@ class SessionRunner:
                     "chunk": "\n" + result["error"],
                 }
             )
-        figures, files_written, saved = self._capture(st, idx, cell_id, before, emit)
+        figures, files_written, saved = self._capture(
+            st, idx, cell_id, before, emit, language=language
+        )
         # Files this cell produced are auto-captured as versioned artifacts; project
         # that into a persisted "artifact" activity step (files / environment / the
         # returned artifact metadata) so the UI renders a "Saving …" card exactly
@@ -3283,8 +3430,8 @@ class SessionRunner:
             cell_seq=idx,
             cell_index=idx,
             project_id=st.project_id,
-            kernel_id=self._kernel_id(st),
-            language=self._kernel_language(st),
+            kernel_id=kernel_id,
+            language=language,
             figures=figures,
             files_written=files_written,
             files_read=[],
