@@ -17,7 +17,15 @@ import pytest
 # compatible, so each expected set is checked as a subset rather than requiring
 # an exact match.
 _PACKAGE_EXPORTS = {
-    "openai4s.agent": {"Agent", "run_task"},
+    "openai4s.agent": {
+        "Agent",
+        "AgentEngine",
+        "EngineResult",
+        "ExecutionOutcome",
+        "ModelReply",
+        "RunState",
+        "run_task",
+    },
     "openai4s.cli": {"main"},
     "openai4s.compute": {"ComputeError", "ComputeManager"},
     "openai4s.kernel": {"Kernel"},

@@ -46,6 +46,27 @@ def should_compact(messages: list[dict], cfg: Config) -> bool:
     return estimate_tokens(messages) > budget
 
 
+def safe_keep_recent(messages: list[dict], minimum: int = 4) -> int:
+    """Keep a native assistant/tool-result group atomic during compaction.
+
+    Provider APIs require every ``role=tool`` result to remain adjacent to the
+    assistant message that declared it.  A fixed tail can otherwise begin in
+    the middle of a parallel tool batch and produce invalid replay history.
+    """
+    if minimum < 0:
+        raise ValueError("minimum must be non-negative")
+    start = max(0, len(messages) - minimum)
+    if start >= len(messages) or messages[start].get("role") != "tool":
+        return len(messages) - start
+    while start > 0 and messages[start - 1].get("role") == "tool":
+        start -= 1
+    if start > 0:
+        assistant = messages[start - 1]
+        if assistant.get("role") == "assistant" and assistant.get("tool_calls"):
+            start -= 1
+    return len(messages) - start
+
+
 def compact(
     messages: list[dict],
     cfg: Config,

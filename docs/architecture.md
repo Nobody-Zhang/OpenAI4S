@@ -1,32 +1,54 @@
-# Architecture — the Code-as-Action dual loop
+# Architecture — hybrid control plane and science runtime
 
-OpenAI4S drives the model with a **dual loop**: an outer REPL *turn* loop, and an inner synchronous *host-RPC* loop that runs **inside** a single code cell.
+OpenAI4S drives the model with one outer agent loop and two deliberately
+different action channels:
 
-**The host executes exactly two kinds of instructions**: ` ```python ` cells on the persistent Jupyter-style kernel ([`kernel/worker.py`](../openai4s/kernel/worker.py)) and ` ```r ` cells on the persistent R kernel ([`kernel/r_worker.R`](../openai4s/kernel/r_worker.R)) — both driven by the same manager over the same JSON-per-line frame protocol. Nothing else (no host-side shell): `host.bash` runs *inside* the kernel worker, and the ReAct tool surface carries no shell tool.
+- **Native JSON tool calls are the orchestration control plane.** They handle
+  deterministic metadata operations, external services, permissions, and
+  workflow control through provider-native structured calls.
+- **Python/R Code-as-Action is the scientific execution plane.** Real
+  computation runs in persistent language kernels and may synchronously call
+  back into host services while a cell is still executing.
+
+The channels never compete in one step: structured tool calls take priority;
+otherwise exactly one complete Python/R cell may run. A task succeeds only
+when a Python cell calls `host.submit_output(...)`. A tool result, prose reply,
+R cell, cancellation, or maximum-turn stop is not completion.
 
 ```mermaid
 flowchart TB
-    UI["CLI  ·  Web UI (HTTP + WebSocket daemon)"] --> M
-    subgraph outer["① OUTER LOOP · REPL turn loop"]
+    UI["CLI · Web UI"] --> M["Planner / reasoner"]
+    M --> LLM["Multi-provider LLM"]
+    LLM --> ROUTE{"Action router"}
+    subgraph outer["① OUTER LOOP · AgentEngine"]
         direction TB
-        M["Model emits prose + ONE code cell<br/>(```python or ```r)"] --> SAFE{"Pre-exec<br/>safety classifier"}
+        ROUTE -->|"native JSON calls"| TOOLS["Control-tool executor<br/>permissions · metadata · external services"]
+        ROUTE -->|"one Python/R cell"| SAFE{"Pre-exec safety classifier"}
         SAFE -->|SAFE python| K["Persistent PYTHON kernel · subprocess<br/>namespace persists · stdout captured"]
         SAFE -->|SAFE r| RK["Persistent R kernel · subprocess<br/>same frame protocol · analysis-only"]
-        K --> COLLECT["Collect stdout · artifacts · rusage"]
-        RK --> COLLECT
-        COLLECT -->|"continue?"| M
+        TOOLS --> OBS["Canonical tool results / observation"]
+        K --> OBS
+        RK --> OBS
+        OBS --> M
     end
     subgraph inner["② INNER LOOP · host RPC · synchronous, mid-cell (python only)"]
         direction TB
         H["host.web_search · web_fetch · read_file<br/>host.llm · delegate · compute · fold · save_artifact"]
     end
     K <-->|"host_call → host_ack → host_response"| H
-    M -.->|prompt| LLM["Multi-provider base model<br/>ark · chatgpt · claude · gemini"]
-    LLM -.->|completion| M
+    K -->|"host.submit_output"| DONE["completed"]
 ```
 
-- **① Outer loop** — the REPL *turn* loop: the model produces a turn (prose + one code cell, ` ```python ` or ` ```r `), the cell is screened and executed in the matching persistent kernel, results/costs are collected, and the loop decides whether to continue. Both loop bodies parse actions through one shared core ([`agent/actions.py`](../openai4s/agent/actions.py)). A task ends only when the agent calls `host.submit_output(...)` — from a python cell; the R kernel is an *analysis* channel (persistent namespace, same result contract, no `host` object).
+- **① Outer loop** — [`agent/engine.py`](../openai4s/agent/engine.py)
+  owns the provider-neutral state machine. [`agent/actions.py`](../openai4s/agent/actions.py)
+  chooses a native tool batch, one Python/R cell, or no action.
+  [`agent/runtime.py`](../openai4s/agent/runtime.py) connects the engine to the
+  local LLM client, compaction, kernels, dispatcher, and CLI transcript.
 - **② Inner loop** — *within a single cell*, agent code can call `host.llm(...)` / `host.delegate(...)` / `host.compute(...)` any number of times. Each is a synchronous `host_call → host_ack → host_response` RPC on a channel **separate from stdout capture**, so the cell blocks, the host services the call mid-execution, and the cell resumes. **This inner RPC loop does not exist in a `tool_use` architecture** — there, actions are atomic and never call back into the host mid-execution.
+
+`AgentEngine` imports no concrete kernel, dispatcher, store, or server. Those
+are ports assembled by entry-point adapters. This keeps terminal states,
+history ordering, and action priority testable without starting infrastructure.
 
 ## The `host` singleton
 
@@ -54,9 +76,27 @@ host.submit_output(...)                                              # the only 
 
 The engine is **pure Python stdlib**: the kernel is a subprocess speaking a hardened JSON-per-line protocol, the LLM client speaks OpenAI / Anthropic / Gemini wires over `urllib`, and the daemon is `http.server` + a hand-rolled WebSocket — no framework, no third-party dependency in the core.
 
-## The hybrid ReAct tool surface
+## Native JSON control tools
 
-Alongside Code-as-Action, a small **ReAct tool surface** ([`openai4s/tools/`](../openai4s/tools)) exposes the deterministic operations — `list` / `read` / `glob` / `grep` / `web` / `env` / `edit` / `write` — as structured tool calls. The model invokes one by emitting a ` ```tool ` cell carrying a JSON call instead of Python; the call routes through the **same `HostDispatcher`** as `host.*`, so it inherits the permission broker, egress fence, injection screen, and step-card machinery. These are for cheap, side-effect-light steps (look at a file, grep the tree, fetch a page). There is deliberately **no shell tool**: the host executes only python/R cells, and shell commands run inside the kernel (`host.bash`, or `subprocess` in a cell). **Real computation still flows through ` ```python ` / ` ```r ` cells** — the Turing-complete kernels, their persistent namespaces, and (python-side) mid-cell host RPC remain the path for anything that actually computes.
+[`openai4s/tools/`](../openai4s/tools) declares deterministic operations such
+as list/read/glob/grep/web/env/edit/write once, then the LLM adapters translate
+those declarations to OpenAI Chat, OpenAI Responses, Anthropic, or Gemini wire
+formats. Provider responses normalize to one lossless tool-call type containing
+the local ID, wire ID, raw arguments, parsed arguments, parse error, and opaque
+provider metadata.
+
+The control executor routes each valid call through the same `HostDispatcher`
+as in-kernel `host.*`, so permissions, egress, injection screening, activity
+events, and audit logging remain shared. It writes one canonical `role=tool`
+history item for every call, including parse errors and calls rejected by the
+per-turn limit. The assistant declaration plus all of its tool results remain
+an atomic group during context compaction.
+
+There is deliberately no native shell tool and no native `submit_output` tool.
+Shell runs only inside the Python kernel, and real scientific work continues
+through persistent Python/R cells. The old fenced ` ```tool ` parser remains a
+silent compatibility path for saved prompts and older clients, but it is no
+longer advertised to the refactored agent.
 
 ## The R execution channel
 

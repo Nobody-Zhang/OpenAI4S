@@ -1,46 +1,48 @@
-"""Code-as-Action outer loop.
+"""Backward-compatible local Agent facade for the hybrid outer loop.
 
-The agent's action space is Turing-complete code, not a fixed tool schema.
-The host executes exactly two kinds of instructions: ```python cells on the
-persistent Jupyter-style kernel and ```r cells on the persistent R kernel.
-Each turn:
-  1. Ask the model for the next step. It replies with prose + one fenced code
-     cell (the "action").
-  2. Extract the cell, run it in the matching persistent kernel.
-  3. Feed stdout/stderr/error back as an observation.
-  4. Repeat until the model calls host.submit_output(...) — completion is
-     signalled through the structured host channel, NOT a text convention.
-
-A dual loop: outer turn loop here, inner host_call RPC loop
-inside the kernel manager.
+The provider-neutral state machine lives in :mod:`openai4s.agent.engine`.
+This module owns local process lifecycle and connects two non-competing action
+channels: native JSON tools for orchestration and persistent Python/R cells for
+scientific execution.  Only ``host.submit_output(...)`` completes a task.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable
 
-from openai4s.agent.actions import NO_CODE_NUDGE, extract_action
-from openai4s.agent.compaction import compact, should_compact
+from openai4s.agent.engine import AgentEngine
+from openai4s.agent.runtime import (
+    ChatModel,
+    CompactionPolicy,
+    LocalActionExecutor,
+    TranscriptEventSink,
+    TranscriptTurn,
+    format_observation,
+)
 from openai4s.config import Config, get_config
 from openai4s.host_dispatch import HostDispatcher, build_dispatcher
 from openai4s.kernel import Kernel
 from openai4s.llm import chat
 from openai4s.security import classify_code, screen_trajectory
 from openai4s.skills_loader import SkillLoader
-from openai4s.tools import (
-    parse_tool_calls,
-    render_tools_prompt,
-    run_tool_calls,
-    scan_fenced_blocks,
-)
+from openai4s.tools import control_tool_specs, parse_tool_calls, scan_fenced_blocks
 
 SYSTEM_PROMPT = """\
-You are openai4s, an autonomous agent whose ONLY way to act on the world is \
-to WRITE AND RUN CODE in persistent kernels: a Jupyter-like PYTHON kernel and \
-an R kernel. The host executes nothing else on your behalf.
+You are openai4s, an autonomous scientific research agent with two distinct, \
+non-competing action channels:
+
+1. Control plane — use the native JSON tools exposed by the model API for \
+small deterministic operations, external services, environment selection, \
+permissions, and workflow orchestration.
+2. Science runtime — write one fenced ```python or ```r cell for computation, \
+exploration, data analysis, simulation, and other work that needs persistent \
+state.
+
+Choose exactly one channel per working turn. Never describe a JSON tool call \
+inside a fenced block. If a reply contains both native calls and a code cell, \
+only the native calls run.
 
 How you work (Code-as-Action):
-- To take any action, reply with a single fenced code cell: a ```python cell \
+- For scientific execution, reply with a single fenced code cell: a ```python cell \
 runs in the python kernel, an ```r cell runs in the R kernel. Each kernel's \
 namespace PERSISTS across turns (variables, imports, functions stay alive), \
 and the two namespaces are SEPARATE — exchange data through files in the \
@@ -73,9 +75,9 @@ finishing happen in python.
     host.todo_write(todos)              # optional progress tracker card (long tasks only — never your first move)
     host.env.list/use/create, host.load_skill(name)          # prebuilt envs + recipes
 - For ANY task touching external facts, datasets, accession numbers, sequences, or \
-literature, you MUST call host.web_search (then host.web_fetch to read hits) BEFORE \
-writing analysis code, and cite what you find — never answer such a task from memory \
-or jump straight to synthetic data when a real lookup is possible.
+literature, you MUST use the native web tools (or host.web_search/web_fetch from a \
+cell) BEFORE analysis, and cite what you find — never answer from memory or jump \
+straight to synthetic data when a real lookup is possible.
 - Do NOT import or call anything OS-destructive unless the task needs it.
 
 Finishing:
@@ -85,18 +87,16 @@ there is no other completion signal. After it succeeds you may add a one-line \
 prose summary, but do not emit further code blocks.
 
 Rules:
-- Each working turn is EITHER a single code cell (```python or ```r) OR \
-one-or-more tool calls (see the tool surface below) — never both in one \
-reply. Keep cells small and incremental. Think in prose before the code block.
+- Each working turn is EITHER native JSON tool calls OR a single code cell \
+(```python or ```r). Keep cells small and incremental. Think in prose before \
+the action.
 - If a cell errors, read the traceback in the Observation and fix it in the \
 next cell.
 """
 
 
-@dataclass
-class Turn:
-    role: str  # "assistant" | "observation"
-    content: str
+Turn = TranscriptTurn
+_format_observation = format_observation
 
 
 @dataclass
@@ -186,10 +186,6 @@ class Agent:
             ctx = self._skill_loader.system_context()
             if ctx:
                 prompt = prompt + "\n\n" + ctx
-        try:
-            prompt = prompt + "\n\n" + render_tools_prompt()
-        except Exception:  # noqa: BLE001 — never let tool-prompt rendering break a run
-            pass
         return prompt
 
     def _pre_exec_gate(self, code: str, messages: list[dict]) -> str | None:
@@ -232,84 +228,50 @@ class Agent:
         return None
 
     def run(self, task: str) -> dict:
-        """Drive the loop for one user task. Returns a transcript + final output."""
+        """Run one task through the shared engine and local runtime adapters."""
+        assert self.dispatcher is not None
+        assert self.max_turns is not None
+        # An Agent can be reused.  A previous submission must never make the
+        # next task appear complete before its own scientific cell submits.
+        self.dispatcher.last_output = None
         messages: list[dict] = [
             {"role": "system", "content": self._system_prompt()},
             {"role": "user", "content": task},
         ]
         transcript: list[Turn] = []
+        try:
+            with Kernel(dispatcher=self.dispatcher) as kernel:
+                if self._skill_loader is not None:
+                    boot = self._skill_loader.bootstrap_code()
+                    if boot.strip():
+                        kernel.execute(boot, origin="agent")
+                engine = AgentEngine(
+                    ChatModel(
+                        self.cfg.llm,
+                        chat,
+                        tools=control_tool_specs(),
+                    ),
+                    LocalActionExecutor(
+                        kernel,
+                        self.dispatcher,
+                        self._pre_exec_gate,
+                        self._execute_r,
+                        log=self._log,
+                    ),
+                    context_policy=CompactionPolicy(self.cfg, log=self._log),
+                    event_sink=TranscriptEventSink(transcript, log=self._log),
+                    max_turns=self.max_turns,
+                )
+                result = engine.run(messages)
+        finally:
+            self._close_run()
 
-        with Kernel(dispatcher=self.dispatcher) as k:
-            # Make skill sidecars importable inside the kernel.
-            if self._skill_loader is not None:
-                boot = self._skill_loader.bootstrap_code()
-                if boot.strip():
-                    k.execute(boot, origin="agent")
-
-            for turn in range(self.max_turns):
-                # Bound context growth: summarize older turns as the context
-                # window fills (openai4s-style token-budget trigger).
-                if should_compact(messages, self.cfg):
-                    messages = compact(
-                        messages, self.cfg, archive_dir=self.cfg.compaction_dir
-                    )
-                    self._log(f"[compacted] messages -> {len(messages)}")
-
-                res = chat(messages, self.cfg.llm)
-                reply = res.get("content", "") or ""
-                transcript.append(Turn("assistant", reply))
-                messages.append({"role": "assistant", "content": reply})
-                self._log(f"\n--- turn {turn} (assistant) ---\n{reply}")
-
-                # A working turn is EITHER a single code cell (```python or
-                # ```r) OR one-or-more ```tool calls — code WINS when both
-                # appear, so a ```tool token merely quoted inside a code cell
-                # (e.g. writing docs about this syntax) never executes. Tool
-                # calls are only honored when the reply has no code cell.
-                action = extract_action(reply)
-                if action is None:
-                    # ReAct tool surface: run any top-level ```tool calls
-                    # (deterministic ops routed through the dispatcher).
-                    tool_calls, tool_errors = parse_tool_calls(reply)
-                    if tool_calls or tool_errors:
-                        obs = run_tool_calls(self.dispatcher, tool_calls, tool_errors)
-                        transcript.append(Turn("observation", obs))
-                        messages.append({"role": "user", "content": obs})
-                        self._log(f"--- turn {turn} (tool results) ---\n{obs}")
-                        if self.dispatcher.last_output is not None:
-                            return self._finish(transcript, reply, "submitted")
-                        continue
-                    # No action and no submitted output: nudge once and continue.
-                    obs = NO_CODE_NUDGE
-                    transcript.append(Turn("observation", obs))
-                    messages.append({"role": "user", "content": obs})
-                    continue
-
-                # Pre-exec safety gate (report Figure 4: the SAFE? diamond +
-                # biosecurity BLOCK). A refusal feeds an Observation back to the
-                # model instead of running the cell. Runs on BOTH languages —
-                # the gate is text-level and fail-open.
-                refusal = self._pre_exec_gate(action.code, messages)
-                if refusal is not None:
-                    transcript.append(Turn("observation", refusal))
-                    messages.append({"role": "user", "content": refusal})
-                    self._log(f"--- turn {turn} (safety refusal) ---\n{refusal}")
-                    continue
-
-                if action.language == "r":
-                    result = self._execute_r(action.code)
-                else:
-                    result = k.execute(action.code, origin="agent")
-                obs = _format_observation(result)
-                transcript.append(Turn("observation", obs))
-                messages.append({"role": "user", "content": obs})
-                self._log(f"--- turn {turn} (observation) ---\n{obs}")
-
-                # Completion is signalled ONLY through the structured host
-                # channel: once host.submit_output(...) has run, we stop.
-                if self.dispatcher.last_output is not None:
-                    return self._finish(transcript, reply, "submitted")
-        return self._finish(transcript, None, "max_turns")
+        final_reply = (
+            result.last_reply.content
+            if result.stop_reason == "submitted" and result.last_reply is not None
+            else None
+        )
+        return self._finish(transcript, final_reply, result.stop_reason)
 
     def _execute_r(self, code: str) -> dict:
         """Run one ```r cell on the persistent R kernel, spawning it lazily.
@@ -354,20 +316,21 @@ class Agent:
         self, transcript: list[Turn], final_reply: str | None, reason: str
     ) -> dict:
         assert self.dispatcher is not None
-        # the R kernel (if any) lives run-scoped, like the python kernel
-        self._shutdown_r_kernel()
-        # : persist the replay tape so the run can be re-played offline.
-        if self._recorder is not None:
-            try:
-                self._recorder.flush()  # type: ignore[attr-defined]
-            except Exception:  # noqa: BLE001
-                pass
         return {
             "stop_reason": reason,
             "final_message": final_reply,
             "submitted_output": self.dispatcher.last_output,
             "transcript": [{"role": t.role, "content": t.content} for t in transcript],
         }
+
+    def _close_run(self) -> None:
+        """Release run-scoped runtimes and persist the optional replay tape."""
+        self._shutdown_r_kernel()
+        if self._recorder is not None:
+            try:
+                self._recorder.flush()  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _extract_code(text: str) -> str | None:
@@ -403,31 +366,6 @@ def _gather_trajectory(messages: list[dict], current_code: str) -> tuple[str, st
             action_parts.append(content)
     action_parts.append(current_code)
     return ("\n\n".join(user_parts[-6:]), "\n\n".join(action_parts[-8:]))
-
-
-def _format_observation(result: dict) -> str:
-    parts = ["[Observation]"]
-    out = result.get("stdout") or ""
-    err = result.get("stderr") or ""
-    error = result.get("error")
-    if out:
-        parts.append(f"stdout:\n{out.rstrip()}")
-    if err:
-        parts.append(f"stderr:\n{err.rstrip()}")
-    if error:
-        tr = result.get("trace") or {}
-        ln = tr.get("error_lineno")
-        loc = f" (cell line {ln})" if ln else ""
-        parts.append(f"ERROR{loc}:\n{error.rstrip()}")
-    if not out and not err and not error:
-        parts.append("(no output)")
-    usage = result.get("usage") or {}
-    if usage:
-        parts.append(
-            f"[usage wall={usage.get('wall_s')}s "
-            f"cpu={usage.get('cpu_s')}s rss={usage.get('peak_rss_kb')}kb]"
-        )
-    return "\n".join(parts)
 
 
 def run_task(task: str, *, verbose: bool = False, cfg: Config | None = None) -> dict:
