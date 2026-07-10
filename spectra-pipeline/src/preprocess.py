@@ -2,12 +2,20 @@
 
 All functions operate on a 1-D intensity array already resampled onto the
 common grid (see ``data.common_grid``).
+
+The cleaned spectrum is preprocessed exactly ONCE per run (not per loop
+iteration): repeated smoothing broadens/flattens peaks and repeated baseline
+removal distorts peak areas. ``save_clean_spectrum`` / ``load_clean_spectrum``
+persist that one clean spectrum so the iterative subtraction loop reads it back
+from disk and it can be inspected later.
 """
 from __future__ import annotations
 
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
-from scipy.signal import savgol_filter
+from scipy.signal import find_peaks, savgol_filter
+
+from .config import GRID_STEP
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +91,49 @@ def normalise(y: np.ndarray, method: str = "area") -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Second-derivative peak detection
+# ---------------------------------------------------------------------------
+def detect_peaks_2nd_deriv(y: np.ndarray, grid: np.ndarray, config: dict) -> np.ndarray:
+    """Screen initial peak positions via the second-derivative method.
+
+    A Raman band shows up as a sharp negative trough in the (smoothed) second
+    derivative, regardless of any residual broad baseline — this is the classic
+    robust way to pick peaks. We SavGol-smooth while differentiating (deriv=2),
+    then run ``find_peaks`` on ``-d2`` with a MAD-based noise threshold.
+
+    Operates on a spectrum already resampled onto ``grid``. Returns the peak
+    positions in grid units (cm^-1), sorted ascending.
+    """
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+    if n < 5:
+        return np.array([])
+
+    window = int(config.get("peak_smooth_window", 11))
+    poly = int(config.get("peak_savgol_poly", 3))
+    if window % 2 == 0:
+        window += 1
+    window = min(window, n if n % 2 == 1 else n - 1)
+    window = max(window, poly + 2)
+    if window % 2 == 0:
+        window += 1
+    if window > n:  # spectrum too short to smooth at this order
+        return np.array([])
+
+    d2 = savgol_filter(y, window_length=window, polyorder=poly, deriv=2)
+    neg = -d2  # troughs of d2 (i.e. peaks of y) become positive prominences
+
+    noise = np.median(np.abs(np.diff(neg))) * 1.4826 or 1e-9
+    prom = config.get("peak_prominence_sigma", 3.0) * noise
+    distance = max(1, int(round(config.get("peak_min_distance_cm", 8.0) / GRID_STEP)))
+
+    idx, _ = find_peaks(neg, prominence=prom, distance=distance)
+    # only keep troughs that sit on actual positive signal, not baseline dips
+    idx = idx[y[idx] > 0]
+    return grid[idx]
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 def preprocess(y: np.ndarray, config: dict) -> np.ndarray:
@@ -96,3 +147,26 @@ def preprocess(y: np.ndarray, config: dict) -> np.ndarray:
     out = np.clip(out, 0, None)
     out = normalise(out, config["normalise_method"])
     return out
+
+
+# ---------------------------------------------------------------------------
+# Persist / reload the one clean spectrum (produced once per run)
+# ---------------------------------------------------------------------------
+def save_clean_spectrum(path: str, grid: np.ndarray, y: np.ndarray) -> None:
+    """Write the cleaned spectrum as a 2-column CSV (raman_shift,intensity).
+
+    Same format as a case's ``spectrum.csv`` so it can be inspected/plotted the
+    same way; the iterative loop reloads it via ``load_clean_spectrum``.
+    """
+    arr = np.column_stack([np.asarray(grid, dtype=float), np.asarray(y, dtype=float)])
+    np.savetxt(path, arr, delimiter=",", header="raman_shift,intensity",
+               comments="", fmt="%.6g")
+
+
+def load_clean_spectrum(path: str):
+    """Read back a clean spectrum written by ``save_clean_spectrum``.
+
+    Returns ``(grid, intensity)``.
+    """
+    arr = np.loadtxt(path, delimiter=",", skiprows=1)
+    return arr[:, 0], arr[:, 1]
