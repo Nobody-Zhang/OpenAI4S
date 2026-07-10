@@ -2,7 +2,8 @@
 
 This is the merge layer: it serves the rich openai4s-local web UI (dashboard +
 conversation + tabbed right dock + 3Dmol viewer + notebook) and backs it with the
-openai4s Code-as-Action engine (persistent kernel, host SDK, SQLite store).
+hybrid AgentEngine (native control tools + persistent science kernels), host SDK,
+and SQLite store.
 
   * Static UI          GET /            GET /static/*
   * REST API           /api/*           (projects, frames, messages, artifacts,
@@ -10,9 +11,9 @@ openai4s Code-as-Action engine (persistent kernel, host SDK, SQLite store).
   * WebSocket          GET /api/ws      (view_session/ping ; text_reset/text_chunk/
                                           frame_update/artifact_created)
 
-Each user message runs the Code-as-Action loop in a per-session persistent kernel;
-prose streams as text chunks, code + output stream as tool chunks, and every cell's
-figures / written files are captured as versioned artifacts.
+Each user message runs the shared AgentEngine against a per-session persistent
+kernel; prose streams as text chunks, code + output stream as tool chunks, and
+every cell's figures / written files are captured as versioned artifacts.
 """
 from __future__ import annotations
 
@@ -39,26 +40,21 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from openai4s.agent.actions import MULTI_CELL_NOTE as _MULTI_CELL_NOTE
-from openai4s.agent.actions import NO_CODE_NUDGE as _NO_CODE_NUDGE
-from openai4s.agent.actions import count_code_blocks as _count_code_blocks
-from openai4s.agent.actions import extract_action as _extract_action
-from openai4s.agent.compaction import compact, should_compact
-from openai4s.agent.loop import SYSTEM_PROMPT, _format_observation
+from openai4s.agent.engine import AgentEngine
+from openai4s.agent.loop import SYSTEM_PROMPT
+from openai4s.agent.models import RunState
+from openai4s.agent.runtime import ChatModel, CompactionPolicy, CompletionSignal
 from openai4s.config import Config, get_config, is_placeholder_api_key
 from openai4s.host_dispatch import build_dispatcher
 from openai4s.kernel import Kernel
 from openai4s.llm import ARK_PLAN_MODELS, PROVIDERS, chat
 from openai4s.review import review_evidence
+from openai4s.server.agent_run import EventCancellation
+from openai4s.server.agent_run import ProseStreamer as _ProseStreamer
+from openai4s.server.agent_run import WebActionExecutor, WebEventSink
 from openai4s.skills_loader import SkillLoader
 from openai4s.store import Store, get_store
-from openai4s.tools import MAX_TOOL_CALLS_PER_TURN as _MAX_TOOL_CALLS_PER_TURN
-from openai4s.tools import execute_tool_call as _execute_tool_call
-from openai4s.tools import finalize_tool_batch as _finalize_tool_batch
-from openai4s.tools import parse_fence_delimiter as _parse_fence_delimiter
-from openai4s.tools import parse_tool_calls as _parse_tool_calls
-from openai4s.tools import render_tools_prompt as _render_tools_prompt
-from openai4s.tools import strip_fenced_blocks as _strip_fenced_blocks
+from openai4s.tools import control_tool_specs
 
 os.environ.setdefault("MPLBACKEND", "Agg")  # headless matplotlib for figure capture
 
@@ -841,81 +837,6 @@ _SUBMIT_NUDGE = (
 )
 
 
-class _ProseStreamer:
-    """Streams narration outside top-level fences as live text chunks.
-
-    Complete lines are scanned with the same nesting rule as the authoritative
-    reply parser. Buffering the current line prevents a literal nested
-    ```tool example inside a Python string from leaking into the chat bubble.
-    """
-
-    def __init__(self, emit, root_frame_id: str):
-        self.emit = emit
-        self.rid = root_frame_id
-        self.acc = ""
-        self.line_buf = ""
-        self.fence_stack: list[tuple[str, int]] = []
-        self.emitted_any = False
-        self.emitted = ""  # exact prose text streamed so far (for reconciliation)
-
-    def feed(self, delta: str) -> None:
-        self.acc += delta
-        self._drain(delta)
-
-    def _drain(self, delta: str) -> None:
-        # A delimiter is meaningful only as a full line, so keep the current
-        # partial line buffered until another delta (or final reconciliation).
-        self.line_buf += delta
-        out: list[str] = []
-        while True:
-            newline = self.line_buf.find("\n")
-            if newline < 0:
-                break
-            line = self.line_buf[: newline + 1]
-            self.line_buf = self.line_buf[newline + 1 :]
-            delimiter = _parse_fence_delimiter(line)
-            if delimiter:
-                fence_char, fence_length, info = delimiter
-                if not self.fence_stack:
-                    self.fence_stack.append((fence_char, fence_length))
-                elif (
-                    fence_char != self.fence_stack[-1][0]
-                    or fence_length < self.fence_stack[-1][1]
-                ):
-                    pass  # literal nested delimiter; remain inside the outer fence
-                elif info:
-                    self.fence_stack.append((fence_char, fence_length))
-                else:
-                    self.fence_stack.pop()
-            elif not self.fence_stack:
-                out.append(line)
-        chunk = "".join(out)
-        if chunk:
-            self._emit_prose(chunk)
-
-    def _emit_prose(self, chunk: str) -> None:
-        if not chunk:
-            return
-        self.emit(
-            {
-                "type": "text_chunk",
-                "frame_id": self.rid,
-                "block_type": "text",
-                "chunk": chunk,
-            }
-        )
-        self.emitted += chunk
-        self.emitted_any = True
-
-    def finalize(self) -> None:
-        # Reconcile the live stream with EXACTLY the prose that gets persisted
-        # (all top-level fenced blocks stripped, including an incomplete final
-        # block). Emit the buffered last prose line, if any, as one suffix.
-        target = _strip_fenced_blocks(self.acc)
-        if target.startswith(self.emitted) and len(target) > len(self.emitted):
-            self._emit_prose(target[len(self.emitted) :])
-
-
 def _activity_title(code: str, idx: int) -> str:
     """Human-readable label for a code cell's activity card — the leading
     `# comment`, else a generic fallow."""
@@ -1108,10 +1029,6 @@ class SessionRunner:
                 from openai4s.security.biosecurity import BIOSECURITY_PROMPT
 
                 ctx += "\n\n" + BIOSECURITY_PROMPT
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            ctx += "\n\n" + _render_tools_prompt()
         except Exception:  # noqa: BLE001
             pass
         proj = self.store.get_project(st.project_id) if st.project_id else None
@@ -2969,129 +2886,71 @@ class SessionRunner:
         return text + "\n\n---\n(附:被引用的文件内容)\n\n" + "\n\n".join(blocks)
 
     def _loop(self, st: SessionState, emit, assistant_visible: list[dict]) -> str:
+        """Run one Web turn through the shared provider-neutral AgentEngine."""
         rid = st.root_frame_id
         max_turns = self.cfg.max_turns or 12
         if st.explore:
             max_turns = max(max_turns, self.cfg.explore_max_turns or 0)
-        llm_cfg = self._llm_cfg(st)  # resolve once per turn (not per iteration)
-        for _turn in range(max_turns):
-            if st.cancel.is_set():
-                return "cancelled"
-            if should_compact(st.messages, self.cfg):
-                st.messages = compact(
-                    st.messages, self.cfg, archive_dir=self.cfg.compaction_dir
-                )
-            streamer = _ProseStreamer(emit, rid)
-            res = chat(st.messages, llm_cfg, on_delta=streamer.feed)
-            streamer.finalize()
-            reply = res.get("content", "") or ""
-            usage = res.get("usage") or {}
-            if usage:
-                self.store.add_frame_tokens(
-                    rid,
-                    input_tokens=usage.get("prompt_tokens", 0) or 0,
-                    output_tokens=usage.get("completion_tokens", 0) or 0,
-                )
-            st.messages.append({"role": "assistant", "content": reply})
-            action = _extract_action(reply)
-            # strip ALL fenced blocks (matches what the streamer hides live), so
-            # the persisted bubble equals the streamed prose and no code leaks in
-            prose = _strip_fenced_blocks(reply).strip()
-            if prose:
-                # Stamp the block with the moment it was produced (before this
-                # iteration's code runs and emits its steps) so a reopened session
-                # can interleave prose with the step cards in true chronological
-                # order — persisted at turn end (see submit_message). The −1ms
-                # keeps a block strictly ahead of the step it triggers even if that
-                # step is added within the same millisecond (the UI breaks msg/step
-                # timestamp ties toward the step); the gap back to the previous
-                # iteration's steps is a whole LLM round-trip, so this only removes
-                # false ties — it never reorders a block behind an earlier step.
-                assistant_visible.append(
-                    {"at": int(time.time() * 1000) - 1, "text": prose}
-                )
-                # fallback for non-streaming wires: emit prose we didn't stream live
-                if not streamer.emitted_any:
-                    emit(
-                        {
-                            "type": "text_chunk",
-                            "frame_id": rid,
-                            "block_type": "text",
-                            "chunk": prose + "\n",
-                        }
-                    )
-            # M5: plan mode is ENFORCED — never execute code. Instead of just
-            # returning the prose, parse the structured plan out of this reply,
-            # persist it + save a plan_*.json artifact, and emit `plan_ready` so
-            # the UI renders the review card (title / confidence / steps /
-            # deliverables + Approve · Discard · Describe-changes).
-            if st.plan:
-                try:
-                    self._finalize_plan(st, reply, prose, emit)
-                except Exception:  # noqa: BLE001 — never let plan capture break a turn
-                    traceback.print_exc()
-                return "plan"
-            if action is None:
-                # ReAct tool surface: run any top-level ```tool calls
-                # (deterministic ops through the dispatcher — same activity-step
-                # cards, permission gate and injection screen as a host cell
-                # call). A code cell (```python or ```r) WINS over tools, so a
-                # ```tool token merely quoted inside a code cell never executes;
-                # tools are only honored when the reply has no code cell.
-                tool_calls, tool_errors = _parse_tool_calls(reply)
-                if tool_calls or tool_errors:
-                    parts: list[str] = []
-                    for call in tool_calls[:_MAX_TOOL_CALLS_PER_TURN]:
-                        # Apply a queued env switch (host.env.use / the env_use
-                        # tool) before the call that depends on it — e.g. env_use
-                        # then bash — respawning the kernel into the new env, then
-                        # run against the (possibly rebuilt) dispatcher.
-                        if st.pending_env:
-                            self._apply_pending_env(st, emit)
-                        text, _ok = _execute_tool_call(st.dispatcher, call)
-                        parts.append(text)
-                    if st.pending_env:  # a trailing env_use → make it live onward
-                        self._apply_pending_env(st, emit)
-                    obs = _finalize_tool_batch(parts, len(tool_calls), tool_errors)
-                    st.messages.append({"role": "user", "content": obs})
-                    if st.dispatcher.last_output is not None:
-                        return "submitted"
-                    continue
-                if st.dispatcher.last_output is not None:
-                    return "submitted"
-                if prose:
-                    nudge = _EXPLORE_NUDGE if st.explore else _SUBMIT_NUDGE
-                    st.messages.append({"role": "user", "content": nudge})
-                    continue
-                st.messages.append({"role": "user", "content": _NO_CODE_NUDGE})
-                continue
-            # If the agent called host.env.use() during the previous cell, switch
-            # the kernel into that prebuilt env now (before this cell's imports).
+        llm_cfg = self._llm_cfg(st)
+
+        def add_usage(usage: dict) -> None:
+            self.store.add_frame_tokens(
+                rid,
+                input_tokens=usage.get("prompt_tokens", 0) or 0,
+                output_tokens=usage.get("completion_tokens", 0) or 0,
+            )
+
+        events = WebEventSink(emit, rid, assistant_visible, add_usage)
+
+        def apply_pending() -> None:
             if st.pending_env:
                 self._apply_pending_env(st, emit)
-            info = self._execute_and_log(
+
+        def execute_cell(action) -> dict:
+            return self._execute_and_log(
                 st,
                 action.code,
                 "agent",
                 emit,
                 stream=True,
                 language=action.language,
-            )
-            obs = _format_observation(info["result"])
-            # One cell runs per step: if the model batched SEVERAL code cells
-            # into this single reply, only the FIRST one just executed —
-            # `extract_action` takes the first match and the rest were stripped
-            # as prose and silently dropped. Say so explicitly, or the model
-            # treats the un-run cells (and any output it already narrated for
-            # them) as done and "concludes" the whole task after one cell — the
-            # false-completion bug where a deliverable task ends with an empty
-            # working dir because cells 2..N never ran.
-            if _count_code_blocks(reply) > 1:
-                obs += _MULTI_CELL_NOTE
-            st.messages.append({"role": "user", "content": obs})
-            if st.dispatcher.last_output is not None:
-                return "submitted"
-        return "max_turns"
+            )["result"]
+
+        def finalize_plan(reply, prose: str) -> None:
+            try:
+                self._finalize_plan(st, reply.content, prose, emit)
+            except Exception:  # noqa: BLE001 — plan capture must not break a turn
+                traceback.print_exc()
+
+        engine = AgentEngine(
+            ChatModel(
+                llm_cfg,
+                chat,
+                tools=() if st.plan else control_tool_specs(),
+                stream=True,
+            ),
+            WebActionExecutor(
+                dispatcher=lambda: st.dispatcher,
+                apply_pending=apply_pending,
+                execute_cell=execute_cell,
+                events=events,
+                prose_nudge=_SUBMIT_NUDGE,
+                explore_nudge=_EXPLORE_NUDGE,
+                explore_mode=st.explore,
+                plan_mode=st.plan,
+                finalize_plan=finalize_plan,
+                cancelled=st.cancel.is_set,
+            ),
+            context_policy=CompactionPolicy(self.cfg),
+            event_sink=events,
+            cancellation=EventCancellation(st.cancel),
+            completion=CompletionSignal(
+                lambda: getattr(st.dispatcher, "last_output", None)
+            ),
+            max_turns=max_turns,
+        )
+        state = RunState(st.messages, max_turns=max_turns)
+        return engine.run(state).stop_reason
 
     def _execute_with_watchdog(
         self,

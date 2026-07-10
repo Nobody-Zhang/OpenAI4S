@@ -246,6 +246,16 @@ implementations. They must not duplicate business logic.
 Each phase is a separate commit or short commit series with an explicit test
 gate. Later phases do not begin while the preceding compatibility gate is red.
 
+Current implementation status:
+
+- provider replies and native calls are normalized behind `openai4s.llm`;
+- `openai4s.agent.engine.AgentEngine` is the only outer-loop state machine;
+- local/CLI runs and persistent Web sessions both use that engine through
+  separate runtime/event adapters;
+- fenced `tool` remains a silent compatibility parser, while new runs expose
+  provider-native JSON schemas;
+- host, kernel, storage, and gateway service extraction remains incremental.
+
 ### Phase 1 — Architecture and contract baseline
 
 - Record this decision document.

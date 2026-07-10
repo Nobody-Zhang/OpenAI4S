@@ -35,6 +35,10 @@ class CancellationPort(Protocol):
     def cancelled(self) -> bool: ...
 
 
+class CompletionPort(Protocol):
+    def completion(self) -> Any: ...
+
+
 class ReplyInterceptor(Protocol):
     def intercept(
         self, reply: ModelReply, state: RunState
@@ -54,6 +58,11 @@ class NullEventSink:
 class NeverCancelled:
     def cancelled(self) -> bool:
         return False
+
+
+class NoCompletion:
+    def completion(self) -> None:
+        return None
 
 
 class IdentityReplyInterceptor:

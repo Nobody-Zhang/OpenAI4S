@@ -110,6 +110,16 @@ class FakeCancellation:
         return self.answers.pop(0) if self.answers else False
 
 
+class FakeCompletion:
+    def __init__(self, answers=()):
+        self.answers = list(answers)
+        self.calls = 0
+
+    def completion(self):
+        self.calls += 1
+        return self.answers.pop(0) if self.answers else None
+
+
 class FakeInterceptor:
     def __init__(self, replacement=None):
         self.replacement = replacement
@@ -259,7 +269,8 @@ def test_max_turns_is_a_hard_bound():
     assert result.stop_reason == "max_turns"
     assert result.turns == 2
     assert len(model.calls) == len(executor.calls) == 2
-    assert cancellation.calls == 2
+    # Check once before the model and again before accepting an outcome.
+    assert cancellation.calls == 4
     assert isinstance(events.events[-1], RunFinished)
 
 
@@ -276,6 +287,33 @@ def test_cancellation_stops_before_context_model_or_executor_work():
     assert not model.calls and not context.calls and not executor.calls
     assert not interceptor.calls
     assert [type(event) for event in events.events] == [RunStarted, RunFinished]
+
+
+def test_external_completion_stops_before_another_model_call():
+    model = FakeModel([_reply("must not run")])
+    executor = FakeExecutor()
+    completion = FakeCompletion([{"background": "done"}])
+    engine = AgentEngine(model, executor, completion=completion)
+
+    result = engine.run([{"role": "user", "content": "wait"}])
+
+    assert result.stop_reason == "submitted"
+    assert result.completion == {"background": "done"}
+    assert result.turns == 0
+    assert not model.calls and not executor.calls
+
+
+def test_cancellation_after_execution_wins_over_simultaneous_submit():
+    model = FakeModel([_reply("```python\nhost.submit_output(...)\n```")])
+    executor = FakeExecutor([ExecutionOutcome(completion={"done": True})])
+    cancellation = FakeCancellation([False, True])
+    engine = AgentEngine(model, executor, cancellation=cancellation)
+
+    result = engine.run([{"role": "user", "content": "finish"}])
+
+    assert result.stop_reason == "cancelled"
+    assert result.completion is None
+    assert result.turns == 1
 
 
 def test_interceptor_can_replace_the_reply_before_a_custom_plan_stop():

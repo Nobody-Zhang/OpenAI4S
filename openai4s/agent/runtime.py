@@ -13,7 +13,6 @@ from typing import Any, Callable, Mapping, Sequence
 from openai4s.tools import (
     MAX_TOOL_CALLS_PER_TURN,
     execute_tool_call,
-    finalize_tool_batch,
     parse_tool_calls,
     run_tool_calls,
 )
@@ -27,6 +26,7 @@ from .actions import (
     count_code_blocks,
 )
 from .compaction import compact, safe_keep_recent, should_compact
+from .control import execute_native_batch
 from .events import AgentEvent, OutcomeProduced, ReplyReceived
 from .models import ExecutionOutcome, ModelReply, RunState
 
@@ -41,6 +41,14 @@ def _null_log(*args: object) -> None:
 class TranscriptTurn:
     role: str
     content: str
+
+
+@dataclass
+class CompletionSignal:
+    read: Callable[[], Any]
+
+    def completion(self) -> Any:
+        return self.read()
 
 
 @dataclass
@@ -104,37 +112,13 @@ class LocalActionExecutor:
         return self._execute_legacy_or_nudge(reply)
 
     def _execute_native(self, batch: NativeToolBatch) -> ExecutionOutcome:
-        parts: list[str] = []
-        history: list[dict[str, Any]] = []
-        for index, call in enumerate(batch.calls):
-            if index >= MAX_TOOL_CALLS_PER_TURN:
-                text = (
-                    f"[Tool error] {call.name or '<unnamed>'}: call was not run; "
-                    f"the per-turn limit is {MAX_TOOL_CALLS_PER_TURN}"
-                )
-                ok = False
-            elif call.parse_error is not None or call.arguments is None:
-                detail = call.parse_error or "arguments are not a JSON object"
-                text = f"[Tool error] {call.name or '<unnamed>'}: {detail}"
-                ok = False
-            else:
-                text, ok = execute_tool_call(
-                    self.dispatcher,
-                    {"name": call.name, "arguments": call.arguments},
-                )
-            parts.append(text)
-            history.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call.id,
-                    "wire_id": call.wire_id,
-                    "name": call.name,
-                    "content": text,
-                    "is_error": not ok,
-                }
+        def invoke(call):
+            return execute_tool_call(
+                self.dispatcher,
+                {"name": call.name, "arguments": call.arguments},
             )
-        observation = finalize_tool_batch(parts, len(batch.calls), [])
-        return ExecutionOutcome(tuple(history), observation=observation)
+
+        return execute_native_batch(batch, invoke)
 
     def _execute_code(
         self, action: CodeCell, reply: ModelReply, state: RunState
@@ -223,6 +207,7 @@ def format_observation(result: dict) -> str:
 __all__ = [
     "ChatModel",
     "CompactionPolicy",
+    "CompletionSignal",
     "LocalActionExecutor",
     "TranscriptEventSink",
     "TranscriptTurn",

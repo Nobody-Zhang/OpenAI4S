@@ -43,7 +43,9 @@ flowchart TB
   owns the provider-neutral state machine. [`agent/actions.py`](../openai4s/agent/actions.py)
   chooses a native tool batch, one Python/R cell, or no action.
   [`agent/runtime.py`](../openai4s/agent/runtime.py) connects the engine to the
-  local LLM client, compaction, kernels, dispatcher, and CLI transcript.
+  local LLM client, compaction, kernels, dispatcher, and CLI transcript;
+  [`server/agent_run.py`](../openai4s/server/agent_run.py) projects the same
+  engine events and actions onto persistent Web sessions and WebSocket events.
 - **② Inner loop** — *within a single cell*, agent code can call `host.llm(...)` / `host.delegate(...)` / `host.compute(...)` any number of times. Each is a synchronous `host_call → host_ack → host_response` RPC on a channel **separate from stdout capture**, so the cell blocks, the host services the call mid-execution, and the cell resumes. **This inner RPC loop does not exist in a `tool_use` architecture** — there, actions are atomic and never call back into the host mid-execution.
 
 `AgentEngine` imports no concrete kernel, dispatcher, store, or server. Those

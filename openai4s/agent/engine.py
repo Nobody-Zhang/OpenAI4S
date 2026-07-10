@@ -18,11 +18,13 @@ from .models import EngineResult, ExecutionOutcome, ModelReply, RunState
 from .ports import (
     ActionExecutor,
     CancellationPort,
+    CompletionPort,
     ContextPolicy,
     EventSink,
     IdentityReplyInterceptor,
     ModelPort,
     NeverCancelled,
+    NoCompletion,
     NullEventSink,
     PassthroughContext,
     ReplyInterceptor,
@@ -40,6 +42,7 @@ class AgentEngine:
         context_policy: ContextPolicy | None = None,
         event_sink: EventSink | None = None,
         cancellation: CancellationPort | None = None,
+        completion: CompletionPort | None = None,
         reply_interceptor: ReplyInterceptor | None = None,
         max_turns: int = 32,
     ) -> None:
@@ -50,6 +53,7 @@ class AgentEngine:
         self.context_policy = context_policy or PassthroughContext()
         self.event_sink = event_sink or NullEventSink()
         self.cancellation = cancellation or NeverCancelled()
+        self.completion = completion or NoCompletion()
         self.reply_interceptor = reply_interceptor or IdentityReplyInterceptor()
         self.max_turns = max_turns
 
@@ -64,6 +68,9 @@ class AgentEngine:
         while state.turn < state.max_turns:
             if self.cancellation.cancelled():
                 return self._finish(state, None, "cancelled")
+            completion = self.completion.completion()
+            if completion is not None:
+                return self._finish(state, completion, "submitted")
             turn = state.turn
             self.event_sink.emit(TurnStarted(turn))
             prepared = self.context_policy.prepare(state)
@@ -89,10 +96,15 @@ class AgentEngine:
             state.messages.extend(dict(message) for message in outcome.history_messages)
             state.turn += 1
             self.event_sink.emit(OutcomeProduced(outcome, turn))
+            if self.cancellation.cancelled():
+                return self._finish(state, None, "cancelled")
             if outcome.stop_reason:
                 return self._finish(state, outcome.completion, outcome.stop_reason)
-            if outcome.completion is not None:
-                return self._finish(state, outcome.completion, "submitted")
+            completion = outcome.completion
+            if completion is None:
+                completion = self.completion.completion()
+            if completion is not None:
+                return self._finish(state, completion, "submitted")
         return self._finish(state, None, "max_turns")
 
     def _state(

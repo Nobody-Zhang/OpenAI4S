@@ -13,6 +13,7 @@ from openai4s.agent.engine import AgentEngine
 from openai4s.agent.runtime import (
     ChatModel,
     CompactionPolicy,
+    CompletionSignal,
     LocalActionExecutor,
     TranscriptEventSink,
     TranscriptTurn,
@@ -260,6 +261,9 @@ class Agent:
                     ),
                     context_policy=CompactionPolicy(self.cfg, log=self._log),
                     event_sink=TranscriptEventSink(transcript, log=self._log),
+                    completion=CompletionSignal(
+                        lambda: self.dispatcher.last_output
+                    ),
                     max_turns=self.max_turns,
                 )
                 result = engine.run(messages)
