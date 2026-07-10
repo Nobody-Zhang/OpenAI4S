@@ -100,6 +100,23 @@ through persistent Python/R cells. The old fenced ` ```tool ` parser remains a
 silent compatibility path for saved prompts and older clients, but it is no
 longer advertised to the refactored agent.
 
+## Session kernel ownership
+
+Each Web session owns one [`KernelSupervisor`](../openai4s/kernel/supervisor.py)
+with independent, lazy Python and R slots. The supervisor never executes code
+and never reads a protocol frame: each `Kernel` remains the sole synchronous
+reader for its worker. It only owns lifecycle identity, active-environment keys,
+manual-stop state, and a session-monotonic generation.
+
+Lifecycle replacement is build-first. A new worker and its dispatcher must be
+live before the session publishes them and shuts down the old pair, so a failed
+environment switch leaves the usable runtime intact. Cell execution holds the
+session `turn_lock`; stop first requests cancellation/interrupt, then crosses
+that same lock before shutdown. The watchdog freezes a `KernelLease` and uses
+identity-checked kill/restart/abandon operations, preventing a stale helper from
+damaging a newer worker. Python sidecar bootstrap runs once per new generation,
+outside the supervisor lock; R never runs Python bootstrap.
+
 ## The R execution channel
 
 An ` ```r ` cell runs on a **persistent R kernel** — `kernel/r_worker.R` spawned by [`kernel/r_kernel.py`](../openai4s/kernel/r_kernel.py) through the *same* manager as the python worker (`Kernel(argv=…)`), speaking the same `execute`/`response` frames with the same result contract (`stdout/stderr/error/interrupted/trace.error_lineno/usage`). The R interpreter resolves from the selected env's `Rscript` → the prebuilt `r` env → `PATH`; `host.env.use("r")` retargets the channel. Differences from the python kernel, by design: the R kernel is an **analysis kernel** — no `host` object, no mid-cell RPC, completion stays on the python control plane — and its plots are captured through the workspace diff (`ggsave()` into the working directory), not a figure device. The two namespaces are separate; cells exchange data through workspace files.

@@ -35,6 +35,7 @@ import time
 import traceback
 import uuid
 import zipfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -46,7 +47,7 @@ from openai4s.agent.models import RunState
 from openai4s.agent.runtime import ChatModel, CompactionPolicy, CompletionSignal
 from openai4s.config import Config, get_config, is_placeholder_api_key
 from openai4s.host_dispatch import build_dispatcher
-from openai4s.kernel import Kernel
+from openai4s.kernel import Kernel, KernelLease, KernelSupervisor
 from openai4s.llm import ARK_PLAN_MODELS, PROVIDERS, chat
 from openai4s.review import review_evidence
 from openai4s.server.agent_run import EventCancellation
@@ -60,6 +61,8 @@ os.environ.setdefault("MPLBACKEND", "Agg")  # headless matplotlib for figure cap
 
 WEBUI_DIR = Path(__file__).resolve().parent / "webui"
 _NB_DIVIDER = "----- output -----"  # matches the frontend live-notebook parser
+_WATCHDOG_INTERRUPT_GRACE_S = 10.0
+_WATCHDOG_KILL_GRACE_S = 10.0
 
 
 # --------------------------------------------------------------------------- #
@@ -412,17 +415,22 @@ class SessionState:
         self.root_frame_id = root_frame_id
         self.project_id = project_id
         self.workspace = workspace
-        self.kernel: Kernel | None = None
+        # One owner for both persistent execution channels.  ``Kernel`` keeps
+        # sole ownership of protocol I/O; the supervisor only coordinates
+        # lifecycle and exact-worker identity across cancellation/watchdogs.
+        self.kernels = KernelSupervisor()
         self.dispatcher = None
         self.messages: list[dict] = []
         self.cell_index = 0
         self.booted = False
         self.turn_lock = threading.Lock()
+        # Stop intent is visible before Stop waits for ``turn_lock``. New turns
+        # back off instead of clearing cancellation and overtaking the stop.
+        self.stop_requested = threading.Event()
+        self.stop_finished = threading.Event()
+        self.stop_finished.set()
+        self.stop_lock = threading.Lock()
         self.cancel = threading.Event()
-        # True when the kernel was explicitly stopped by the user (so the next
-        # turn/REPL knows to auto-start a fresh one rather than treating it as
-        # never-booted). Distinguishes "stopped" from "not yet started".
-        self.kernel_manual_stop = False
         # Per-session model override (from the composer dropdown) + plan flag.
         self.model: str | None = None
         self.plan: bool = False
@@ -442,8 +450,39 @@ class SessionState:
         # R-only env (dispatcher.active_r_env), torn down with the session.
         # `r_env_name` records which env the running R kernel resolved against
         # (None = default resolution: the 'r' env, else Rscript on PATH).
-        self.r_kernel: Kernel | None = None
         self.r_env_name: str | None = None
+
+    @property
+    def kernel(self) -> Kernel | None:
+        """Current Python worker (compatibility view; lifecycle lives above)."""
+        return self.kernels.kernel("python")
+
+    @property
+    def r_kernel(self) -> Kernel | None:
+        """Current R worker (compatibility view; lifecycle lives above)."""
+        return self.kernels.kernel("r")
+
+    @property
+    def kernel_manual_stop(self) -> bool:
+        return bool(self.kernels.status("python")["manual_stop"])
+
+    @contextmanager
+    def execution_barrier(self):
+        """Serialize a turn while giving an already-requested Stop priority."""
+        while True:
+            self.turn_lock.acquire()
+            # Admission and cancellation reset are one critical section. If a
+            # Stop arrives after this clear, its newly-set signal survives; if
+            # it arrived before, stop_requested makes this entrant yield.
+            self.cancel.clear()
+            if not self.stop_requested.is_set():
+                break
+            self.turn_lock.release()
+            self.stop_finished.wait()
+        try:
+            yield
+        finally:
+            self.turn_lock.release()
 
 
 class MessageJob:
@@ -1110,55 +1149,68 @@ class SessionRunner:
             pass
         st.messages = [{"role": "system", "content": ctx}]
 
-    def _spawn_kernel(self, st: SessionState) -> None:
-        """Create the persistent kernel process + run skill bootstrap. Does not
-        touch st.messages (so it is safe for stop→start)."""
-        disp = build_dispatcher(self.cfg, frame_id=st.root_frame_id)
-        # Project every visible host.* call into a rich, persisted activity step
-        # (plan / search / env / skill / bash / edit / artifact) so the UI shows
-        # what the agent DID, not the Python it wrote to do it.
-        disp.on_step = self._make_step_sink(st)
-        disp.on_plan = self._make_plan_sink(st)
-        # keep the R-channel target across dispatcher rebuilds (env switches,
-        # kernel restarts) — the R kernel itself is lazy and session-scoped
-        disp.active_r_env = getattr(st.dispatcher, "active_r_env", None)
-        st.dispatcher = disp
-        self._wire_delegation(st)
-        # Register this conversation's UI channel with the permission broker so
-        # tool-call approval prompts (from this kernel, its background cells, or
-        # any delegated sub-agent) surface here and can be answered.
-        try:
-            from openai4s.permissions import broker
+    def _spawn_kernel(self, st: SessionState) -> KernelLease:
+        """Ensure the Python worker matches the resolved runtime environment.
 
-            _rid = st.root_frame_id
-            broker().register_channel(
-                _rid,
-                self.hub.emitter(_rid),
-                cancel_event=st.cancel,
-                # only prompt when a human is actually watching this conversation
-                watching=lambda r=_rid: self.hub.has_subscriber(r),
-            )
-        except Exception:  # noqa: BLE001
-            pass
-        # Resolve which prebuilt environment this kernel runs in. Falls back to
-        # the base kernel when the requested env is gone or is R-only (no Python
-        # to host the notebook kernel). The agent can switch with host.env.use().
+        The candidate dispatcher stays local until ``KernelSupervisor`` accepts
+        its worker.  If construction fails, the old worker/dispatcher pair and
+        active environment metadata remain intact.
+        """
+        previous_env = st.env_name
         env = self._resolve_env(st)
-        disp.active_env_bin = env.bin_dir  # env-name reporting (host.env.list)
-        disp.on_env_switch = self._make_env_switch_sink(st)
-        st.kernel = Kernel(
-            dispatcher=disp,
-            cwd=str(st.workspace),
-            mode="repl",
-            python=env.interpreter,
-            env_root=str(env.root) if env.is_conda else None,
-            env_name=env.name,
+        env_key = (
+            env.name,
+            str(env.interpreter or ""),
+            str(env.root) if getattr(env, "is_conda", False) else None,
         )
-        st.kernel_manual_stop = False
-        self._run_bootstrap(st)
-        st.booted = True
 
-    def _wire_delegation(self, st: SessionState) -> None:
+        def factory() -> Kernel:
+            disp = build_dispatcher(self.cfg, frame_id=st.root_frame_id)
+            # Project every visible host.* call into persisted UI activity.
+            disp.on_step = self._make_step_sink(st)
+            disp.on_plan = self._make_plan_sink(st)
+            # Preserve the lazy R-channel target across Python replacements.
+            disp.active_r_env = getattr(st.dispatcher, "active_r_env", None)
+            self._wire_delegation(st, disp)
+            try:
+                from openai4s.permissions import broker
+
+                _rid = st.root_frame_id
+                broker().register_channel(
+                    _rid,
+                    self.hub.emitter(_rid),
+                    cancel_event=st.cancel,
+                    watching=lambda r=_rid: self.hub.has_subscriber(r),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            disp.active_env_bin = env.bin_dir
+            disp.on_env_switch = self._make_env_switch_sink(st)
+            return Kernel(
+                dispatcher=disp,
+                cwd=str(st.workspace),
+                mode="repl",
+                python=env.interpreter,
+                env_root=str(env.root) if env.is_conda else None,
+                env_name=env.name,
+            )
+
+        previous_lease = st.kernels.lease("python")
+        try:
+            lease = st.kernels.ensure("python", env_key, factory)
+        except BaseException:
+            st.env_name = previous_env
+            raise
+        st.dispatcher = lease.kernel.dispatcher
+        if previous_lease is None or previous_lease.kernel is not lease.kernel:
+            # Run outside the supervisor lock so cancellation can interrupt a
+            # slow sidecar.  The caller's turn_lock still prevents execution
+            # from racing this one-time bootstrap.
+            self._run_bootstrap(st, lease.kernel)
+        st.booted = True
+        return lease
+
+    def _wire_delegation(self, st: SessionState, dispatcher=None) -> None:
         """Enable host.delegate inside web-session kernels.
 
         The standalone Agent wires this in its __post_init__, but the web UI uses
@@ -1167,7 +1219,7 @@ class SessionRunner:
         Rewire per turn so delegated specialists inherit the currently selected
         model from the composer dropdown.
         """
-        disp = st.dispatcher
+        disp = dispatcher if dispatcher is not None else st.dispatcher
         if disp is None:
             return
         delegation_enabled = str(
@@ -1252,7 +1304,7 @@ class SessionRunner:
         return sink
 
     def _ensure_kernel(self, st: SessionState) -> None:
-        if st.kernel is not None:
+        if st.kernels.alive("python"):
             return
         self._seed_messages(st)
         self._spawn_kernel(st)
@@ -1349,25 +1401,23 @@ class SessionRunner:
             broker().cancel_root(root_frame_id)
         except Exception:  # noqa: BLE001
             pass
-        if st.kernel is not None:
-            try:
-                st.kernel.interrupt()
-            except Exception:
-                pass
-        # a running ```r cell blocks the turn thread on the R worker — Stop must
-        # reach BOTH kernels or the R channel is uncancellable until the watchdog
-        if st.r_kernel is not None:
-            try:
-                st.r_kernel.interrupt()
-            except Exception:  # noqa: BLE001
-                pass
+        # A running ```r cell blocks the same turn thread as Python.  Interrupt
+        # both exact supervisor slots without waiting on the execution barrier.
+        st.kernels.interrupt()
 
-    def _run_bootstrap(self, st: SessionState) -> None:
+    def interrupt_kernel(self, root_frame_id: str) -> dict:
+        """Best-effort user interrupt for both persistent execution channels."""
+        st = self._sessions.get(root_frame_id)
+        interrupted = st.kernels.interrupt() if st is not None else 0
+        return {"ok": True, "interrupted": interrupted, "frame_id": root_frame_id}
+
+    def _run_bootstrap(self, st: SessionState, kernel: Kernel | None = None) -> None:
         """(Re)run skill-sidecar bootstrap in the session kernel."""
         try:
             boot = _maybe_call(getattr(self.skills, "bootstrap_code", ""))
-            if boot and boot.strip():
-                st.kernel.execute(boot, origin="system")
+            target = kernel if kernel is not None else st.kernel
+            if target is not None and boot and boot.strip():
+                target.execute(boot, origin="system")
         except Exception:  # noqa: BLE001
             pass
 
@@ -1381,39 +1431,40 @@ class SessionRunner:
         """
         st = self._state(root_frame_id, project_id)
         emit = self.hub.emitter(root_frame_id)
-        with st.turn_lock:
+        with st.execution_barrier():
             # the R kernel restarts with the session: drop it here and let the
             # next ```r cell respawn it fresh (same lazy path as first use)
-            if st.r_kernel is not None:
-                try:
-                    st.r_kernel.shutdown()
-                except Exception:  # noqa: BLE001
-                    pass
-                st.r_kernel = None
+            st.kernels.stop("r", manual=False)
             if st.kernel is None:
                 self._ensure_kernel(st)
+                lease = st.kernels.lease("python")
             elif st.desired_env and st.desired_env != st.env_name:
                 # The active kernel is a transient base fallback. A full spawn
                 # re-runs environment resolution so a recovered pinned env can
                 # finally take effect; Kernel.restart() would reuse base Python.
-                try:
-                    st.kernel.shutdown()
-                except Exception:  # noqa: BLE001 — respawn is the recovery path
-                    pass
-                st.kernel = None
-                self._spawn_kernel(st)
+                previous = st.kernels.lease("python")
+                lease = self._spawn_kernel(st)
+                if previous is not None and lease.kernel is previous.kernel:
+                    # The pin is still unavailable, so resolution selected the
+                    # same fallback key and ensure() correctly reused it. An
+                    # explicit Restart must still clear that base namespace.
+                    lease = st.kernels.restart(
+                        "python",
+                        after_restart=lambda kernel: self._run_bootstrap(st, kernel),
+                    )
             else:
-                st.kernel.restart()
-                self._run_bootstrap(st)
-            gen = getattr(st.kernel, "generation", 0)
-        emit(
-            {
-                "type": "kernel_status",
-                "frame_id": root_frame_id,
-                "status": "restarted",
-                "generation": gen,
-            }
-        )
+                lease = st.kernels.restart(
+                    "python", after_restart=lambda kernel: self._run_bootstrap(st, kernel)
+                )
+            gen = lease.generation if lease is not None else 0
+            emit(
+                {
+                    "type": "kernel_status",
+                    "frame_id": root_frame_id,
+                    "status": "restarted",
+                    "generation": gen,
+                }
+            )
         return {
             "ok": True,
             "status": "restarted",
@@ -1473,39 +1524,26 @@ class SessionRunner:
         """Cheap 'is this session's kernel process live' — no job scan (unlike
         kernel_status)."""
         st = self._sessions.get(root_frame_id)
-        return bool(
-            st
-            and st.kernel is not None
-            and (not hasattr(st.kernel, "is_alive") or st.kernel.is_alive())
-        )
+        return bool(st and st.kernels.alive("python"))
 
     def kernel_status(self, root_frame_id: str) -> dict:
         """Report a session's notebook/kernel state so the UI can offer
         stop/start/resume."""
         st = self._sessions.get(root_frame_id)
-        alive = bool(
-            st
-            and st.kernel is not None
-            and (not hasattr(st.kernel, "is_alive") or st.kernel.is_alive())
-        )
+        supervisor_status = st.kernels.status("python") if st else None
+        alive = bool(supervisor_status and supervisor_status["alive"])
         if st is None:
             state = "none"
-        elif alive:
-            state = "running"
-        elif st.kernel_manual_stop:
-            state = "stopped"
         else:
-            state = "none"
+            state = supervisor_status["state"]
         return {
             "frame_id": root_frame_id,
             "state": state,  # none | running | stopped
             "alive": alive,
-            "generation": getattr(st.kernel, "generation", 0)
-            if st and st.kernel
-            else 0,
+            "generation": supervisor_status["generation"] if supervisor_status else 0,
             "turn_running": self.is_running(root_frame_id),
             "cell_count": (st.cell_index if st else 0),
-            "manual_stop": bool(st and st.kernel_manual_stop),
+            "manual_stop": bool(supervisor_status and supervisor_status["manual_stop"]),
             "env": self._env_summary(st),
             "repl_enabled": bool(self.cfg.notebook_repl),
         }
@@ -1558,7 +1596,7 @@ class SessionRunner:
         return f"r — {name}"
 
     def _ensure_r_kernel(self, st: SessionState) -> str | None:
-        """Make st.r_kernel live and targeted, or return a soft error string.
+        """Make the supervised R slot live and targeted, or soft-fail.
 
         Mirrors agent/loop.py Agent._execute_r: respawn when the worker died or
         host.env.use() retargeted the R channel (dispatcher.active_r_env). The
@@ -1566,25 +1604,20 @@ class SessionRunner:
         python — this never raises.
         """
         want = getattr(st.dispatcher, "active_r_env", None)
-        k = st.r_kernel
-        if k is not None and (not k.is_alive() or st.r_env_name != want):
-            try:
-                k.shutdown()
-            except Exception:  # noqa: BLE001
-                pass
-            st.r_kernel = None
-            k = None
-        if k is None:
-            from openai4s.kernel.environments import get_environment
-            from openai4s.kernel.r_kernel import spawn_r_kernel
+        from openai4s.kernel.environments import get_environment
+        from openai4s.kernel.r_kernel import spawn_r_kernel
 
-            try:
-                st.r_kernel = spawn_r_kernel(
+        try:
+            lease = st.kernels.ensure(
+                "r",
+                want,
+                lambda: spawn_r_kernel(
                     cwd=str(st.workspace), env=get_environment(want)
-                )
-            except Exception as e:  # noqa: BLE001 — soft-fail into the observation
-                return f"R kernel unavailable: {e}"
-            st.r_env_name = want
+                ),
+            )
+        except Exception as e:  # noqa: BLE001 — soft-fail into the observation
+            return f"R kernel unavailable: {e}"
+        st.r_env_name = lease.key
         return None
 
     def stop_kernel(self, root_frame_id: str, project_id: str = "default") -> dict:
@@ -1594,43 +1627,49 @@ class SessionRunner:
         st = self._sessions.get(root_frame_id)
         if st is None:
             return {"ok": True, "state": "none", "frame_id": root_frame_id}
-        self.cancel(root_frame_id)
-        if st.kernel is not None:
-            try:
-                st.kernel.shutdown()
-            except Exception:  # noqa: BLE001
-                pass
-            st.kernel = None
-        if st.r_kernel is not None:
-            try:
-                st.r_kernel.shutdown()
-            except Exception:  # noqa: BLE001
-                pass
-            st.r_kernel = None
-        st.kernel_manual_stop = True
-        st.cancel.clear()
         emit = self.hub.emitter(root_frame_id)
-        emit({"type": "kernel_status", "frame_id": root_frame_id, "status": "stopped"})
+        with st.stop_lock:
+            st.stop_finished.clear()
+            st.stop_requested.set()
+            try:
+                self.cancel(root_frame_id)
+                # Wait for the single protocol reader to leave before detaching
+                # and shutting down its worker. New turns observe stop_requested
+                # and yield this barrier instead of clearing cancellation.
+                with st.turn_lock:
+                    st.kernels.stop("python", manual=True)
+                    st.kernels.stop("r", manual=True)
+                # Publish the stopped state before waking a queued start; its
+                # later "started" event must be the final visible lifecycle.
+                emit(
+                    {
+                        "type": "kernel_status",
+                        "frame_id": root_frame_id,
+                        "status": "stopped",
+                    }
+                )
+            finally:
+                st.stop_requested.clear()
+                st.stop_finished.set()
         return {"ok": True, "state": "stopped", "frame_id": root_frame_id}
 
     def start_kernel(self, root_frame_id: str, project_id: str = "default") -> dict:
         """(Re)start a stopped/absent kernel WITHOUT wiping the conversation, so
         the user can resume. Idempotent when already running."""
         st = self._state(root_frame_id, project_id)
-        with st.turn_lock:
-            if st.kernel is None:
-                self._seed_messages(st)
-                self._spawn_kernel(st)
-            gen = getattr(st.kernel, "generation", 0)
         emit = self.hub.emitter(root_frame_id)
-        emit(
-            {
-                "type": "kernel_status",
-                "frame_id": root_frame_id,
-                "status": "started",
-                "generation": gen,
-            }
-        )
+        with st.execution_barrier():
+            self._ensure_kernel(st)
+            lease = st.kernels.lease("python")
+            gen = lease.generation if lease is not None else 0
+            emit(
+                {
+                    "type": "kernel_status",
+                    "frame_id": root_frame_id,
+                    "status": "started",
+                    "generation": gen,
+                }
+            )
         return {
             "ok": True,
             "state": "running",
@@ -1680,36 +1719,29 @@ class SessionRunner:
             }
         st = self._state(root_frame_id, project_id)
         emit = self.hub.emitter(root_frame_id)
-        with st.turn_lock:
+        with st.execution_barrier():
             st.pending_env = None
             already = (
                 st.env_name == env_name
-                and st.kernel is not None
-                and st.kernel.is_alive()
+                and st.kernels.alive("python")
             )
             st.desired_env = env_name
-            st.env_name = env_name
             self._persist_env(root_frame_id, env_name)
             if not already:
-                # respawn into the new interpreter (fresh dispatcher + bootstrap)
-                if st.kernel is not None:
-                    try:
-                        st.kernel.shutdown()
-                    except Exception:  # noqa: BLE001
-                        pass
-                    st.kernel = None
                 self._seed_messages(st)
-                self._spawn_kernel(st)
-            gen = getattr(st.kernel, "generation", 0)
-        emit(
-            {
-                "type": "kernel_status",
-                "frame_id": root_frame_id,
-                "status": "env_changed",
-                "generation": gen,
-                "env": self._env_summary(st),
-            }
-        )
+                lease = self._spawn_kernel(st)
+            else:
+                lease = st.kernels.lease("python")
+            gen = lease.generation if lease is not None else 0
+            emit(
+                {
+                    "type": "kernel_status",
+                    "frame_id": root_frame_id,
+                    "status": "env_changed",
+                    "generation": gen,
+                    "env": self._env_summary(st),
+                }
+            )
         return {
             "ok": True,
             "state": "running",
@@ -1744,20 +1776,13 @@ class SessionRunner:
         if target == st.env_name:
             self._persist_env(st.root_frame_id, target)
             return
-        st.env_name = target
-        if st.kernel is not None:
-            try:
-                st.kernel.shutdown()
-            except Exception:  # noqa: BLE001
-                pass
-            st.kernel = None
-        self._spawn_kernel(st)
+        lease = self._spawn_kernel(st)
         emit(
             {
                 "type": "kernel_status",
                 "frame_id": st.root_frame_id,
                 "status": "env_changed",
-                "generation": getattr(st.kernel, "generation", 0),
+                "generation": lease.generation,
                 "env": self._env_summary(st),
             }
         )
@@ -1857,7 +1882,7 @@ class SessionRunner:
             job_error: str | None = None
             try:
                 st = self._state(root_frame_id, project_id)
-                with st.turn_lock:
+                with st.execution_barrier():
                     # Capture after acquiring the turn lock. If the user requested
                     # a review while a turn was still running, that turn gets to
                     # publish its real terminal status before we temporarily show
@@ -1877,7 +1902,6 @@ class SessionRunner:
                         # daemon crash before temporarily showing the Reviewer.
                         frame_status = "ready"
                         self.store.update_frame(root_frame_id, status=frame_status)
-                    st.cancel.clear()
                     if operation_cancel.is_set():
                         st.cancel.set()
                     emit(
@@ -2702,8 +2726,7 @@ class SessionRunner:
         # plan mode wins: a plan turn never executes, so explore is meaningless
         st.explore = bool(explore) and not st.plan
         emit = self.hub.emitter(root_frame_id)
-        with st.turn_lock:
-            st.cancel.clear()
+        with st.execution_barrier():
             self._ensure_kernel(st)
             self._wire_delegation(st)
             self.store.update_frame(root_frame_id, status="processing")
@@ -2958,13 +2981,13 @@ class SessionRunner:
         code: str,
         origin: str,
         on_chunk,
-        kernel_attr: str = "kernel",
+        language: str = "python",
     ) -> dict:
         """Run one cell but NEVER let a wedged kernel hang the turn forever.
 
-        `kernel_attr` names the SessionState slot holding the target kernel —
-        "kernel" (python) or "r_kernel" — the SIGINT/kill/abandon ladder below
-        is language-neutral.
+        A lease freezes the exact Python or R worker for the whole watchdog
+        ladder. A stale helper can therefore never kill, restart, or abandon a
+        replacement worker installed by another lifecycle operation.
 
         The kernel read loop (`Kernel.execute` → `_readline`) blocks on the
         worker's stdout with no timeout, so if the worker wedges (e.g. a cell
@@ -2978,8 +3001,8 @@ class SessionRunner:
           2. else hard-KILL the old worker. If the helper was blocked in the read
              loop this EOFs it and it dies → we `restart()` the kernel in place.
           3. else (helper wedged inside a host-side call — SIGKILL of the worker
-             can't reach it) we ABANDON this Kernel (`st.kernel=None`, respawned
-             lazily) rather than `restart()` it: restarting the SHARED kernel
+             can't reach it) we ABANDON this exact lease (respawned lazily)
+             rather than `restart()` it: restarting the SHARED kernel
              would reassign the `_proc` slot the zombie still holds and let it
              corrupt/steal frames from a fresh worker. The zombie stays bound to
              the dead old proc and dies when its call returns.
@@ -2991,22 +3014,22 @@ class SessionRunner:
         import math
         import os
 
+        lease = st.kernels.lease(language)
+        if lease is None:
+            raise RuntimeError(f"{language} kernel is not available")
+        kernel = lease.kernel
         try:
             cap = float(os.environ.get("OPENAI4S_CELL_TIMEOUT", "900") or 900)
         except (TypeError, ValueError):
             cap = 900.0
         if not math.isfinite(cap) or cap <= 0:  # inf/nan/<=0 → disable (old behaviour)
-            return getattr(st, kernel_attr).execute(
-                code, origin=origin, on_chunk=on_chunk
-            )
+            return kernel.execute(code, origin=origin, on_chunk=on_chunk)
 
         box: dict = {}
 
         def _run() -> None:
             try:
-                box["result"] = getattr(st, kernel_attr).execute(
-                    code, origin=origin, on_chunk=on_chunk
-                )
+                box["result"] = kernel.execute(code, origin=origin, on_chunk=on_chunk)
             except BaseException as e:  # noqa: BLE001 — relay to the caller thread
                 box["error"] = e
 
@@ -3031,6 +3054,8 @@ class SessionRunner:
             th.join(slice_)
             if not th.is_alive():
                 break
+            if st.cancel.is_set():
+                break
             if _brk is not None and _brk.is_pending(st.root_frame_id):
                 continue  # paused for approval — do not spend the watchdog budget
             remaining -= slice_
@@ -3042,12 +3067,11 @@ class SessionRunner:
         # Cap exceeded — try a gentle SIGINT first. It breaks a Python-level hang
         # and KEEPS the kernel + namespace, so the cell just comes back as an
         # interrupted (error) result and the turn continues.
-        kernel = getattr(st, kernel_attr)
         try:
             kernel.interrupt()
         except Exception:  # noqa: BLE001
             pass
-        th.join(10)
+        th.join(_WATCHDOG_INTERRUPT_GRACE_S)
         if not th.is_alive():
             if "error" in box:
                 raise box["error"]
@@ -3059,30 +3083,27 @@ class SessionRunner:
                 "error": f"cell interrupted after exceeding {int(cap)}s",
             }
 
-        # Still wedged after SIGINT. Hard-kill the OLD worker in place (do NOT
-        # reassign self._proc). If the helper was blocked in the kernel READ this
-        # EOFs it and it dies; if it was blocked in a host-side call, kill can't
-        # reach it.
-        try:
-            proc = getattr(kernel, "_proc", None)
-            if proc is not None:
-                proc.kill()
-        except Exception:  # noqa: BLE001
-            pass
-        th.join(10)
+        # Still wedged after SIGINT. Hard-kill only the worker captured by this
+        # lease. If it is no longer current, the supervisor leaves the newer
+        # worker untouched.
+        st.kernels.kill_if_current(lease)
+        th.join(_WATCHDOG_KILL_GRACE_S)
         if th.is_alive():
             # Helper is stuck in a host-side call (not the read loop). Restarting
             # the SHARED kernel would reassign the _proc slot the zombie still
             # holds → frame corruption/steal. Abandon this Kernel instead; the
             # session lazily respawns a fresh one and the zombie dies harmlessly
             # against the dead old proc.
-            setattr(st, kernel_attr, None)
+            st.kernels.abandon_if_current(lease)
         else:
             # Helper is gone — safe to restart the shared Kernel in place.
             try:
-                kernel.restart()
-                if kernel_attr == "kernel":
-                    self._run_bootstrap(st)  # skill sidecars are python-only
+                callback = (
+                    (lambda target: self._run_bootstrap(st, target))
+                    if language == "python"
+                    else None
+                )
+                st.kernels.restart_if_current(lease, after_restart=callback)
             except Exception:  # noqa: BLE001
                 pass
         raise TimeoutError(
@@ -3262,22 +3283,17 @@ class SessionRunner:
                 "saved": [],
             }
         if language == "r":
+            r_lease = st.kernels.lease("r")
             try:
                 result = self._execute_with_watchdog(
-                    st, code, origin, on_chunk, kernel_attr="r_kernel"
+                    st, code, origin, on_chunk, language="r"
                 )
             except BaseException:
-                # a dead/desynced R worker must never poison the session:
-                # drop it so the next ```r cell respawns fresh. The turn still
-                # fails (uniform kernel-death contract) — but not every later
-                # R turn with it.
-                dead = st.r_kernel
-                st.r_kernel = None
-                if dead is not None:
-                    try:
-                        dead.shutdown()
-                    except Exception:  # noqa: BLE001
-                        pass
+                # A callback/protocol error may leave a live worker with an old
+                # response still buffered. Close only the lease that executed
+                # this cell; watchdog recovery may already have advanced it.
+                if r_lease is not None:
+                    st.kernels.shutdown_if_current(r_lease)
                 raise
         else:
             result = self._execute_with_watchdog(st, code, origin, on_chunk)
@@ -3661,7 +3677,7 @@ class SessionRunner:
         """Execute code directly in the session kernel (notebook REPL, no LLM)."""
         st = self._state(root_frame_id, project_id)
         emit = self.hub.emitter(root_frame_id)
-        with st.turn_lock:
+        with st.execution_barrier():
             self._ensure_kernel(st)
             info = self._execute_and_log(st, code, "user", emit, stream=False)
             r = info["result"]
@@ -5341,18 +5357,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                         403,
                     )
                     return
-                st = runner._sessions.get(m.group(1))  # noqa: SLF001
-                if st and st.kernel is not None:
-                    try:
-                        st.kernel.interrupt()
-                    except Exception:  # noqa: BLE001
-                        pass
-                if st and st.r_kernel is not None:
-                    try:
-                        st.r_kernel.interrupt()
-                    except Exception:  # noqa: BLE001
-                        pass
-                self._json({"ok": True})
+                self._json(runner.interrupt_kernel(m.group(1)))
                 return
             m = re.fullmatch(r"/frames/([^/]+)/kernel/start", sub)
             if m and method == "POST":

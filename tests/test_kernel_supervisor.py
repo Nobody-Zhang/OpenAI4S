@@ -140,6 +140,20 @@ def test_restart_stop_and_start_keep_a_monotonic_session_generation():
     assert booted[-1] is started.kernel
 
 
+def test_explicit_stop_before_first_worker_records_manual_state():
+    supervisor = KernelSupervisor()
+
+    assert supervisor.stop("python", manual=True) == 0
+    assert supervisor.status("python") == {
+        "language": "python",
+        "state": "stopped",
+        "alive": False,
+        "generation": 0,
+        "manual_stop": True,
+        "key": None,
+    }
+
+
 def test_interrupt_and_stop_all_cover_python_and_r_slots():
     supervisor = KernelSupervisor()
     py_created: list[FakeKernel] = []
@@ -214,6 +228,22 @@ def test_abandon_current_detaches_zombie_without_shutdown_then_recovers():
     recovered = supervisor.ensure("python", "base", create)
     assert recovered.generation == 1
     assert recovered.kernel is created[1]
+
+
+def test_shutdown_if_current_closes_only_the_exact_desynchronized_worker():
+    supervisor = KernelSupervisor()
+    created: list[FakeKernel] = []
+    create = _factory(created, "r")
+    stale = supervisor.ensure("r", "r-old", create)
+    current = supervisor.ensure("r", "r-new", create)
+
+    assert supervisor.shutdown_if_current(stale) is False
+    assert supervisor.current("r") == current
+    assert current.kernel.shutdown_calls == 0
+
+    assert supervisor.shutdown_if_current(current) is True
+    assert supervisor.current("r") is None
+    assert current.kernel.shutdown_calls == 1
 
 
 def test_unknown_slots_are_empty_and_restart_requires_a_factory():

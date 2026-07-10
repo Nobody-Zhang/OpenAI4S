@@ -1337,6 +1337,12 @@ def test_notebook_repl_execute_route_gated_by_flag(monkeypatch, tmp_path):
     assert hits == [(fid, "default", "print(2)")]
     assert replies2[-1] == (200, sentinel)
 
+    interrupts = []
+    runner2.interrupt_kernel = lambda rfid: interrupts.append(rfid) or {"ok": True}
+    handler2._api("POST", f"/frames/{fid}/kernel/interrupt")
+    assert interrupts == [fid]
+    assert replies2[-1] == (200, {"ok": True})
+
 
 def test_resolve_env_does_not_clobber_pin_when_env_unresolvable(monkeypatch, tmp_path):
     """Regression: a transiently-unresolvable pinned env must fall back to base
@@ -1387,29 +1393,72 @@ def test_restart_respawns_when_active_env_is_only_a_pin_fallback(monkeypatch, tm
     calls = []
 
     class FallbackKernel:
-        generation = 1
-
         def shutdown(self):
             calls.append("shutdown")
 
         def restart(self):
             calls.append("restart")
 
-    st.kernel = FallbackKernel()
+    st.kernels.ensure("python", "base", FallbackKernel)
     st.env_name = "base"
     st.desired_env = "struct"
 
     def spawn(state):
         calls.append("spawn")
         state.env_name = state.desired_env
-        state.kernel = SimpleNamespace(generation=2)
+        return state.kernels.ensure(
+            "python",
+            "struct",
+            lambda: SimpleNamespace(shutdown=lambda: None),
+        )
 
     monkeypatch.setattr(runner, "_spawn_kernel", spawn)
     result = runner.restart_kernel(st.root_frame_id, st.project_id)
 
-    assert calls == ["shutdown", "spawn"]
+    # Replacement is build-first: the old base worker is shut down only after
+    # the recovered target worker exists.
+    assert calls == ["spawn", "shutdown"]
     assert st.env_name == "struct"
-    assert result["generation"] == 2
+    assert result["generation"] == 1
+
+
+def test_restart_still_clears_namespace_when_pin_remains_unavailable(
+    monkeypatch, tmp_path
+):
+    """A fallback resolving to the same base key must not turn Restart into reuse."""
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    st = runner._state("f-restart-still-fallback", "default")
+    calls = []
+
+    class FallbackKernel:
+        def restart(self):
+            calls.append("restart")
+
+        def shutdown(self):
+            calls.append("shutdown")
+
+    kernel = FallbackKernel()
+    st.kernels.ensure("python", "base", lambda: kernel)
+    st.env_name = "base"
+    st.desired_env = "struct"
+
+    def unresolved(state):
+        calls.append("resolve-base")
+        return state.kernels.ensure("python", "base", lambda: FallbackKernel())
+
+    monkeypatch.setattr(runner, "_spawn_kernel", unresolved)
+    monkeypatch.setattr(
+        runner,
+        "_run_bootstrap",
+        lambda state, target=None: calls.append("bootstrap"),
+    )
+
+    result = runner.restart_kernel(st.root_frame_id, st.project_id)
+
+    assert st.kernel is kernel
+    assert calls == ["resolve-base", "restart", "bootstrap"]
+    assert result["generation"] == 1
 
 
 def test_tool_batch_applies_env_switch_before_following_call(monkeypatch, tmp_path):

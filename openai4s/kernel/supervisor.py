@@ -108,7 +108,14 @@ class KernelSupervisor:
 
     def stop(self, language: str | None = None, *, manual: bool = True) -> int:
         with self._lock:
-            names = [language] if language is not None else list(self._slots)
+            if language is not None:
+                # An explicit stop is meaningful even before the first worker:
+                # callers can distinguish a user-stopped session from one that
+                # has never been started.
+                self._slot(language)
+                names = [language]
+            else:
+                names = list(self._slots)
             kernels: list[Any] = []
             for name in names:
                 slot = self._slots.get(name)
@@ -150,6 +157,18 @@ class KernelSupervisor:
                 return False
             slot.kernel = None
             return True
+
+    def shutdown_if_current(self, lease: KernelLease, *, manual: bool = False) -> bool:
+        """Detach and shut down an exact desynchronized worker if still current."""
+        with self._lock:
+            slot = self._slots.get(lease.language)
+            if not self._matches(slot, lease):
+                return False
+            kernel = slot.kernel
+            slot.kernel = None
+            slot.manual_stop = manual
+        self._shutdown(kernel)
+        return True
 
     def restart_if_current(
         self,
