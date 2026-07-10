@@ -1,8 +1,9 @@
-"""Pipeline configuration + config search space.
+"""Pipeline configuration.
 
-A ``config`` is a plain dict that fully determines one pass of the pipeline
-(preprocessing -> matching -> unmixing -> diagnosis). The outer loop searches
-over the space defined by ``SEARCH_SPACE`` and keeps the best-scoring config.
+A ``config`` is a plain dict of fixed hyperparameters that fully determines the
+analysis: global preprocessing (done once) -> iterative peak-driven matching &
+spectral subtraction -> unmixing -> diagnosis. There is no config search — the
+loop is the iterative subtraction over residuals, not a hyperparameter search.
 """
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ GRID_STEP = 2.0
 
 
 # ---------------------------------------------------------------------------
-# Default pipeline config. The loop mutates a copy of this.
+# Default pipeline config (fixed hyperparameters).
 # ---------------------------------------------------------------------------
 DEFAULT_CONFIG = {
     # --- despike (cosmic-ray removal) ---
@@ -41,35 +42,26 @@ DEFAULT_CONFIG = {
     # --- normalisation ---
     "normalise_method": "area",     # {"area", "max", "l2"}
 
-    # --- candidate selection (library matching) ---
-    "selection_method": "greedy",   # {"greedy" (OMP-style), "topk"}
-    "match_metric": "pearson",      # correlation metric for ranking
-    "top_k": 8,                     # topk: keep K hits; greedy: max components
-    "corr_threshold": 0.3,          # candidate must exceed this correlation
-    "greedy_min_gain": 0.01,        # greedy: min relative-residual drop to keep a component
+    # --- second-derivative peak detection (produces the "clean" peak list) ---
+    "peak_smooth_window": 11,        # SavGol window for the 2nd-derivative
+    "peak_savgol_poly": 3,           # SavGol polyorder for the 2nd-derivative
+    "peak_prominence_sigma": 3.0,    # trough prominence threshold (x MAD noise)
+    "peak_min_distance_cm": 8.0,     # min spacing between detected peaks (cm^-1)
+
+    # --- peak-driven candidate pre-filter ---
+    "peak_prefilter_enabled": True,  # restrict matching to minerals whose ref
+                                     # peaks coincide with the detected peaks
+    "peak_match_tol_cm": 8.0,        # ref/target peak coincidence tolerance
+    "peak_min_matches": 1,           # min coincident peaks for a mineral to pass
+
+    # --- library matching (peak-driven, per residual step) ---
+    "match_metric": "pearson",      # correlation metric for ranking a residual
+    "top_k": 8,                     # max number of components (subtraction steps)
+    "corr_threshold": 0.3,          # a candidate must exceed this correlation
+    "greedy_min_gain": 0.01,        # min relative-residual drop to keep a component
 
     # --- unmixing (NNLS) ---
     "fraction_threshold": 0.05,     # drop components below this fraction, refit
-}
-
-
-# ---------------------------------------------------------------------------
-# Search space for the outer loop. Each key maps to a list of candidate values.
-# ---------------------------------------------------------------------------
-SEARCH_SPACE = {
-    "despike_threshold": [5.0, 7.0, 10.0],
-    "denoise_method": ["savgol", "gaussian"],
-    "denoise_window": [5, 7, 11, 15],
-    "baseline_method": ["asls", "airpls", "poly"],
-    "baseline_lam": [1e4, 1e5, 1e6],
-    "baseline_p": [0.001, 0.01, 0.05],
-    "baseline_poly_order": [3, 5, 7],
-    "normalise_method": ["area", "max", "l2"],
-    "selection_method": ["greedy", "topk"],
-    "top_k": [5, 8, 12, 20],
-    "corr_threshold": [0.2, 0.3, 0.4],
-    "greedy_min_gain": [0.005, 0.01, 0.02, 0.04],
-    "fraction_threshold": [0.03, 0.05, 0.1],
 }
 
 
