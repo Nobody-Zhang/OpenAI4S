@@ -145,7 +145,13 @@ def test_dispatcher_env_list_and_use(tmp_path, monkeypatch):
     assert u["ok"] is True and switched["name"] == "python"
 
     assert "error" in disp._m_env_use({"name": "nope"})
-    assert "error" in disp._m_env_use({"name": "r"})  # R has no Python kernel
+    # an R-only env is no longer refused: it retargets the ```r channel (the
+    # persistent R kernel) and leaves the python kernel untouched
+    u_r = disp._m_env_use({"name": "r"})
+    assert u_r["ok"] is True
+    assert disp.active_r_env == "r"
+    assert switched["name"] == "r"  # gateway applies via the pending-env path
+    assert "```r" in u_r["note"]
 
 
 # --- gateway wiring -------------------------------------------------------

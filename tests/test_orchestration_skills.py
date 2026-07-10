@@ -173,8 +173,12 @@ def test_compute_env_setup_pkgscan(session, tmp_path):
     _cfg, _disp, kernel = session
     caps = _emit(kernel, "host.capabilities()")
     # compute is advertised when a remote-compute provider/family is
-    # installed (the repo ships remote-compute-ssh); r_kernel stays off.
-    assert caps["compute"] is True and caps["r_kernel"] is False
+    # installed (the repo ships remote-compute-ssh); r_kernel mirrors whether
+    # an R interpreter is actually resolvable on this machine (live probe).
+    from openai4s.kernel.r_kernel import resolve_r_interpreter
+
+    assert caps["compute"] is True
+    assert caps["r_kernel"] == (resolve_r_interpreter() is not None)
 
     env = tmp_path / "fakeenv"
     (env / "conda-meta").mkdir(parents=True)

@@ -17,7 +17,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from openai4s.tools.base import Tool
-from openai4s.tools.bash import bash, precheck_command
 from openai4s.tools.edit import edit_file, static_edit_precheck
 from openai4s.tools.env import env_create, env_list, env_use
 from openai4s.tools.fs import list_dir, read_text_file, write_file
@@ -25,6 +24,9 @@ from openai4s.tools.search import content_search, glob_files
 from openai4s.tools.web import web_fetch, web_search
 
 # Ordered, canonical tool surface. Order here is the order shown in the prompt.
+# There is deliberately NO shell tool: the host executes only python/R cells —
+# shell commands run inside the kernel (`host.bash` in sdk/host.py, or
+# subprocess in a cell), never in the host process.
 REGISTRY: list[Tool] = [
     list_dir,
     read_text_file,
@@ -32,7 +34,6 @@ REGISTRY: list[Tool] = [
     glob_files,
     content_search,
     edit_file,
-    bash,
     env_list,
     env_use,
     env_create,
@@ -270,10 +271,13 @@ def render_tools_prompt() -> str:
         "",
         "Use a tool for small, deterministic operations — listing a directory, "
         "reading/writing a file, glob, grep, a web search or fetch, an "
-        "environment switch, or a single-string edit. Use a ```python cell for "
-        "analysis, plotting, modeling, simulations, and any multi-step "
-        "computation needing persistent kernel state. NEVER write a python cell "
-        "merely to list files, grep, or fetch a URL — use the tool.",
+        "environment switch, or a single-string edit. Use a ```python cell "
+        "(or an ```r cell for R) for analysis, plotting, modeling, simulations, "
+        "and any multi-step computation needing persistent kernel state. NEVER "
+        "write a python cell merely to list files, grep, or fetch a URL — use "
+        "the tool. There is no shell tool: run shell commands from a python "
+        "cell (host.bash(...) or subprocess), which executes them inside the "
+        "kernel.",
         "",
         "Available tools:",
     ]
@@ -385,13 +389,6 @@ def execute_tool_call(dispatcher: Any, call: Any) -> tuple[str, bool]:
             )
         spec = dict(raw_spec)
 
-        if tool.dangerous and tool.host_method == "bash":
-            reason = precheck_command(spec.get("command", ""))
-            if reason:
-                return (
-                    f"[Tool: {tool.name}] blocked by static safety precheck: {reason}",
-                    False,
-                )
         if tool.host_method == "edit_file":
             err = static_edit_precheck(spec)
             if err:

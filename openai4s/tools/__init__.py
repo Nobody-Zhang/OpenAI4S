@@ -2,12 +2,14 @@
 
 A thin, declarative layer on top of the Code-as-Action model: each `Tool` is
 metadata that names a small deterministic operation (list/read/write/glob/grep/
-edit/bash/env/web) and the host method it routes to. Tools do NOT re-implement
-any fs/shell/web logic — `execute_tool_call` dispatches them through the
-existing `HostDispatcher` (passed in by the caller), so every call inherits the
+edit/env/web) and the host method it routes to. Tools do NOT re-implement any
+fs/web logic — `execute_tool_call` dispatches them through the existing
+`HostDispatcher` (passed in by the caller), so every call inherits the
 permission gate, egress fence, injection screening, UI activity steps, and call
-logging. Analysis, plotting, modeling and multi-step computation stay in
-```python cells with persistent kernel state.
+logging. There is deliberately no shell tool: the host executes only python/R
+cells, and shell commands run inside the kernel. Analysis, plotting, modeling
+and multi-step computation stay in ```python / ```r cells with persistent
+kernel state.
 
 This package is pure stdlib and imports nothing from the engine (no
 host_dispatch / loop / gateway) at module load, so it stays importable with

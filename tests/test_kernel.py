@@ -320,5 +320,36 @@ def test_user_raised_keyboardinterrupt_is_normal_error_with_lineno():
         assert k.is_alive()
 
 
+def test_host_bash_is_kernel_local_and_never_rpcs(tmp_path):
+    """host.bash runs INSIDE the worker process — the host executes only
+    python/R cells. A dispatcher that rejects a 'bash' method proves no RPC
+    happens; the command's output is captured in the cell like any subprocess."""
+
+    def no_bash_dispatcher(method, args):
+        if method == "bash":
+            raise AssertionError("host.bash must not reach the host dispatcher")
+        return _echo_dispatcher(method, args)
+
+    with Kernel(dispatcher=no_bash_dispatcher, cwd=str(tmp_path)) as k:
+        r = k.execute("r = host.bash('echo kernel-local'); print(r['stdout'])")
+        assert r["error"] is None
+        assert "kernel-local" in r["stdout"]
+        # the shell ran in the worker's cwd (the workspace)
+        r2 = k.execute("print(host.bash('pwd')['workdir'])")
+        assert str(tmp_path.resolve()) in r2["stdout"]
+
+
+def test_host_bash_static_precheck_blocks_catastrophe(tmp_path):
+    with Kernel(dispatcher=_echo_dispatcher, cwd=str(tmp_path)) as k:
+        r = k.execute(
+            "try:\n"
+            "    host.bash('rm -rf /')\n"
+            "except RuntimeError as e:\n"
+            "    print('BLOCKED:', e)\n"
+        )
+        assert r["error"] is None
+        assert "BLOCKED:" in r["stdout"] and "precheck" in r["stdout"]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

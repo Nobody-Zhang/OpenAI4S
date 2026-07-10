@@ -9,6 +9,7 @@ or dispatcher (a fake callable stands in).
 import time
 
 from openai4s.host_dispatch import HostDispatcher
+from openai4s.security.shellcheck import precheck_command
 from openai4s.tools import (
     MAX_TOOL_CALLS_PER_TURN,
     MAX_TOOL_OBS_CHARS,
@@ -19,7 +20,6 @@ from openai4s.tools import (
     render_tools_prompt,
     run_tool_calls,
 )
-from openai4s.tools.bash import precheck_command
 
 _F = "`" * 3  # triple-backtick fence delimiter
 
@@ -33,7 +33,10 @@ def test_registry_is_populated_and_every_tool_resolves_to_a_handler():
     """Every declared Tool has a non-empty name + host_method, and each
     host_method resolves to a real _m_<method> handler on HostDispatcher —
     the drift guard the routing depends on."""
-    assert len(REGISTRY) >= 12
+    # 11 tools: the shell tool is deliberately absent — the host executes only
+    # python/R cells, and shell commands run inside the kernel (host.bash).
+    assert len(REGISTRY) >= 11
+    assert "bash" not in {t.name for t in REGISTRY}
     names = [t.name for t in REGISTRY]
     assert len(set(names)) == len(names)  # no duplicate names
     for t in REGISTRY:
@@ -168,8 +171,11 @@ def test_render_tools_prompt_lists_names_and_convention():
     prompt = render_tools_prompt()
     assert isinstance(prompt, str)
     assert "tool" in prompt
-    for name in ("read_text_file", "content_search", "bash"):
+    for name in ("read_text_file", "content_search", "env_use", "web_fetch"):
         assert name in prompt
+    # no shell tool line: shell runs inside the kernel, not as a host tool
+    assert "- bash(" not in prompt
+    assert "```r" in prompt  # the prompt points R work at the R channel
 
 
 # --- static prechecks -------------------------------------------------------
@@ -218,7 +224,10 @@ def test_execute_read_tool_routes_to_host_method_with_spec_list():
     assert obs.startswith("[Tool: read_text_file]")
 
 
-def test_execute_dangerous_bash_blocks_before_dispatch():
+def test_execute_bash_is_not_a_tool_and_never_dispatches():
+    """The host executes only python/R cells: there is no shell tool. A model
+    emitting a `bash` tool call gets an unknown-tool error and the dispatcher
+    is NEVER invoked — shell work belongs inside the kernel (host.bash)."""
     calls = []
 
     def disp(method, args):
@@ -228,10 +237,9 @@ def test_execute_dangerous_bash_blocks_before_dispatch():
     obs, ok = execute_tool_call(
         disp, {"name": "bash", "arguments": {"command": "rm -rf /"}}
     )
-    # the static precheck short-circuits — the dispatcher is never invoked
     assert calls == []
     assert ok is False
-    assert "precheck" in obs
+    assert "unknown tool" in obs
 
 
 def test_execute_reports_error_only_result_as_not_ok():

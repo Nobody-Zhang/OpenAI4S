@@ -389,9 +389,11 @@ def _perm_match(text: str, pattern: str) -> bool:
 # safe, confined, or already-guarded tools (file reads/writes/edits stay inside the
 # session workspace, .env/secrets are hard-blocked, web_* is SSRF-guarded) and keep
 # an approval prompt ONLY for genuinely risky / external / irreversible actions:
-# arbitrary shell, external MCP connectors, long-running background procs, writing
-# credentials, and deleting/publishing skills. (And an UNWATCHED turn allows
-# everything anyway — the gate only ever prompts when a human is actively viewing.)
+# external MCP connectors, long-running background procs, writing credentials, and
+# deleting/publishing skills. (Shell is NOT a host method — host.bash runs inside
+# the kernel worker, governed by the pre-exec code gate like any cell. And an
+# UNWATCHED turn allows everything anyway — the gate only ever prompts when a
+# human is actively viewing.)
 _DEFAULT_PERMISSION_RULES = (
     # secrets: absolute veto regardless of anything else
     ("read_file", "*.env", "deny"),
@@ -409,7 +411,6 @@ _DEFAULT_PERMISSION_RULES = (
     ("web_search", "*", "allow"),
     ("skills_edit", "*", "allow"),
     # genuinely risky / external / irreversible -> ask (only when a human is watching)
-    ("bash", "*", "ask"),
     ("mcp_call", "*", "ask"),
     ("exec_background", "*", "ask"),
     ("credentials_set", "*", "ask"),

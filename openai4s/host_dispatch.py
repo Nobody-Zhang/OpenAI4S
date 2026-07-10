@@ -198,8 +198,6 @@ def _step_begin(method: str, args: list) -> tuple[str, str, dict] | None:
             f"Requesting network access to {dom}",
             {"domain": dom, "reason": a.get("reason", "")},
         )
-    if method == "bash":
-        return ("bash", "Running a shell command", {"command": a.get("command", "")})
     if method == "edit_file":
         p = a.get("path", "")
         return (
@@ -317,7 +315,6 @@ def _step_begin(method: str, args: list) -> tuple[str, str, dict] | None:
 # is internal plumbing and is never gated.
 GATEABLE_TOOLS = frozenset(
     {
-        "bash",
         "read_file",
         "write_file",
         "edit_file",
@@ -399,11 +396,9 @@ def _is_secret_path(path: str) -> bool:
 
 def _gate_target(method: str, args: list) -> str:
     """The tool-specific string a permission pattern is matched against
-    (command for bash, path for file tools, domain for fetch, …)."""
+    (path for file tools, domain for fetch, …)."""
     a = args[0] if args and isinstance(args[0], dict) else {}
     first = args[0] if (args and isinstance(args[0], str)) else ""
-    if method == "bash":
-        return a.get("command", "") or ""
     if method in ("write_file", "edit_file", "read_file"):
         return a.get("path", "") or ""
     if method == "save_artifact":
@@ -466,14 +461,6 @@ def _step_end(method: str, kind: str, result: Any, ok: bool) -> tuple[dict, str]
     if kind == "fetch":
         text = r.get("content") or r.get("text") or r.get("markdown") or ""
         return ({"content": text[:8000], "url": r.get("url")}, f"{len(text):,} chars")
-    if kind == "bash":
-        out, err = r.get("stdout", "") or "", r.get("stderr", "") or ""
-        code = r.get("exit_code")
-        lines = len((out + err).splitlines())
-        return (
-            {"stdout": out[:12000], "stderr": err[:6000], "exit_code": code},
-            (f"exit {code}" if code else _plural(lines, "line")),
-        )
     if kind == "edit":
         return (
             {"path": r.get("path"), "replaced": r.get("replaced")},
@@ -602,11 +589,15 @@ class HostDispatcher:
         # → a `plan_progress` WS event that ticks the review card. None = headless.
         self.on_plan: Callable[[dict], None] | None = None
         # prebuilt-environment integration (wired by the web gateway):
-        #  - active_env_bin: `<env>/bin` of the kernel's conda env, prepended to
-        #    PATH for host.bash so the env's CLI tools (mafft/iqtree/Rscript) resolve;
+        #  - active_env_bin: `<env>/bin` of the kernel's conda env (the kernel
+        #    worker's own PATH already carries it — kept for env-name reporting);
         #  - on_env_switch(name): record a host.env.use() request to apply next cell.
         self.active_env_bin: str | None = None
         self.on_env_switch: Callable[[str], None] | None = None
+        # R execution channel: host.env.use() on an R-only env retargets the
+        # persistent R kernel (```r cells) instead of being refused; the outer
+        # loops consult this name when (re)spawning the R kernel.
+        self.active_r_env: str | None = None
 
     @property
     def compute(self):
@@ -967,6 +958,15 @@ class HostDispatcher:
             raise RuntimeError("ContactEmailUnavailable: no user email configured")
         return email
 
+    def _r_kernel_available(self) -> bool:
+        """True when an R interpreter is resolvable for the ```r channel."""
+        try:
+            from openai4s.kernel.r_kernel import resolve_r_interpreter
+
+            return resolve_r_interpreter() is not None
+        except Exception:  # noqa: BLE001 — a probe failure must not break caps
+            return False
+
     def _m_capabilities(self) -> dict:
         from openai4s import webtools
 
@@ -983,7 +983,7 @@ class HostDispatcher:
             "app_tiles": True,
             "compute": self._compute_available(),
             "remote_gpu": self._remote_gpu_status_payload(),
-            "r_kernel": False,
+            "r_kernel": self._r_kernel_available(),
             # opencode-parity harness tools
             "bash": True,
             "files": True,
@@ -998,10 +998,10 @@ class HostDispatcher:
         }
 
     # --- opencode-parity harness tools -----------------------------------
-    # bash / read_file / write_file / edit_file / glob / grep / list_dir /
-    # web_fetch / web_search / todo — the file+shell+web toolset an opencode
-    # agent has, exposed as host.* so a Code-as-Action cell can call them. All
-    # file/shell ops are confined to the session workspace.
+    # read_file / write_file / edit_file / glob / grep / list_dir / web_fetch /
+    # web_search / todo — the file+web toolset an opencode agent has, exposed
+    # as host.* so a Code-as-Action cell can call them. File ops are confined
+    # to the session workspace. (host.bash is kernel-local — see sdk/host.py.)
     def _workspace(self) -> Path:
         # ALWAYS resolved so relative_to() below never mixes a resolved file path
         # with an unresolved root (breaks under symlinked data dirs, e.g. macOS
@@ -1037,55 +1037,10 @@ class HostDispatcher:
             raise FileNotFoundError(f"no such file: {rel}")
         return target
 
-    def _m_bash(self, spec: dict) -> dict:
-        """Run a shell command in the session workspace. {command, timeout, workdir}."""
-        import os
-        import subprocess
-
-        command = spec.get("command") or ""
-        if not command.strip():
-            return {"error": "bash: empty command"}
-        # Best-effort outbound-domain fence. No-op unless
-        # OPENAI4S_EGRESS=allowlist. Static scan of explicit http(s) URLs
-        # (curl/wget/pip install <url>/git clone https://…); a blocked domain is
-        # refused BEFORE the shell runs, with the proxy-403 soft error. This is
-        # defense-in-depth only — obfuscated commands are NOT caught here (real
-        # enforcement is the OS sandbox openai4s does not ship).
-        from openai4s import egress
-
-        blocked = egress.scan_command(command)
-        if blocked is not None:
-            return egress.blocked_error(blocked)
-        timeout = float(spec.get("timeout") or 120)
-        workdir = self._workspace()
-        if spec.get("workdir"):
-            workdir = self._resolve(spec["workdir"])
-        # Activate the kernel's prebuilt env for this command: prepend its bin/ so
-        # pip/mafft/iqtree/Rscript and the env's python resolve inside the env.
-        run_env = None
-        if self.active_env_bin:
-            run_env = dict(os.environ)
-            run_env["PATH"] = self.active_env_bin + os.pathsep + run_env.get("PATH", "")
-        try:
-            proc = subprocess.run(
-                command,
-                shell=True,
-                cwd=str(workdir),
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env=run_env,
-            )
-        except subprocess.TimeoutExpired:
-            return {"error": f"bash: timed out after {timeout}s"}
-        out = (proc.stdout or "")[-30000:]
-        err = (proc.stderr or "")[-8000:]
-        return {
-            "exit_code": proc.returncode,
-            "stdout": out,
-            "stderr": err,
-            "workdir": str(workdir),
-        }
+    # NOTE: there is deliberately no `_m_bash`. The host executes only python/R
+    # cells; shell commands run INSIDE the kernel worker via the kernel-local
+    # `host.bash` (sdk/host.py), which keeps the static shell precheck and the
+    # egress fence.
 
     def _m_read_file(self, spec: dict) -> dict:
         path = self._resolve(spec.get("path", ""), must_exist=True)
@@ -1680,7 +1635,8 @@ class HostDispatcher:
     def _m_env_use(self, spec: dict | str) -> dict:
         """Run subsequent notebook cells in a PREBUILT environment. The switch is
         applied before the NEXT cell (call this in its own cell, then import in a
-        new one). Rejects an unknown or R-only env (the kernel needs Python)."""
+        new one). An R-only env retargets the persistent R kernel (```r cells)
+        instead of the python kernel."""
         from openai4s.kernel import environments as envmod
 
         if isinstance(spec, str):
@@ -1694,9 +1650,32 @@ class HostDispatcher:
                 "error": f"unknown environment {name!r}; available: " + ", ".join(avail)
             }
         if env.interpreter is None:
+            # R-only env: no Python to host the notebook kernel — instead of
+            # refusing, make it the target of the R execution channel. The
+            # outer loops read active_r_env when (re)spawning the R kernel;
+            # the gateway ALSO applies it via the pending-env mechanism so an
+            # already-running R kernel is retargeted before the next cell.
+            if not env.rscript:
+                return {
+                    "error": f"'{name}' has neither a Python nor an R "
+                    "interpreter — pick another environment (host.env.list())."
+                }
+            self.active_r_env = name
+            note = f"subsequent ```r cells run in '{name}'"
+            if self.on_env_switch is not None:
+                try:
+                    self.on_env_switch(name)
+                except Exception:  # noqa: BLE001
+                    note = "R env switch failed to register"
             return {
-                "error": f"'{name}' is a {env.language} environment with no "
-                "Python — use host.bash (e.g. Rscript) for it."
+                "ok": True,
+                "env": {
+                    "name": env.name,
+                    "language": env.language,
+                    "description": env.description(),
+                    "notable": env.notable(),
+                },
+                "note": note,
             }
         if self.on_env_switch is not None:
             try:

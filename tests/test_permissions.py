@@ -268,15 +268,25 @@ def _wait_ask(events):
     raise AssertionError("no await_permission emitted")
 
 
-def test_dispatcher_gate_denies_bash_soft_fail(tmp_path):
-    disp, frame, _ = _dispatcher(tmp_path)
+def test_dispatcher_gate_denies_write_file_soft_fail(tmp_path):
+    # bash is no longer a host method (shell runs kernel-local); write_file —
+    # pinned to 'ask' for this conversation — exercises the same deny path.
+    disp, frame, st = _dispatcher(tmp_path)
+    st.set_permission_rule(
+        scope="conversation",
+        scope_id=frame,
+        tool="write_file",
+        pattern="*",
+        decision="ask",
+    )
     events = []
     broker().register_channel(frame, lambda ev: events.append(ev))
     try:
         out = {}
         t = threading.Thread(
             target=lambda: out.__setitem__(
-                "r", disp("bash", [{"command": "echo should-not-run"}])
+                "r",
+                disp("write_file", [{"path": "gate.txt", "content": "nope"}]),
             )
         )
         t.start()
@@ -286,27 +296,37 @@ def test_dispatcher_gate_denies_bash_soft_fail(tmp_path):
         # denied call returns the single-key soft-fail dict the worker raises
         assert set(out["r"].keys()) == {"error"}
         assert "Permission denied" in out["r"]["error"]
+        assert not (disp._workspace() / "gate.txt").exists()
     finally:
         broker().unregister_channel(frame)
 
 
-def test_dispatcher_gate_allows_and_runs_bash(tmp_path):
-    disp, frame, _ = _dispatcher(tmp_path)
+def test_dispatcher_gate_allows_and_runs_write_file(tmp_path):
+    disp, frame, st = _dispatcher(tmp_path)
+    st.set_permission_rule(
+        scope="conversation",
+        scope_id=frame,
+        tool="write_file",
+        pattern="*",
+        decision="ask",
+    )
     events = []
     broker().register_channel(frame, lambda ev: events.append(ev))
     try:
         out = {}
         t = threading.Thread(
             target=lambda: out.__setitem__(
-                "r", disp("bash", [{"command": "echo gate-ok"}])
+                "r",
+                disp("write_file", [{"path": "gate.txt", "content": "gate-ok"}]),
             )
         )
         t.start()
         ask = _wait_ask(events)
         broker().resolve(ask["decision_id"], allow=True, scope="once")
         t.join(timeout=8)
-        # allow → the real _m_bash ran and captured stdout
-        assert "gate-ok" in (out["r"].get("stdout") or "")
+        # allow → the real _m_write_file ran and the file exists
+        assert out["r"].get("path")
+        assert (disp._workspace() / "gate.txt").read_text() == "gate-ok"
     finally:
         broker().unregister_channel(frame)
 
@@ -370,11 +390,11 @@ def test_exact_literal_pattern_with_metachars_matches_itself(tmp_path):
 def test_reset_restores_modified_default_decision(tmp_path):
     st = _store(tmp_path)
     st.set_permission_rule(
-        scope="global", scope_id="", tool="bash", pattern="*", decision="allow"
+        scope="global", scope_id="", tool="mcp_call", pattern="*", decision="allow"
     )  # user loosens the default
-    assert st.resolve_permission(tool="bash", pattern_input="rm x") == "allow"
+    assert st.resolve_permission(tool="mcp_call", pattern_input="srv/tool") == "allow"
     st.seed_default_permission_rules(force=True)  # reset
-    assert st.resolve_permission(tool="bash", pattern_input="rm x") == "ask"
+    assert st.resolve_permission(tool="mcp_call", pattern_input="srv/tool") == "ask"
 
 
 def test_exec_background_gate_target_is_the_code():

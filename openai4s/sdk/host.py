@@ -1230,16 +1230,69 @@ class _Host:
 
     # --- opencode-parity harness tools -----------------------------------
     # A Code-as-Action cell can call these directly; they mirror opencode's
-    # bash/read/write/edit/glob/grep/list/webfetch/websearch/todo tools. File +
-    # shell ops are confined to your working directory (the session workspace).
+    # bash/read/write/edit/glob/grep/list/webfetch/websearch/todo tools. File
+    # ops are confined to your working directory (the session workspace).
     def bash(
         self, command: str, *, timeout: float = 120, workdir: str | None = None
     ) -> dict:
-        """Run a shell command in the workspace. Returns
-        {exit_code, stdout, stderr}. Networking is available."""
-        return self._call(
-            "bash", [{"command": command, "timeout": timeout, "workdir": workdir}]
-        )
+        """Run a shell command INSIDE the kernel process. Returns
+        {exit_code, stdout, stderr, workdir}. Networking is available.
+
+        The host executes only python/R cells — shell work happens here in the
+        worker, whose cwd is the session workspace and whose PATH already
+        carries the active prebuilt env's bin/ (so pip/mafft/iqtree resolve).
+        The static shell precheck and the egress fence still apply.
+        """
+        import os
+        import subprocess
+
+        if not isinstance(command, str) or not command.strip():
+            raise RuntimeError("bash: empty command")
+        # Cheap static gate — same blocklist the host-side bash used to run.
+        try:
+            from openai4s.security.shellcheck import precheck_command
+
+            reason = precheck_command(command)
+        except Exception:  # noqa: BLE001 — the gate itself must fail open
+            reason = None
+        if reason:
+            raise RuntimeError(f"bash: blocked by static safety precheck: {reason}")
+        # Best-effort outbound-domain fence. No-op unless
+        # OPENAI4S_EGRESS=allowlist (env inherited from the host at spawn).
+        blocked_msg = None
+        try:
+            from openai4s import egress
+
+            blocked = egress.scan_command(command)
+            if blocked is not None:
+                blocked_msg = egress.blocked_error(blocked).get("error")
+        except Exception:  # noqa: BLE001 — fence lookup must fail open
+            blocked_msg = None
+        if blocked_msg:
+            raise RuntimeError(blocked_msg)
+        cwd = os.getcwd()
+        if workdir:
+            cand = os.path.realpath(os.path.join(cwd, str(workdir)))
+            if not os.path.isdir(cand):
+                raise RuntimeError(f"bash: workdir not found: {workdir}")
+            cwd = cand
+        try:
+            proc = subprocess.run(
+                command,
+                shell=True,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=float(timeout or 120),
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"bash: timed out after {timeout}s") from None
+        return {
+            "exit_code": proc.returncode,
+            "stdout": (proc.stdout or "")[-30000:],
+            "stderr": (proc.stderr or "")[-8000:],
+            "workdir": cwd,
+        }
 
     def read_file(self, path: str, *, offset: int = 0, limit: int = 2000) -> dict:
         """Read a workspace file (optionally a line window). Returns {content,...}."""
