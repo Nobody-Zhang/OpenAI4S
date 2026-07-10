@@ -1,0 +1,83 @@
+"""Library matching -> candidate selection."""
+from __future__ import annotations
+
+import numpy as np
+from scipy.optimize import nnls
+
+from . import metrics
+from .data import Library
+
+
+def rank_library(processed: np.ndarray, lib: Library, metric: str = "pearson") -> np.ndarray:
+    """Return correlation of the processed target against every library column."""
+    fn = metrics.pearson if metric == "pearson" else metrics.cosine
+    return np.array([fn(processed, lib.A[:, j]) for j in range(len(lib.names))])
+
+
+def _select_topk(processed, lib, config):
+    scores = rank_library(processed, lib, config["match_metric"])
+    order = np.argsort(scores)[::-1]
+    cand = [j for j in order[: config["top_k"]] if scores[j] >= config["corr_threshold"]]
+    if not cand:
+        cand = [int(order[0])]
+    return np.array(cand), scores[cand]
+
+
+def _select_greedy(processed, lib, config):
+    """Orthogonal-matching-pursuit style selection.
+
+    Iteratively correlate the *current residual* against the library, add the
+    best match, refit all selected via NNLS, subtract, and repeat. Subtracting
+    the strong components exposes weaker minor components whose global
+    correlation would otherwise be buried under look-alikes of the major phase.
+    """
+    metric = metrics.pearson if config["match_metric"] == "pearson" else metrics.cosine
+    max_k = config["top_k"]
+    thr = config["corr_threshold"]
+    min_gain = config.get("greedy_min_gain", 0.01)
+
+    selected: list[int] = []
+    residual = processed.copy()
+    prev_relres = 1.0
+    tgt_norm = np.linalg.norm(processed) or 1e-12
+
+    for _ in range(max_k):
+        scores = np.array([metric(residual, lib.A[:, j]) for j in range(len(lib.names))])
+        for j in selected:
+            scores[j] = -np.inf
+        best = int(np.argmax(scores))
+        if scores[best] < thr and selected:
+            break
+        selected.append(best)
+
+        A = lib.A[:, selected]
+        coef, _ = nnls(A, processed)
+        recon = A @ coef
+        residual = processed - recon
+        relres = float(np.linalg.norm(residual) / tgt_norm)
+        if prev_relres - relres < min_gain and len(selected) > 1:
+            selected.pop()  # last addition didn't help enough
+            break
+        prev_relres = relres
+
+    if not selected:
+        scores = rank_library(processed, lib, config["match_metric"])
+        selected = [int(np.argmax(scores))]
+    idx = np.array(selected)
+    final_scores = np.array([metric(processed, lib.A[:, j]) for j in idx])
+    return idx, final_scores
+
+
+def select_candidates(processed: np.ndarray, lib: Library, config: dict):
+    """Select candidate library entries. ``config['selection_method']`` picks
+    'greedy' (OMP-style residual matching, default) or 'topk' (global top-K).
+
+    Returns (candidate_indices, candidate_names, scores_for_candidates).
+    """
+    method = config.get("selection_method", "greedy")
+    if method == "topk":
+        cand, scores = _select_topk(processed, lib, config)
+    else:
+        cand, scores = _select_greedy(processed, lib, config)
+    names = [lib.names[j] for j in cand]
+    return np.array(cand), names, scores
