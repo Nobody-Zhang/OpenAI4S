@@ -13,7 +13,6 @@ exceptions are also converted to {"error":...} on the wire by the manager.
 """
 from __future__ import annotations
 
-import fnmatch
 import hashlib
 import re
 import shutil
@@ -26,6 +25,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from openai4s.config import Config, get_config
+from openai4s.host.files import WorkspaceFileService
+from openai4s.host.files import is_secret_path as _is_secret_path
 from openai4s.llm import chat
 from openai4s.store import SECRET_ARG_HOST_CALLS, get_store
 
@@ -368,32 +369,6 @@ Protocol:
 }
 
 
-# secret files whose CONTENTS must never leak through any file tool, matched
-# case-insensitively on the basename (a .env read is denied on macOS/Windows
-# case-insensitive FS as .ENV too). Defense-in-depth only — raw Python in a cell
-# is NOT sandboxed by the gate; this just closes the host.* tool surface.
-_SECRET_BASENAMES = (
-    "*.env",
-    ".env",
-    ".env.*",
-    "*.pem",
-    "*.key",
-    "id_rsa",
-    "id_ed25519",
-    ".netrc",
-    ".pgpass",
-)
-
-
-def _is_secret_path(path: str) -> bool:
-    import posixpath
-
-    base = posixpath.basename((path or "").replace("\\", "/").rstrip("/")).lower()
-    if not base:
-        return False
-    return any(fnmatch.fnmatchcase(base, pat) for pat in _SECRET_BASENAMES)
-
-
 def _gate_target(method: str, args: list) -> str:
     """The tool-specific string a permission pattern is matched against
     (path for file tools, domain for fetch, …)."""
@@ -563,6 +538,10 @@ class HostDispatcher:
         self.last_output: dict | None = None
         self.frame_id = frame_id
         self.store = get_store(self.cfg.db_path)
+        self._files = WorkspaceFileService(
+            data_dir=self.cfg.data_dir,
+            frame_id=lambda: self.frame_id,
+        )
         # Steering hooks wired by the delegation layer.
         self.steer_fns: dict[str, Callable[..., Any]] = {}
         from openai4s.skills_loader import SkillLoader
@@ -1003,39 +982,13 @@ class HostDispatcher:
     # as host.* so a Code-as-Action cell can call them. File ops are confined
     # to the session workspace. (host.bash is kernel-local — see sdk/host.py.)
     def _workspace(self) -> Path:
-        # ALWAYS resolved so relative_to() below never mixes a resolved file path
-        # with an unresolved root (breaks under symlinked data dirs, e.g. macOS
-        # /tmp -> /private/tmp, raising ValueError on every file-tool call).
-        ws = (
-            self.cfg.data_dir / "agent-workspaces" / (self.frame_id or "default")
-        ).resolve()
-        ws.mkdir(parents=True, exist_ok=True)
-        return ws
+        return self._files.workspace()
 
     def _rel(self, path: Path) -> str | None:
-        """Workspace-relative path string, or None if `path` escapes the
-        workspace (used to CONFINE glob/grep results, whose patterns are not run
-        through _resolve)."""
-        try:
-            return str(path.resolve().relative_to(self._workspace()))
-        except (ValueError, OSError):
-            return None
+        return self._files.relative(path)
 
     def _resolve(self, rel: str, *, must_exist: bool = False) -> Path:
-        """Resolve a workspace-relative (or absolute-within-workspace) path,
-        refusing to escape the workspace root."""
-        ws = self._workspace()
-        p = Path(rel)
-        target = (p if p.is_absolute() else ws / p).resolve()
-        try:
-            target.relative_to(ws)
-        except ValueError:
-            raise ValueError(
-                f"path escapes the workspace: {rel!r} (stay inside your working dir)"
-            )
-        if must_exist and not target.exists():
-            raise FileNotFoundError(f"no such file: {rel}")
-        return target
+        return self._files.resolve(rel, must_exist=must_exist)
 
     # NOTE: there is deliberately no `_m_bash`. The host executes only python/R
     # cells; shell commands run INSIDE the kernel worker via the kernel-local
@@ -1061,122 +1014,22 @@ class HostDispatcher:
         return {"blocked": None}
 
     def _m_read_file(self, spec: dict) -> dict:
-        path = self._resolve(spec.get("path", ""), must_exist=True)
-        offset = max(0, int(spec.get("offset") or 0))  # clamp: negatives slice wrong
-        limit = max(1, int(spec.get("limit") or 2000))
-        try:
-            data = path.read_bytes()
-        except OSError as e:
-            return {"error": f"read_file: {e}"}
-        try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError:
-            return {
-                "path": self._rel(path),
-                "binary": True,
-                "size_bytes": len(data),
-                "content": "",
-            }
-        lines = text.splitlines()
-        window = lines[offset : offset + limit]
-        return {
-            "path": self._rel(path),
-            "total_lines": len(lines),
-            "offset": offset,
-            "content": "\n".join(window),
-            "truncated": (offset + limit) < len(lines),
-        }
+        return self._files.read_file(spec)
 
     def _m_write_file(self, spec: dict) -> dict:
-        path = self._resolve(spec.get("path", ""))
-        content = spec.get("content", "")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-        return {"path": self._rel(path), "bytes": len(content.encode("utf-8"))}
+        return self._files.write_file(spec)
 
     def _m_edit_file(self, spec: dict) -> dict:
-        path = self._resolve(spec.get("path", ""), must_exist=True)
-        old = spec.get("old_string", "")
-        new = spec.get("new_string", "")
-        replace_all = bool(spec.get("replace_all"))
-        text = path.read_text(encoding="utf-8")
-        n = text.count(old)
-        if not old or n == 0:
-            return {"error": "edit_file: old_string not found"}
-        if n > 1 and not replace_all:
-            return {
-                "error": f"edit_file: old_string is not unique ({n} matches); "
-                "pass replace_all=True or add more context"
-            }
-        text = text.replace(old, new) if replace_all else text.replace(old, new, 1)
-        path.write_text(text, encoding="utf-8")
-        return {"path": self._rel(path), "replaced": n}
+        return self._files.edit_file(spec)
 
     def _m_glob(self, spec: dict) -> dict:
-        pattern = spec.get("pattern") or "**/*"
-        base = (
-            self._resolve(spec.get("path")) if spec.get("path") else self._workspace()
-        )
-        matches = []
-        for p in sorted(base.glob(pattern)):
-            # confine: a pattern like '../../etc/*' escapes; _rel returns None then.
-            rel = self._rel(p) if p.is_file() else None
-            if rel is not None and not _is_secret_path(rel):  # never surface secrets
-                matches.append(rel)
-        return {"pattern": pattern, "count": len(matches), "matches": matches[:1000]}
+        return self._files.glob(spec)
 
     def _m_grep(self, spec: dict) -> dict:
-        pattern = spec.get("pattern") or ""
-        if not pattern:
-            return {"error": "grep: empty pattern"}
-        try:
-            rx = re.compile(pattern)
-        except re.error as e:
-            return {"error": f"grep: bad regex: {e}"}
-        include = spec.get("include")
-        base = (
-            self._resolve(spec.get("path")) if spec.get("path") else self._workspace()
-        )
-        hits: list[dict] = []
-        globpat = include or "**/*"
-        for p in sorted(base.glob(globpat) if include else base.rglob("*")):
-            if not p.is_file():
-                continue
-            rel = self._rel(p)  # confine: skip anything that escapes the workspace
-            if rel is None or _is_secret_path(rel):  # never grep secrets' contents
-                continue
-            try:
-                text = p.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
-                continue
-            for i, line in enumerate(text.splitlines(), 1):
-                if rx.search(line):
-                    hits.append({"file": rel, "line": i, "text": line[:400]})
-                    if len(hits) >= 200:
-                        return {
-                            "pattern": pattern,
-                            "count": len(hits),
-                            "matches": hits,
-                            "truncated": True,
-                        }
-        return {"pattern": pattern, "count": len(hits), "matches": hits}
+        return self._files.grep(spec)
 
     def _m_list_dir(self, spec: dict) -> dict:
-        rel = spec.get("path") or "."
-        base = self._resolve(rel) if rel != "." else self._workspace()
-        if not base.exists():
-            return {"error": f"list_dir: no such directory: {rel}"}
-        entries = []
-        for p in sorted(base.iterdir()):
-            entries.append(
-                {
-                    "name": p.name,
-                    "path": (self._rel(p) or p.name),
-                    "is_dir": p.is_dir(),
-                    "size_bytes": (p.stat().st_size if p.is_file() else None),
-                }
-            )
-        return {"path": rel, "count": len(entries), "entries": entries}
+        return self._files.list_dir(spec)
 
     def _m_web_fetch(self, spec: dict) -> dict:
         from openai4s import egress, webtools

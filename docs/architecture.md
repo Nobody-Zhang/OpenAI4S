@@ -100,6 +100,16 @@ through persistent Python/R cells. The old fenced ` ```tool ` parser remains a
 silent compatibility path for saved prompts and older clients, but it is no
 longer advertised to the refactored agent.
 
+`HostDispatcher` is the shared orchestration envelope, not the implementation
+home for every capability. It retains wire decoding, permissions and human
+approval, audit/replay recording, injection screening, and activity events,
+then forwards domain work to small host-side services. For example,
+[`host/files.py`](../openai4s/host/files.py) owns workspace resolution and the
+read/write/edit/glob/grep/list operations. The service receives the current
+frame ID through a provider so a dispatcher whose frame is assigned after
+construction still targets the correct session workspace. It does not depend
+on the Store, Kernel, Gateway, permission broker, or event transport.
+
 ## Session kernel ownership
 
 Each Web session owns one [`KernelSupervisor`](../openai4s/kernel/supervisor.py)
