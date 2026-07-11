@@ -69,6 +69,7 @@ from openai4s.server.plans import normalize_plan as _normalize_plan
 from openai4s.server.plans import public_plan as _plan_public
 from openai4s.server.plans import short_hash as _short_hash
 from openai4s.server.plans import slugify as _slugify
+from openai4s.server.skills import SkillCustomizationService
 from openai4s.skills_loader import SkillLoader
 from openai4s.store import Store, get_store
 from openai4s.tools import control_tool_specs
@@ -3258,72 +3259,30 @@ def _memory_enabled(store) -> bool:
 
 # --- user skill authoring helpers ------------------------------------------
 def _skill_slug(name: str) -> str:
-    slug = re.sub(r"[^a-z0-9_-]+", "-", (name or "").strip().lower()).strip("-")
-    return slug[:64] or "skill"
+    return SkillCustomizationService.slug(name)
 
 
 def _parse_skill_md(content: str) -> tuple[dict, str]:
-    from openai4s.skills_loader.loader import _parse_frontmatter
-
-    try:
-        return _parse_frontmatter(content)
-    except Exception:  # noqa: BLE001
-        return {}, content
+    return SkillCustomizationService.parse_document(content)
 
 
 def _write_user_skill(
     loader, name: str, description: str, body: str, existing: bool = False
 ) -> dict:
-    name = (name or "").strip()
-    if not name:
-        return {"error": "skill name is required"}
-    slug = _skill_slug(name)
-    # refuse to shadow a BUNDLED skill of the same slug (discover() would keep the
-    # bundled one anyway, so this would be a silently-ignored write).
-    try:
-        if not existing and (loader.skills_dir / slug).is_dir():
-            return {
-                "error": f"'{slug}' collides with a built-in skill — "
-                "pick a different name"
-            }
-    except Exception:  # noqa: BLE001
-        pass
-    root = loader.user_skills_dir() / slug
-    root.mkdir(parents=True, exist_ok=True)
-    desc = " ".join((description or "").split())
-    fm = f"---\nname: {name}\ndescription: {desc}\norigin: user\n---\n\n"
-    (root / "SKILL.md").write_text(fm + (body or "").strip() + "\n", "utf-8")
-    loader.discover()  # refresh so it shows up immediately
-    return {"ok": True, "name": name, "slug": slug, "origin": "user"}
+    return SkillCustomizationService(loader).create_or_update(
+        name,
+        description,
+        body,
+        existing=existing,
+    )
 
 
 def _read_user_skill(loader, name: str) -> dict:
-    for s in loader.skills().values():
-        if s.name == name or s.root.name == name:
-            meta, body = _parse_skill_md((s.root / "SKILL.md").read_text("utf-8"))
-            return {
-                "name": s.name,
-                "description": s.description,
-                "body": body,
-                "origin": s.origin,
-                "editable": s.origin == "user",
-            }
-    return {"error": "skill not found"}
+    return SkillCustomizationService(loader).get(name)
 
 
 def _delete_user_skill(loader, name: str) -> dict:
-    import shutil as _sh
-
-    udir = loader.user_skills_dir().resolve()
-    for s in loader.skills().values():
-        if s.name == name or s.root.name == name:
-            root = s.root.resolve()
-            if str(root).startswith(str(udir)) and root != udir:
-                _sh.rmtree(root, ignore_errors=True)
-                loader.discover()
-                return {"ok": True}
-            return {"error": "only user-authored skills can be deleted"}
-    return {"error": "skill not found"}
+    return SkillCustomizationService(loader).delete(name)
 
 
 def _detect_gpu() -> dict:
@@ -3525,8 +3484,8 @@ def _clean_api_key(value: str | None) -> str:
 
 def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
     store = get_store(cfg.db_path)
-    skills = SkillLoader(cfg=cfg)
-    _disabled_skills: set[str] = set()
+    skill_customization = SkillCustomizationService(SkillLoader(cfg=cfg))
+    _disabled_skills = skill_customization.disabled_names
     _disabled_agents: set[str] = set()
     _default_model = {"id": cfg.llm.model or "default"}
 
@@ -4786,18 +4745,18 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
             m = re.fullmatch(r"/skills/catalog/([^/]+)/enabled", sub)
             if m and method in ("PUT", "PATCH"):
                 name = unquote(m.group(1))
-                if self._body().get("enabled"):
-                    _disabled_skills.discard(name)
-                else:
-                    _disabled_skills.add(name)
-                self._json({"ok": True})
+                self._json(
+                    skill_customization.set_enabled(
+                        name,
+                        self._body().get("enabled"),
+                    )
+                )
                 return
             # ---- skill authoring (create / edit / import / delete) ----
             if sub == "/skills" and method == "POST":
                 b = self._body()
                 self._json(
-                    _write_user_skill(
-                        skills,
+                    skill_customization.create_or_update(
                         b.get("name") or "",
                         b.get("description") or "",
                         b.get("body") or b.get("content") or "",
@@ -4806,29 +4765,25 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 return
             if sub == "/skills/import" and method == "POST":
                 b = self._body()
-                # accept a raw SKILL.md (content) or explicit fields
-                content = b.get("content") or ""
-                name = b.get("name") or ""
-                desc = b.get("description") or ""
-                body_md = b.get("body") or ""
-                if content and not body_md:
-                    meta, parsed = _parse_skill_md(content)
-                    name = name or meta.get("name") or ""
-                    desc = desc or meta.get("description") or ""
-                    body_md = parsed
-                self._json(_write_user_skill(skills, name, desc, body_md))
+                self._json(
+                    skill_customization.import_document(
+                        content=b.get("content") or "",
+                        name=b.get("name") or "",
+                        description=b.get("description") or "",
+                        body=b.get("body") or "",
+                    )
+                )
                 return
             m = re.fullmatch(r"/skills/([^/]+)", sub)
             if m and sub not in ("/skills/catalog", "/skills/import"):
                 name = unquote(m.group(1))
                 if method == "GET":
-                    self._json(_read_user_skill(skills, name))
+                    self._json(skill_customization.get(name))
                     return
                 if method in ("PUT", "PATCH"):
                     b = self._body()
                     self._json(
-                        _write_user_skill(
-                            skills,
+                        skill_customization.create_or_update(
                             name,
                             b.get("description") or "",
                             b.get("body") or b.get("content") or "",
@@ -4837,7 +4792,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                     )
                     return
                 if method == "DELETE":
-                    self._json(_delete_user_skill(skills, name))
+                    self._json(skill_customization.delete(name))
                     return
             # ---- agents ----
             if sub == "/agents" and method == "GET":
@@ -5318,29 +5273,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
             }
 
         def _skills_catalog(self, disabled: set[str]) -> list[dict]:
-            try:
-                cat = skills.catalog()
-            except Exception:
-                return []
-            out = []
-            for s in cat:
-                name = s.get("name") if isinstance(s, dict) else str(s)
-                origin = s.get("origin") if isinstance(s, dict) else None
-                out.append(
-                    {
-                        "name": name,
-                        "displayName": (s.get("displayName") or s.get("title") or name)
-                        if isinstance(s, dict)
-                        else name,
-                        "description": (s.get("description") or "")
-                        if isinstance(s, dict)
-                        else "",
-                        "origin": origin,
-                        "editable": origin == "user",
-                        "enabled": name not in disabled,
-                    }
-                )
-            return out
+            return skill_customization.catalog(disabled)
 
         def _agents_payload(self) -> list[dict]:
             out = []
