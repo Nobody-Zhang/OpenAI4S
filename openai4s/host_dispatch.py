@@ -28,6 +28,7 @@ from openai4s.config import Config, get_config
 from openai4s.host.credentials import CredentialService
 from openai4s.host.files import WorkspaceFileService
 from openai4s.host.files import is_secret_path as _is_secret_path
+from openai4s.host.progress import PLAN_STEP_STATUSES, ProgressService
 from openai4s.host.skills import SkillService
 from openai4s.llm import chat
 from openai4s.store import SECRET_ARG_HOST_CALLS, get_store
@@ -576,8 +577,6 @@ class HostDispatcher:
         self.recorder: Any | None = None
         # remote-compute transport, built lazily on first compute_* call.
         self._compute: Any = None
-        # opencode-style session todo list (host.todo_write / host.todo_read).
-        self._todos: list[dict] = []
         # optional sink for semantic activity steps (wired by the web gateway):
         # on_step({"phase":"begin"|"end", "step_id", "kind", "title",
         #          "input"|"output", "status", "summary"}). None = headless/CLI.
@@ -586,6 +585,11 @@ class HostDispatcher:
         # (wired by the web gateway): on_plan({"plan_id","step_id","status","note"})
         # → a `plan_progress` WS event that ticks the review card. None = headless.
         self.on_plan: Callable[[dict], None] | None = None
+        self._progress_service = ProgressService(
+            self.store,
+            get_frame_id=lambda: self.frame_id,
+            get_plan_sink=lambda: self.on_plan,
+        )
         # prebuilt-environment integration (wired by the web gateway):
         #  - active_env_bin: `<env>/bin` of the kernel's conda env (the kernel
         #    worker's own PATH already carries it — kept for env-name reporting);
@@ -1449,73 +1453,19 @@ class HostDispatcher:
         }
 
     def _m_todo_write(self, spec: dict) -> dict:
-        todos = spec.get("todos") or []
-        clean = []
-        for t in todos:
-            if not isinstance(t, dict):
-                continue
-            clean.append(
-                {
-                    "id": t.get("id") or f"t{len(clean) + 1}",
-                    "content": t.get("content", ""),
-                    "status": t.get("status", "pending"),
-                    "priority": t.get("priority", "medium"),
-                }
-            )
-        self._todos = clean
-        return {"ok": True, "count": len(clean), "todos": clean}
+        return self._progress_service.todo_write(spec)
 
     def _m_todo_read(self, *_a: Any) -> dict:
-        return {"todos": self._todos}
+        return self._progress_service.todo_read()
 
     # --- structured plan progress (host.plan_update / host.plan_read) --------
-    _PLAN_STEP_STATUS = frozenset(
-        {"pending", "in_progress", "completed", "failed", "skipped"}
-    )
+    _PLAN_STEP_STATUS = PLAN_STEP_STATUSES
 
     def _m_plan_update(self, spec: dict) -> dict:
-        """Tick one step of the session's approved plan. Emits a plan_progress
-        event (via on_plan) so the review card checkbox flips live."""
-        step_id = spec.get("step_id") or spec.get("id")
-        status = spec.get("status") or "in_progress"
-        if status not in self._PLAN_STEP_STATUS:
-            status = "in_progress"
-        note = spec.get("note")
-        plan_id = spec.get("plan_id")
-        plan = (
-            self.store.get_plan(plan_id)
-            if plan_id
-            else (
-                self.store.get_plan_by_frame(self.frame_id) if self.frame_id else None
-            )
-        )
-        if not plan:
-            return {"error": "no active plan for this session"}
-        if not step_id:
-            return {"error": "plan_update requires step_id"}
-        self.store.set_plan_step_status(plan["plan_id"], step_id, status, note)
-        if self.on_plan is not None:
-            try:
-                self.on_plan(
-                    {
-                        "plan_id": plan["plan_id"],
-                        "step_id": step_id,
-                        "status": status,
-                        "note": note,
-                    }
-                )
-            except Exception:  # noqa: BLE001 — telemetry must never break a call
-                pass
-        return {
-            "ok": True,
-            "plan_id": plan["plan_id"],
-            "step_id": step_id,
-            "status": status,
-        }
+        return self._progress_service.plan_update(spec)
 
     def _m_plan_read(self, *_a: Any) -> dict:
-        plan = self.store.get_plan_by_frame(self.frame_id) if self.frame_id else None
-        return plan or {"plan": None}
+        return self._progress_service.plan_read()
 
     # --- environments / dependencies (reference 'list/create env' steps) -----
     def _current_env_name(self) -> str:
