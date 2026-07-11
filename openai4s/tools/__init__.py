@@ -1,6 +1,6 @@
 """Class-based control-tool surface for openai4s.
 
-Workspace tools are named ``Tool`` subclasses whose modules contain both schema
+Every built-in is a named ``Tool`` subclass whose module contains both schema
 and domain behaviour. Model calls still enter through ``HostDispatcher`` before
 that behaviour runs, preserving permissions, human approval, egress controls,
 injection screening, UI activity events, audit logs, and replay. There is no
@@ -13,7 +13,11 @@ zero side effects. Wiring into the agent loops happens elsewhere.
 """
 from openai4s.tools.base import Tool
 from openai4s.tools.content_search import ContentSearchTool
+from openai4s.tools.contexts import EnvironmentToolContext, WorkspaceToolContext
 from openai4s.tools.edit import EditFileTool
+from openai4s.tools.env_create import EnvCreateTool
+from openai4s.tools.env_list import EnvListTool
+from openai4s.tools.env_use import EnvUseTool
 from openai4s.tools.glob_files import GlobFilesTool
 from openai4s.tools.list_directory import ListDirectoryTool
 from openai4s.tools.native import ToolSpec, control_tool_specs
@@ -36,17 +40,26 @@ from openai4s.tools.registry import (
     scan_fenced_blocks,
     strip_fenced_blocks,
 )
+from openai4s.tools.web_fetch import WebFetchTool
+from openai4s.tools.web_search import WebSearchTool
 from openai4s.tools.write_file import WriteFileTool
 
 __all__ = [
     "Tool",
     "ToolSpec",
+    "WorkspaceToolContext",
+    "EnvironmentToolContext",
     "ListDirectoryTool",
     "ReadTextFileTool",
     "WriteFileTool",
     "GlobFilesTool",
     "ContentSearchTool",
     "EditFileTool",
+    "EnvListTool",
+    "EnvUseTool",
+    "EnvCreateTool",
+    "WebSearchTool",
+    "WebFetchTool",
     "FencedBlock",
     "REGISTRY",
     "get_tool",

@@ -19,34 +19,36 @@ from typing import Any
 from openai4s.tools.base import Tool
 from openai4s.tools.content_search import ContentSearchTool
 from openai4s.tools.edit import EditFileTool
-from openai4s.tools.env import env_create, env_list, env_use
+from openai4s.tools.env_create import EnvCreateTool
+from openai4s.tools.env_list import EnvListTool
+from openai4s.tools.env_use import EnvUseTool
 from openai4s.tools.glob_files import GlobFilesTool
 from openai4s.tools.list_directory import ListDirectoryTool
 from openai4s.tools.read_text_file import ReadTextFileTool
-from openai4s.tools.web import web_fetch, web_search
+from openai4s.tools.web_fetch import WebFetchTool
+from openai4s.tools.web_search import WebSearchTool
 from openai4s.tools.write_file import WriteFileTool
 
 # Ordered, canonical tool surface. Order here is the order shown in the prompt.
 # There is deliberately NO shell tool: the host executes only python/R cells —
 # shell commands run inside the kernel (`host.bash` in sdk/host.py, or
 # subprocess in a cell), never in the host process.
-FILE_TOOL_TYPES: tuple[type[Tool], ...] = (
+TOOL_TYPES: tuple[type[Tool], ...] = (
     ListDirectoryTool,
     ReadTextFileTool,
     WriteFileTool,
     GlobFilesTool,
     ContentSearchTool,
     EditFileTool,
+    EnvListTool,
+    EnvUseTool,
+    EnvCreateTool,
+    WebSearchTool,
+    WebFetchTool,
 )
+FILE_TOOL_TYPES = TOOL_TYPES[:6]
 
-REGISTRY: list[Tool] = [
-    *(tool_type() for tool_type in FILE_TOOL_TYPES),
-    env_list,
-    env_use,
-    env_create,
-    web_search,
-    web_fetch,
-]
+REGISTRY: list[Tool] = [tool_type() for tool_type in TOOL_TYPES]
 
 _BY_NAME: dict[str, Tool] = {t.name: t for t in REGISTRY}
 _BY_HOST_METHOD: dict[str, Tool] = {t.host_method: t for t in REGISTRY}
@@ -55,6 +57,8 @@ if len(_BY_NAME) != len(REGISTRY):
     raise RuntimeError("duplicate public tool name in REGISTRY")
 if len(_BY_HOST_METHOD) != len(REGISTRY):
     raise RuntimeError("duplicate host method in REGISTRY")
+if any(type(tool).execute is Tool.execute for tool in REGISTRY):
+    raise RuntimeError("built-in REGISTRY entries must implement Tool.execute()")
 
 
 def get_tool(name: str) -> Tool | None:

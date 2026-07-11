@@ -2,12 +2,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from openai4s.tools.base import Tool
-
-if TYPE_CHECKING:
-    from openai4s.host.files import WorkspaceFileService
+from openai4s.tools.contexts import WorkspaceToolContext
 
 
 class ListDirectoryTool(Tool):
@@ -27,7 +23,7 @@ class ListDirectoryTool(Tool):
         "required": [],
     }
 
-    def execute(self, workspace: "WorkspaceFileService", arguments: dict) -> dict:
+    def execute(self, workspace: WorkspaceToolContext, arguments: dict) -> dict:
         relative = arguments.get("path") or "."
         base = workspace.resolve(relative) if relative != "." else workspace.workspace()
         if not base.exists():

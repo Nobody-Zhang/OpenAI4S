@@ -51,6 +51,8 @@ _PACKAGE_EXPORTS = {
     "openai4s.skills_loader": {"Skill", "SkillLoader", "discover_skills"},
     "openai4s.tools": {
         "Tool",
+        "WorkspaceToolContext",
+        "EnvironmentToolContext",
         "FencedBlock",
         "REGISTRY",
         "get_tool",

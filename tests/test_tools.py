@@ -22,7 +22,9 @@ from openai4s.tools import (
 )
 from openai4s.tools.base import Tool
 from openai4s.tools.edit import edit_file
-from openai4s.tools.registry import FILE_TOOL_TYPES
+from openai4s.tools.env import env_create, env_list, env_use
+from openai4s.tools.registry import TOOL_TYPES
+from openai4s.tools.web import web_fetch, web_search
 
 _F = "`" * 3  # triple-backtick fence delimiter
 
@@ -50,15 +52,42 @@ def test_registry_is_populated_and_every_tool_resolves_to_a_handler():
         ), f"{t.name} -> unresolvable host_method {t.host_method!r}"
 
 
-def test_workspace_tools_are_named_classes_with_local_execute_behavior():
-    """Built-in file tools must never regress to anonymous Tool metadata."""
-    assert tuple(type(tool) for tool in REGISTRY[:6]) == FILE_TOOL_TYPES
-    for tool in REGISTRY[:6]:
+def test_builtin_tools_are_named_classes_with_local_execute_behavior():
+    """Built-ins must never regress to anonymous Tool metadata."""
+    assert tuple(type(tool) for tool in REGISTRY) == TOOL_TYPES
+    for tool in REGISTRY:
         assert type(tool) is not Tool
         assert type(tool).execute is not Tool.execute
         with pytest.raises(FrozenInstanceError):
             tool.name = "renamed"
-    assert type(edit_file) is FILE_TOOL_TYPES[-1]
+    compatibility_aliases = (
+        edit_file,
+        env_list,
+        env_use,
+        env_create,
+        web_search,
+        web_fetch,
+    )
+    expected_types = (TOOL_TYPES[5], *TOOL_TYPES[6:])
+    assert tuple(type(tool) for tool in compatibility_aliases) == expected_types
+
+
+def test_tool_schema_returns_an_isolated_parameter_copy():
+    tool = REGISTRY[0]
+    schema = tool.schema()
+
+    schema["function"]["parameters"]["properties"]["path"]["description"] = "changed"
+
+    assert tool.parameters["properties"]["path"]["description"] != "changed"
+
+
+def test_concrete_tool_instances_do_not_share_mutable_schemas():
+    first = TOOL_TYPES[0]()
+    second = TOOL_TYPES[0]()
+
+    first.parameters["properties"]["path"]["description"] = "first only"
+
+    assert second.parameters["properties"]["path"]["description"] != "first only"
 
 
 # --- parsing model replies --------------------------------------------------

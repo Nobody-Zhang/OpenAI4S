@@ -6,9 +6,9 @@ domain behaviour in ``execute``.  Model-originated calls must enter through
 auditing, injection screening, and UI activity events before ``execute`` is
 reached by the dispatcher's thin host-method adapter.
 
-The positional constructor remains available for older declarative entries
-and callers that build dynamic metadata-only tools. New built-ins should use
-named subclasses, mirroring CoreCoder's extensible tool catalogue.
+The positional constructor remains available for callers that build dynamic
+metadata-only tools. OpenAI4S built-ins use named subclasses, mirroring
+CoreCoder's extensible tool catalogue.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ class Tool:
     Subclasses normally set the metadata below as class attributes and
     override :meth:`execute`.  ``Tool(name, host_method, ...)`` is retained for
     schema-only extensions and compatibility; built-in tools never use it.
+    Concrete context ports are documented in :mod:`openai4s.tools.contexts`.
     """
 
     name: str = ""
@@ -79,6 +80,8 @@ class Tool:
         for field, value in overrides.items():
             if value is None:
                 value = getattr(type(self), field)
+            if field == "parameters":
+                value = copy.deepcopy(value)
             object.__setattr__(self, field, value)
         object.__setattr__(self, "_frozen", True)
 
@@ -94,7 +97,7 @@ class Tool:
         return f"{type(self).__name__}({values})"
 
     def __eq__(self, other: object) -> bool:
-        if type(other) is not type(self):
+        if not isinstance(other, Tool):
             return False
         return all(
             getattr(self, field) == getattr(other, field)

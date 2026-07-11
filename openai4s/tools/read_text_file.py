@@ -2,12 +2,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from openai4s.tools.base import Tool
-
-if TYPE_CHECKING:
-    from openai4s.host.files import WorkspaceFileService
+from openai4s.tools.contexts import WorkspaceToolContext
 
 
 class ReadTextFileTool(Tool):
@@ -31,7 +27,7 @@ class ReadTextFileTool(Tool):
         "required": ["path"],
     }
 
-    def execute(self, workspace: "WorkspaceFileService", arguments: dict) -> dict:
+    def execute(self, workspace: WorkspaceToolContext, arguments: dict) -> dict:
         path = workspace.resolve(arguments.get("path", ""), must_exist=True)
         offset = max(0, int(arguments.get("offset") or 0))
         limit = max(1, int(arguments.get("limit") or 2000))

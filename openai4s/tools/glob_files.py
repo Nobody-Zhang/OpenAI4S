@@ -2,12 +2,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from openai4s.tools.base import Tool
-
-if TYPE_CHECKING:
-    from openai4s.host.files import WorkspaceFileService
+from openai4s.tools.contexts import WorkspaceToolContext
 
 
 class GlobFilesTool(Tool):
@@ -27,7 +23,7 @@ class GlobFilesTool(Tool):
         "required": ["pattern"],
     }
 
-    def execute(self, workspace: "WorkspaceFileService", arguments: dict) -> dict:
+    def execute(self, workspace: WorkspaceToolContext, arguments: dict) -> dict:
         pattern = arguments.get("pattern") or "**/*"
         base = (
             workspace.resolve(arguments.get("path"))

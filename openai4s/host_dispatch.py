@@ -1045,35 +1045,10 @@ class HostDispatcher:
         return self._execute_control_tool("list_dir", spec, context=self._files)
 
     def _m_web_fetch(self, spec: dict) -> dict:
-        from openai4s import egress, webtools
-
-        try:
-            return webtools.web_fetch(
-                spec.get("url", ""),
-                fmt=spec.get("format", "markdown"),
-                timeout=float(spec.get("timeout") or 30),
-                max_chars=int(spec.get("max_chars") or 20000),
-            )
-        except (webtools.NetworkDisabled, egress.EgressBlocked) as e:
-            # egress soft-fail is already proxy-403-shaped; the agent recovers by
-            # calling host.request_network_access(domain=...).
-            return {"error": str(e)}
-        except Exception as e:  # noqa: BLE001
-            return {"error": f"web_fetch: {e}"}
+        return self._execute_control_tool("web_fetch", spec, context=self)
 
     def _m_web_search(self, spec: dict) -> dict:
-        from openai4s import egress, webtools
-
-        try:
-            return webtools.web_search(
-                spec.get("query", ""),
-                num_results=int(spec.get("num_results") or 8),
-                timeout=float(spec.get("timeout") or 20),
-            )
-        except (webtools.NetworkDisabled, egress.EgressBlocked) as e:
-            return {"error": str(e)}
-        except Exception as e:  # noqa: BLE001
-            return {"error": f"web_search: {e}"}
+        return self._execute_control_tool("web_search", spec, context=self)
 
     # --- remote-GPU job provenance (reproducibility traceback) -----------
     def _record_remote_prov(
@@ -1447,162 +1422,20 @@ class HostDispatcher:
         return plan or {"plan": None}
 
     # --- environments / dependencies (reference 'list/create env' steps) -----
-    _IMPORT_ALIAS = {
-        "scikit-learn": "sklearn",
-        "biopython": "Bio",
-        "pyyaml": "yaml",
-        "beautifulsoup4": "bs4",
-        "opencv-python": "cv2",
-        "pillow": "PIL",
-        "scikit-image": "skimage",
-        "anndata": "anndata",
-        "scanpy": "scanpy",
-        "leidenalg": "leidenalg",
-        "python-igraph": "igraph",
-        "umap-learn": "umap",
-    }
-
     def _current_env_name(self) -> str:
-        """Best-effort name of the env this kernel runs in, derived from the
-        active env bin dir (None ⇒ the base kernel)."""
+        """Best-effort compatibility helper for the active Python env name."""
         if self.active_env_bin:
             return Path(self.active_env_bin).parent.name
         return "base"
 
     def _m_env_list(self, spec: dict | None = None) -> dict:
-        """List the PREBUILT environments the notebook kernel can run in — the
-        reference's 'Listing envs …' step. Each is already stocked for a domain
-        (general DS / structure / phylogenetics / R), so the agent should PICK
-        one that has what it needs (host.env.use) instead of installing every
-        task. When `packages` are given, report per-env has/missing so the agent
-        can choose the env that already satisfies the imports."""
-        from openai4s.kernel import environments as envmod
-
-        spec = spec or {}
-        packages = [p for p in (spec.get("packages") or []) if isinstance(p, str)]
-        current = self._current_env_name()
-        envs_out: list[dict] = []
-        best: str | None = None
-        best_score = -1
-        for env in envmod.discover_environments():
-            has = [p for p in packages if env.has_package(p)]
-            missing = [p for p in packages if not env.has_package(p)]
-            envs_out.append(
-                {
-                    "name": env.name,
-                    "language": env.language,
-                    "python_version": env.python_version(),
-                    "runnable": env.interpreter is not None,
-                    "current": env.name == current,
-                    "description": env.description(),
-                    "notable": env.notable(),
-                    "has": has,
-                    "missing": missing,
-                }
-            )
-            if env.interpreter is not None and packages:
-                score = len(has)
-                if score > best_score or (score == best_score and env.name == current):
-                    best_score, best = score, env.name
-        # Packages available in NO env genuinely need installing.
-        truly_missing = [
-            p for p in packages if not any(p in e["has"] for e in envs_out)
-        ]
-        return {
-            "environments": envs_out,
-            "requested": packages,
-            "missing": truly_missing,
-            "current": current,
-            "recommend": best if (packages and best_score > 0) else None,
-        }
+        return self._execute_control_tool("env_list", spec or {}, context=self)
 
     def _m_env_use(self, spec: dict | str) -> dict:
-        """Run subsequent notebook cells in a PREBUILT environment. The switch is
-        applied before the NEXT cell (call this in its own cell, then import in a
-        new one). An R-only env retargets the persistent R kernel (```r cells)
-        instead of the python kernel."""
-        from openai4s.kernel import environments as envmod
-
-        if isinstance(spec, str):
-            spec = {"name": spec}
-        spec = spec or {}
-        name = spec.get("name") or spec.get("env") or ""
-        env = envmod.get_environment(name)
-        if env is None:
-            avail = [e.name for e in envmod.discover_environments()]
-            return {
-                "error": f"unknown environment {name!r}; available: " + ", ".join(avail)
-            }
-        if env.interpreter is None:
-            # R-only env: no Python to host the notebook kernel — instead of
-            # refusing, make it the target of the R execution channel. The
-            # outer loops read active_r_env when (re)spawning the R kernel;
-            # the gateway ALSO applies it via the pending-env mechanism so an
-            # already-running R kernel is retargeted before the next cell.
-            if not env.rscript:
-                return {
-                    "error": f"'{name}' has neither a Python nor an R "
-                    "interpreter — pick another environment (host.env.list())."
-                }
-            self.active_r_env = name
-            note = f"subsequent ```r cells run in '{name}'"
-            if self.on_env_switch is not None:
-                try:
-                    self.on_env_switch(name)
-                except Exception:  # noqa: BLE001
-                    note = "R env switch failed to register"
-            return {
-                "ok": True,
-                "env": {
-                    "name": env.name,
-                    "language": env.language,
-                    "description": env.description(),
-                    "notable": env.notable(),
-                },
-                "note": note,
-            }
-        if self.on_env_switch is not None:
-            try:
-                self.on_env_switch(name)
-                note = (
-                    f"switching to '{name}' before the next cell — put your "
-                    "imports in a new cell"
-                )
-            except Exception:  # noqa: BLE001
-                note = "env switch failed to register"
-        else:
-            note = "env switching is only available in the web session kernel"
-        return {
-            "ok": True,
-            "env": {
-                "name": env.name,
-                "language": env.language,
-                "python_version": env.python_version(),
-                "description": env.description(),
-                "notable": env.notable(),
-            },
-            "note": note,
-        }
+        return self._execute_control_tool("env_use", spec, context=self)
 
     def _m_env_setup(self, spec: dict) -> dict:
-        """Ensure packages are installed (pip) so the environment is ready —
-        the reference's 'Creating <skill> analysis environment' step. Installs
-        into the kernel interpreter; newly-installed modules import on next use."""
-        from openai4s.kernel import preinstall
-
-        spec = spec or {}
-        packages = [p for p in (spec.get("packages") or []) if isinstance(p, str)]
-        name = spec.get("name") or "analysis"
-        if not packages:
-            return {
-                "name": name,
-                "installed": [],
-                "ok": True,
-                "note": "no packages requested",
-            }
-        res = preinstall.install(packages)
-        res["name"] = name
-        return res
+        return self._execute_control_tool("env_setup", spec, context=self)
 
     def _m_load_skill(self, name: str) -> dict:
         """Return a skill's full guidance (SKILL.md) — the reference's
