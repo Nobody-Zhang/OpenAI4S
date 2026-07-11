@@ -18,7 +18,6 @@ every cell's figures / written files are captured as versioned artifacts.
 from __future__ import annotations
 
 import base64
-import binascii
 import hashlib
 import io
 import json
@@ -58,7 +57,8 @@ from openai4s.review import review_evidence
 from openai4s.server.agent_run import EventCancellation
 from openai4s.server.agent_run import ProseStreamer as _ProseStreamer
 from openai4s.server.agent_run import WebActionExecutor, WebEventSink
-from openai4s.server.artifacts import ArtifactManager
+from openai4s.server.artifacts import ArtifactManager, ArtifactOperationError
+from openai4s.server.artifacts import is_text_editable as _is_text_editable
 from openai4s.server.cell_run import CellExecutionPorts, CellExecutionService
 from openai4s.server.execution_views import ExecutionViewService
 
@@ -97,60 +97,6 @@ def _iso(ms: int | float | None) -> str | None:
         )
     except (ValueError, OSError, TypeError):
         return None
-
-
-_TEXT_EDIT_EXT = (
-    ".md",
-    ".markdown",
-    ".txt",
-    ".log",
-    ".csv",
-    ".tsv",
-    ".json",
-    ".py",
-    ".js",
-    ".ts",
-    ".fasta",
-    ".fa",
-    ".nwk",
-    ".treefile",
-    ".xml",
-    ".yaml",
-    ".yml",
-    ".sh",
-    ".r",
-    ".tex",
-    ".html",
-    ".htm",
-    ".css",
-)
-_BINARY_EXT = (
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".webp",
-    ".svg",
-    ".pdf",
-    ".pdb",
-    ".cif",
-    ".mol",
-    ".mol2",
-    ".sdf",
-    ".xyz",
-)
-
-
-def _is_text_editable(filename: str | None, content_type: str | None) -> bool:
-    name = (filename or "").lower()
-    ct = (content_type or "").lower()
-    if ct.startswith("image/") or name.endswith(_BINARY_EXT):
-        return False
-    return (
-        name.endswith(_TEXT_EDIT_EXT)
-        or ct.startswith("text/")
-        or any(k in ct for k in ("json", "csv", "xml", "javascript"))
-    )
 
 
 def _guess_ctype(name: str) -> str:
@@ -4718,22 +4664,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 return
             m = re.fullmatch(r"/artifacts/([^/]+)", sub)
             if m and method == "DELETE":
-                a = store.get_artifact(m.group(1))
-                stale = store.delete_artifact(m.group(1))
-                for p in stale:
-                    try:
-                        Path(p).unlink()
-                    except OSError:
-                        pass
-                if a and a.get("root_frame_id"):
-                    hub.broadcast(
-                        a["root_frame_id"],
-                        {
-                            "type": "artifact_created",
-                            "root_frame_id": a["root_frame_id"],
-                        },
-                    )
-                self._json({"ok": True})
+                self._json(self._delete_artifact(m.group(1)))
                 return
             m = re.fullmatch(r"/artifacts/(.+)", sub)
             if m and method == "GET":
@@ -5374,145 +5305,53 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
             return execution_views.artifact_lineage(artifact_id)
 
         def _edit_artifact(self, artifact_id: str, content: str) -> dict:
-            """Save edited content as a NEW version. The live workspace file (that
-            the agent reads) is updated in place, while an immutable per-version
-            snapshot preserves these exact bytes for history/restore — the same
-            model as auto-capture, so ``path`` stays the live file."""
-            a = store.get_artifact(artifact_id)
-            if not a:
-                raise GatewayError(404, "artifact not found")
-            if not _is_text_editable(a.get("filename"), a.get("content_type")):
-                raise GatewayError(415, "artifact is not text-editable")
-            live = runner.live_artifact_path(a)
-            # protect a PRE-FIX latest that has no immutable snapshot yet, before we
-            # overwrite the live file (post-fix versions already carry their own).
-            cur_vid = a.get("latest_version_id")
-            cur_meta = store.version_meta(cur_vid) if cur_vid else None
             try:
-                if (
-                    cur_meta
-                    and not cur_meta.get("snapshot_path")
-                    and cur_meta.get("path")
-                    and Path(cur_meta["path"]).resolve() == live.resolve()
-                    and live.exists()
-                ):
-                    runner._write_version_snapshot(
-                        cur_vid, a["filename"], data=live.read_bytes()
-                    )
-            except OSError:
-                pass
-            raw = content.encode("utf-8")
-            try:
-                live.parent.mkdir(parents=True, exist_ok=True)
-                live.write_text(content, encoding="utf-8")
-            except OSError as e:
-                raise GatewayError(500, f"write failed: {e}")
-            rec = store.save_artifact(
-                path=str(live),
-                filename=a["filename"],
-                content_type=a.get("content_type"),
-                size_bytes=len(raw),
-                checksum=hashlib.sha256(raw).hexdigest(),
-                frame_id=a.get("root_frame_id"),
-                project_id=a.get("project_id"),
-                artifact_id=artifact_id,
-            )
-            runner._write_version_snapshot(rec["version_id"], a["filename"], data=raw)
-            if a.get("root_frame_id"):
-                hub.broadcast(
-                    a["root_frame_id"],
-                    {
-                        "type": "artifact_created",
-                        "artifact": {
-                            "id": artifact_id,
-                            "filename": a["filename"],
-                            "version_id": rec["version_id"],
-                            "root_frame_id": a["root_frame_id"],
-                        },
-                    },
+                return runner.artifacts.edit(
+                    artifact_id,
+                    content,
+                    broadcast=lambda root_frame_id, event: hub.broadcast(
+                        root_frame_id, event
+                    ),
                 )
-            return {
-                "ok": True,
-                "artifact_id": artifact_id,
-                "version_id": rec["version_id"],
-                "size_bytes": len(raw),
-            }
+            except ArtifactOperationError as error:
+                raise GatewayError(error.code, error.message) from error
 
         def _restore_version(self, artifact_id: str, version_id: str) -> dict:
             return runner.restore_version(artifact_id, version_id)
 
         def _rename_artifact(self, artifact_id: str, filename: str | None) -> dict:
-            if not filename:
-                raise GatewayError(400, "filename required")
-            a = store.get_artifact(artifact_id)
-            if not a:
-                raise GatewayError(404, "artifact not found")
-            store.rename_artifact(artifact_id, filename)
-            if a.get("root_frame_id"):
-                hub.broadcast(
-                    a["root_frame_id"],
-                    {
-                        "type": "artifact_created",
-                        "artifact": {
-                            "id": artifact_id,
-                            "filename": filename,
-                            "root_frame_id": a["root_frame_id"],
-                        },
-                    },
+            try:
+                return runner.artifacts.rename(
+                    artifact_id,
+                    filename,
+                    broadcast=lambda root_frame_id, event: hub.broadcast(
+                        root_frame_id, event
+                    ),
                 )
-            return {"ok": True, "artifact_id": artifact_id, "filename": filename}
+            except ArtifactOperationError as error:
+                raise GatewayError(error.code, error.message) from error
 
         def _upload(self, b: dict) -> dict:
-            filename = b.get("filename") or f"upload-{uuid.uuid4().hex[:8]}"
-            data_b64 = b.get("content_base64") or b.get("content") or ""
-            frame_id = b.get("frame_id")
-            project_id = b.get("project_id") or "default"
             try:
-                raw = base64.b64decode(data_b64) if data_b64 else b""
-            except (binascii.Error, ValueError):
-                raw = data_b64.encode("utf-8") if isinstance(data_b64, str) else b""
-            ws = (
-                runner.workspace_for(frame_id) if frame_id else cfg.data_dir / "uploads"
-            )
-            ws.mkdir(parents=True, exist_ok=True)
-            target = ws / Path(filename).name
-            target.write_bytes(raw)
-            existing = (
-                store.artifact_by_filename(target.name, frame_id, strict=True)
-                if frame_id
-                else None
-            )
-            rec = store.save_artifact(
-                path=str(target),
-                filename=target.name,
-                content_type=_guess_ctype(target.name),
-                size_bytes=len(raw),
-                checksum=hashlib.sha256(raw).hexdigest(),
-                frame_id=frame_id,
-                project_id=project_id,
-                is_user_upload=True,
-                artifact_id=(existing["artifact_id"] if existing else None),
-            )
-            # freeze this upload's bytes so re-uploading the same name keeps history
-            runner._write_version_snapshot(rec["version_id"], target.name, data=raw)
-            if frame_id:
-                hub.broadcast(
-                    frame_id,
-                    {
-                        "type": "artifact_created",
-                        "artifact": {
-                            "id": rec["artifact_id"],
-                            "filename": target.name,
-                            "content_type": rec.get("content_type"),
-                            "root_frame_id": frame_id,
-                        },
-                    },
+                return runner.artifacts.upload(
+                    b,
+                    broadcast=lambda root_frame_id, event: hub.broadcast(
+                        root_frame_id, event
+                    ),
                 )
-            return {
-                "artifact_id": rec["artifact_id"],
-                "id": rec["artifact_id"],
-                "filename": target.name,
-            }
+            except ArtifactOperationError as error:
+                raise GatewayError(error.code, error.message) from error
+
+        def _delete_artifact(self, artifact_id: str) -> dict:
+            try:
+                return runner.artifacts.delete(
+                    artifact_id,
+                    broadcast=lambda root_frame_id, event: hub.broadcast(
+                        root_frame_id, event
+                    ),
+                )
+            except ArtifactOperationError as error:
+                raise GatewayError(error.code, error.message) from error
 
         # ---- websocket --------------------------------------------------
         def _handle_ws(self) -> None:

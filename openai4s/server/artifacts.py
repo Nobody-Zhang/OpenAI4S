@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
 import json
 import re
 import shutil
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -14,6 +18,57 @@ _JUNK_DIR_SEGMENTS = frozenset(
     {"__pycache__", "node_modules", "site-packages", "venv"}
 )
 EventSink = Callable[[dict[str, Any]], None]
+Broadcast = Callable[[str, dict[str, Any]], None]
+
+_TEXT_EDIT_EXT = (
+    ".txt",
+    ".log",
+    ".md",
+    ".markdown",
+    ".csv",
+    ".tsv",
+    ".json",
+    ".py",
+    ".js",
+    ".ts",
+    ".fasta",
+    ".fa",
+    ".nwk",
+    ".treefile",
+    ".xml",
+    ".yaml",
+    ".yml",
+    ".sh",
+    ".r",
+    ".tex",
+    ".html",
+    ".htm",
+    ".css",
+)
+_BINARY_EXT = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".svg",
+    ".pdf",
+    ".pdb",
+    ".cif",
+    ".mol",
+    ".mol2",
+    ".sdf",
+    ".xyz",
+)
+
+
+class ArtifactOperationError(Exception):
+    """An artifact mutation that the HTTP layer can map to a response."""
+
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 
 class ArtifactSession(Protocol):
@@ -41,6 +96,15 @@ class ArtifactManager:
         self.environment_snapshot = environment_snapshot
         self.guess_content_type = guess_content_type
         self.checksum = checksum
+
+    def _notify(
+        self,
+        root_frame_id: str | None,
+        event: dict[str, Any],
+        broadcast: Broadcast | None,
+    ) -> None:
+        if root_frame_id:
+            (broadcast or self.broadcast)(root_frame_id, event)
 
     def versions_dir(self) -> Path:
         directory = self.data_dir / "artifact-versions"
@@ -146,6 +210,200 @@ class ArtifactManager:
             "ok": True,
             "artifact": self.store.get_artifact(artifact_id),
         }
+
+    def edit(
+        self,
+        artifact_id: str,
+        content: str,
+        *,
+        broadcast: Broadcast | None = None,
+    ) -> dict:
+        """Save edited text as a new version without changing its live path."""
+        artifact = self.store.get_artifact(artifact_id)
+        if not artifact:
+            raise ArtifactOperationError(404, "artifact not found")
+        if not is_text_editable(
+            artifact.get("filename"), artifact.get("content_type")
+        ):
+            raise ArtifactOperationError(415, "artifact is not text-editable")
+
+        live = self.live_path(artifact)
+        current_version_id = artifact.get("latest_version_id")
+        current = (
+            self.store.version_meta(current_version_id)
+            if current_version_id
+            else None
+        )
+        try:
+            if (
+                current
+                and not current.get("snapshot_path")
+                and current.get("path")
+                and Path(current["path"]).resolve() == live.resolve()
+                and live.exists()
+            ):
+                self.write_version_snapshot(
+                    current_version_id,
+                    artifact["filename"],
+                    data=live.read_bytes(),
+                )
+        except OSError:
+            pass
+
+        raw = content.encode("utf-8")
+        try:
+            live.parent.mkdir(parents=True, exist_ok=True)
+            live.write_text(content, encoding="utf-8")
+        except OSError as error:
+            raise ArtifactOperationError(500, f"write failed: {error}") from error
+
+        record = self.store.save_artifact(
+            path=str(live),
+            filename=artifact["filename"],
+            content_type=artifact.get("content_type"),
+            size_bytes=len(raw),
+            checksum=hashlib.sha256(raw).hexdigest(),
+            frame_id=artifact.get("root_frame_id"),
+            project_id=artifact.get("project_id"),
+            artifact_id=artifact_id,
+        )
+        self.write_version_snapshot(
+            record["version_id"], artifact["filename"], data=raw
+        )
+        root_frame_id = artifact.get("root_frame_id")
+        self._notify(
+            root_frame_id,
+            {
+                "type": "artifact_created",
+                "artifact": {
+                    "id": artifact_id,
+                    "filename": artifact["filename"],
+                    "version_id": record["version_id"],
+                    "root_frame_id": root_frame_id,
+                },
+            },
+            broadcast,
+        )
+        return {
+            "ok": True,
+            "artifact_id": artifact_id,
+            "version_id": record["version_id"],
+            "size_bytes": len(raw),
+        }
+
+    def rename(
+        self,
+        artifact_id: str,
+        filename: str | None,
+        *,
+        broadcast: Broadcast | None = None,
+    ) -> dict:
+        """Rename artifact metadata; the historical live file stays in place."""
+        if not filename:
+            raise ArtifactOperationError(400, "filename required")
+        artifact = self.store.get_artifact(artifact_id)
+        if not artifact:
+            raise ArtifactOperationError(404, "artifact not found")
+        self.store.rename_artifact(artifact_id, filename)
+        root_frame_id = artifact.get("root_frame_id")
+        self._notify(
+            root_frame_id,
+            {
+                "type": "artifact_created",
+                "artifact": {
+                    "id": artifact_id,
+                    "filename": filename,
+                    "root_frame_id": root_frame_id,
+                },
+            },
+            broadcast,
+        )
+        return {"ok": True, "artifact_id": artifact_id, "filename": filename}
+
+    def upload(
+        self,
+        payload: dict,
+        *,
+        broadcast: Broadcast | None = None,
+    ) -> dict:
+        """Decode and register one JSON/base64 upload as a versioned artifact."""
+        filename = payload.get("filename") or f"upload-{uuid.uuid4().hex[:8]}"
+        encoded = payload.get("content_base64") or payload.get("content") or ""
+        frame_id = payload.get("frame_id")
+        project_id = payload.get("project_id") or "default"
+        try:
+            raw = base64.b64decode(encoded) if encoded else b""
+        except (binascii.Error, ValueError):
+            raw = encoded.encode("utf-8") if isinstance(encoded, str) else b""
+
+        workspace = (
+            self.workspace_for(frame_id)
+            if frame_id
+            else self.data_dir / "uploads"
+        )
+        workspace.mkdir(parents=True, exist_ok=True)
+        target = workspace / Path(filename).name
+        target.write_bytes(raw)
+        existing = (
+            self.store.artifact_by_filename(target.name, frame_id, strict=True)
+            if frame_id
+            else None
+        )
+        record = self.store.save_artifact(
+            path=str(target),
+            filename=target.name,
+            content_type=self.guess_content_type(target.name),
+            size_bytes=len(raw),
+            checksum=hashlib.sha256(raw).hexdigest(),
+            frame_id=frame_id,
+            project_id=project_id,
+            is_user_upload=True,
+            artifact_id=(existing["artifact_id"] if existing else None),
+        )
+        self.write_version_snapshot(record["version_id"], target.name, data=raw)
+        self._notify(
+            frame_id,
+            {
+                "type": "artifact_created",
+                "artifact": {
+                    "id": record["artifact_id"],
+                    "filename": target.name,
+                    "content_type": record.get("content_type"),
+                    "root_frame_id": frame_id,
+                },
+            },
+            broadcast,
+        )
+        return {
+            "artifact_id": record["artifact_id"],
+            "id": record["artifact_id"],
+            "filename": target.name,
+        }
+
+    def delete(
+        self,
+        artifact_id: str,
+        *,
+        broadcast: Broadcast | None = None,
+    ) -> dict:
+        """Delete an artifact, reclaim unreferenced files, and notify its frame."""
+        artifact = self.store.get_artifact(artifact_id)
+        stale_paths = self.store.delete_artifact(artifact_id)
+        for path in stale_paths:
+            try:
+                Path(path).unlink()
+            except OSError:
+                pass
+        root_frame_id = artifact.get("root_frame_id") if artifact else None
+        self._notify(
+            root_frame_id,
+            {
+                "type": "artifact_created",
+                "root_frame_id": root_frame_id,
+            },
+            broadcast,
+        )
+        return {"ok": True}
 
     def snapshot(self, workspace: Path) -> dict[str, int]:
         """Return mtimes for deliverables, excluding dependency/repository trees."""
@@ -326,4 +584,16 @@ def _ignored_file(path: Path) -> bool:
     return path.name.endswith((".pyc", ".pyo"))
 
 
-__all__ = ["ArtifactManager"]
+def is_text_editable(filename: str | None, content_type: str | None) -> bool:
+    name = (filename or "").lower()
+    content = (content_type or "").lower()
+    if content.startswith("image/") or name.endswith(_BINARY_EXT):
+        return False
+    return (
+        name.endswith(_TEXT_EDIT_EXT)
+        or content.startswith("text/")
+        or any(kind in content for kind in ("json", "csv", "xml", "javascript"))
+    )
+
+
+__all__ = ["ArtifactManager", "ArtifactOperationError", "is_text_editable"]
