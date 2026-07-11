@@ -6,15 +6,15 @@
 
 ## 💸 Replicating Claude Science in two cuts or less
 
-**An open-source, _Code-as-Action_ scientific research agent.**<br/>
-<sub>The model's action space is a Turing-complete kernel — **not** a fixed tool schema.</sub>
+**An open-source hybrid scientific research agent.**<br/>
+<sub>JSON tools orchestrate; persistent Python/R kernels do the science.</sub>
 
 <p>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-d97706.svg"></a>
   <img alt="Python" src="https://img.shields.io/badge/Python-3.10%2B-3fb950.svg">
   <img alt="Core deps" src="https://img.shields.io/badge/core-pure%20stdlib-58a6ff.svg">
   <img alt="Paradigm" src="https://img.shields.io/badge/paradigm-Code--as--Action-bc8cff.svg">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-206%20passing-3fb950.svg">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-offline%20suite-3fb950.svg">
 </p>
 <p>
   <a href="https://github.com/PKU-YuanGroup/OpenAI4S/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/PKU-YuanGroup/OpenAI4S?style=social"></a>
@@ -40,19 +40,31 @@
 
 ---
 
-## 🧬 Code-as-Action, not ReAct
+## 🧬 JSON orchestration, Code-as-Action science
 
-Most "AI agents" are **ReAct + `tool_use`**: each step the model emits one `tool_use` JSON, the host runs that single tool, and the loop repeats — the action space is a fixed menu. **OpenAI4S** instead emits **a cell of real Python/R code** that runs in a **persistent kernel**; every "tool" is a plain function on an in-kernel `host` object. The action space is a **Turing-complete language** — one turn can loop, branch, and call libraries while big objects stay resident in kernel memory.
+OpenAI4S deliberately has two action planes. Provider-native **JSON tool
+calls** handle deterministic orchestration, permissions, metadata, external
+services, and human approval. **Python/R Code-as-Action** handles computation,
+exploration, analysis, simulation, and long-running scientific work in
+persistent kernels. Python cells can synchronously call the in-kernel `host`
+API while they run; R is an independent persistent analysis channel.
+
+This is not a choice between tools and code: each does the job it is good at.
+Tool-only and conversational work can finish through the Engine-owned,
+strictly structured `finalize_response` action. Scientific cells keep the
+important `host.submit_output(...)` completion contract, including structured
+artifacts and metrics. `host.submit_output` is the only completion signal that
+can fire *inside* a Cell; a later sole `finalize_response` may still close the
+Engine after earlier Cells have run.
 
 <table>
-<tr><th></th><th>🧰 ReAct + <code>tool_use</code></th><th>🧬 Code-as-Action (OpenAI4S)</th></tr>
-<tr><td align="right"><b>Action unit</b></td><td>One tool call (JSON)</td><td><b>An arbitrary program</b> (a code cell)</td></tr>
-<tr><td align="right"><b>Action space</b></td><td>A fixed menu of tools</td><td><b>A Turing-complete language</b> (Python / R)</td></tr>
-<tr><td align="right"><b>Loops & composition</b></td><td>Orchestrated over many round-trips</td><td>Done <b>in one cell</b> — <code>for</code>, <code>if</code>, comprehensions</td></tr>
-<tr><td align="right"><b>Intermediate state</b></td><td>Lives in the model's context (text)</td><td>Lives in <b>kernel memory</b> (real objects)</td></tr>
-<tr><td align="right"><b>Big objects</b></td><td>Serialized back into context</td><td>Stay resident; <b>only a summary returns</b></td></tr>
-<tr><td align="right"><b>N operations</b></td><td>≈ N model round-trips</td><td><b>One round-trip</b> can do many steps</td></tr>
-<tr><td align="right"><b>Extending tools</b></td><td>Change the schema + the host</td><td><code>import</code> a library, or read a Skill</td></tr>
+<tr><th></th><th>JSON control plane</th><th>Python/R science plane</th></tr>
+<tr><td align="right"><b>Best for</b></td><td>workflow, permissions, metadata, services</td><td>computation, analysis, simulation</td></tr>
+<tr><td align="right"><b>Action unit</b></td><td>One ordered native-tool batch</td><td><b>One complete code cell</b></td></tr>
+<tr><td align="right"><b>Composition</b></td><td>auditable schemas and resource policy</td><td><code>for</code>, <code>if</code>, libraries, mid-cell Host RPC</td></tr>
+<tr><td align="right"><b>State</b></td><td>append-only Action Ledger</td><td>kernel memory + versioned artifacts</td></tr>
+<tr><td align="right"><b>Completion</b></td><td>Engine-owned <code>finalize_response</code></td><td><code>host.submit_output(...)</code></td></tr>
+<tr><td align="right"><b>Extending</b></td><td>named <code>Tool</code> subclass</td><td>import a library or load a Skill</td></tr>
 <tr><td colspan="3">
 
 ```python
@@ -76,11 +88,13 @@ host.save_artifact(plot(frames))             # ...only "<DataFrame 100000×20>" 
 
 ## 😮 Highlights
 
-- **🧬 Code-as-Action engine** — a Jupyter-style **persistent kernel** *is* the action space. Namespace persists across cells; big objects stay resident, only summaries hit context.
+- **🧬 Hybrid action engine** — class-based native JSON tools orchestrate while persistent Python/R kernels execute science. CLI and Web adapters start a language lazily, so tool/finalize-only runs do not spawn a kernel.
+- **📒 Ledger-first runtime** — action groups/events and terminal facts are append-only; execution attempts, generation lifecycle, usage, and completion records remain durable and reconstructable.
 - **🐍 Pure-stdlib core** — the engine **and** the web server are stdlib-only (`http.server` + hand-rolled WebSocket, no framework, no deps). The LLM client speaks OpenAI / Anthropic / Gemini over `urllib` alone.
 - **🔌 One-line multi-provider** — `ark` (doubao · glm · kimi · deepseek · minimax) plus official `chatgpt · claude · gemini`, behind a single `host.llm`; switch from the UI.
-- **🖥️ Full scientific web app** — live streaming turns, **versioned artifacts** (with a built-in 3Dmol viewer for `.pdb`/`.cif`), a live Notebook sharing the agent's kernel, background & resume.
-- **🔬 24 bundled Skills** — 14 GPU/model science Skills (AlphaFold2 · ESMFold2 · Boltz · Chai-1 · OpenFold3 · ProteinMPNN · ESM-2 · Evo2 · Borzoi · scGPT · scVI · DiffDock …) + research-workflow Skills. Skills are **recipes of code**, not JSON schemas.
+- **🖥️ Scientific workbench** — live streaming, versioned artifacts, provenance, an Action Timeline surface, and a **read-only-by-default Notebook**. An explicit developer flag enables multiline Python/R input against the shared kernels.
+- **🔐 Hardened local execution** — strict child-environment allowlists, durable approvals, one-shot generation-bound `host.bash` capabilities, and OS sandbox adapters (Seatbelt on macOS, bubblewrap on Linux) with visible degraded/fail-closed modes.
+- **🔬 24 bundled Skills** — 14 GPU/model science Skills (AlphaFold2 · ESMFold2 · Boltz · Chai-1 · OpenFold3 · ProteinMPNN · ESM-2 · Evo2 · Borzoi · scGPT · scVI · DiffDock …) + research-workflow Skills. Skills are **recipes of code**, not JSON schemas; user-authored Skills stay under the data directory and cannot shadow bundled trust.
 - **☁️ BYOC remote compute** — dispatch GPU jobs to your own machines via `ssh:<alias>` or the bundled **NVIDIA NIM** provider; real `host.fold` (single-sequence Protenix / AF3-class) under a strict no-fabrication policy.
 
 ---
@@ -120,11 +134,11 @@ git clone https://github.com/PKU-YuanGroup/OpenAI4S && cd OpenAI4S
 
 | doc | what's inside |
 |---|---|
-| [**Architecture**](docs/architecture.md) | the Code-as-Action dual loop, the `host` API, kernel design |
+| [**Architecture**](docs/architecture.md) | the hybrid action router, Action Ledger, `host` RPC, and lazy kernels |
 | [**Backend extension guide**](docs/backend-extension-guide.md) | where new Tool classes, host services, repositories, and session behaviour belong |
 | [**Skills**](docs/skills.md) | the 24 bundled Skills + how to write your own |
 | [**Remote compute**](docs/compute.md) | BYOC GPU jobs, `host.fold`, auto-provisioning |
-| [**Web app**](docs/webapp.md) | UI features, live Notebook, artifacts, the demo session |
+| [**Web app**](docs/webapp.md) | UI features, Action Timeline, read-only Notebook, artifacts, and implementation status |
 | [**Configuration**](docs/configuration.md) | model providers, env vars, conda envs, CLI |
 | [**Security**](docs/security.md) | defense-in-depth safety layers & remote-access notes |
 
@@ -132,7 +146,11 @@ git clone https://github.com/PKU-YuanGroup/OpenAI4S && cd OpenAI4S
 
 ## 🗺️ Roadmap
 
-- [ ] OS-level sandbox parity (Seatbelt / bubblewrap + seccomp) for the local kernel.
+- [ ] Finish the remaining product layer: an explicit verified-recovery action,
+  fork-from-cell semantics plus visible branch fork/undo/navigation controls,
+  a visible `.ipynb` download control, and dedicated 2D
+  chemistry/genome/sequence/MSA/LaTeX renderers.
+- [ ] Add stronger Linux isolation beyond bubblewrap where available (for example seccomp) and expand packaged sandbox smoke coverage.
 - [ ] Keyless `web_search` beyond DuckDuckGo (rate-limit resilience).
 - [ ] More BYOC providers (Modal / SLURM) beyond SSH + NVIDIA NIM.
 - [ ] A public benchmark of end-to-end scientific workflows.
@@ -162,7 +180,7 @@ Style is enforced by **pre-commit** — `black`, `isort` (`--profile black`), an
 ### What we welcome
 
 - **New Skills** — a `SKILL.md` (+ optional `kernel.py`) under `skills/` — recipes of code, not schemas.
-- **New providers** — a wire adapter in [`openai4s/llm.py`](openai4s/llm.py), or a BYOC compute provider.
+- **New providers** — a wire adapter under [`openai4s/llm/`](openai4s/llm/), or a BYOC compute provider.
 - **Engine & UI** — the core is pure stdlib and readable; the web app is framework-free.
 
 Keep the core dependency-free, guard optional science imports behind `try/except ImportError`, and make sure `uv run pytest` and `uv run pre-commit run --all-files` pass before opening a PR.
