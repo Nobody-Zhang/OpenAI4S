@@ -1,9 +1,12 @@
 """Public progress and completion projections never depend on hidden reasoning."""
 
 from openai4s.agent.actions import CodeCell, NativeToolBatch, NativeToolCall
+from openai4s.agent.loop import SYSTEM_PROMPT
+from openai4s.agent.models import ExecutionOutcome
 from openai4s.server.completions import (
     action_narration,
     completion_message,
+    outcome_narration,
     response_language,
 )
 
@@ -66,13 +69,74 @@ def test_completion_message_has_bounded_json_fallback_and_completion_fallback():
     rendered = completion_message(
         {"output": {"metrics": {"accuracy": 0.93}}}, language="en"
     )
-    assert '"accuracy": 0.93' in rendered
+    assert "Metrics:\n- accuracy: 0.93" in rendered
 
     assert (
         completion_message(None, language="zh", require_fallback=True)
         == "任务已完成。"
     )
     assert completion_message(None, require_fallback=False) == ""
+
+
+def test_completion_message_renders_scientific_public_fields_as_sections():
+    rendered = completion_message(
+        {
+            "output": {
+                "summary": "Compared the measured variants.",
+                "findings": ["Variant A scored highest", "Variant C was unstable"],
+                "metrics": {"accuracy": 0.93, "n": 120},
+                "limitations": ["Single assay batch"],
+            },
+            "completion_bullets": ["Compared all measured variants"],
+        }
+    )
+
+    assert rendered.startswith("Compared the measured variants.")
+    assert "Key findings:\n- Variant A scored highest" in rendered
+    assert "Metrics:\n- accuracy: 0.93" in rendered
+    assert "Limitations:\n- Single assay batch" in rendered
+    assert '"findings"' not in rendered
+
+
+def test_code_outcome_narration_uses_real_error_and_redacts_secrets():
+    action = CodeCell("python", "raise RuntimeError('hidden source')")
+    failed = ExecutionOutcome(
+        observation=(
+            "[Observation]\nERROR (cell line 1):\nTraceback...\n"
+            "RuntimeError: api_key=very-secret-value"
+        )
+    )
+
+    text = outcome_narration(action, failed, "en", had_public_prose=True)
+
+    assert "This cell failed" in text
+    assert "RuntimeError" in text
+    assert "very-secret-value" not in text
+    assert "hidden source" not in text
+
+
+def test_code_only_success_narrates_actual_output_shape_not_generic_action():
+    action = CodeCell("python", "print('a')\nprint('b')")
+    outcome = ExecutionOutcome(
+        observation="[Observation]\nstdout:\na\nb\n[usage wall=0.1s cpu=0.1s rss=1kb]"
+    )
+
+    assert action_narration(action) == ""
+    text = outcome_narration(action, outcome, "en", had_public_prose=False)
+    assert "2 stdout line(s)" in text
+    assert "running this analysis stage" not in text
+    assert outcome_narration(action, outcome, had_public_prose=True) == ""
+
+
+def test_agent_prompt_never_claims_post_fence_prose_runs_after_submit():
+    assert "After it succeeds you may add" not in SYSTEM_PROMPT
+    assert "Only prose BEFORE the action fence is user-visible" in SYSTEM_PROMPT
+    assert "NEVER `import host`" in SYSTEM_PROMPT
+    assert "1-4 completed" in SYSTEM_PROMPT
+    assert all(
+        key in SYSTEM_PROMPT
+        for key in ("summary", "findings", "metrics", "limitations")
+    )
 
 
 def test_completion_action_narration_does_not_expose_submit_source():

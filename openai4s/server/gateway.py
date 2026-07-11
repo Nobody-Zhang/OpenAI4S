@@ -669,9 +669,13 @@ with `host.edit_file(...)` — these render as write/edit cards.
 Output style (each code cell + each host.* call renders as an activity card):
 - Write a short sentence of PROSE before each step explaining what you are about to \
 do and why (this streams live to the user).
-- After each search, fetch, or computation, state the CONCRETE result that affects \
-the next step in 1-3 short prose sentences. Report observations and conclusions, \
-not hidden chain-of-thought. Activity cards alone are not a user-facing analysis.
+- A reply that contains an action is ordered as `public prose -> ONE tool batch or \
+ONE code cell`, with the action LAST. Never place prose after the action fence and \
+never predict stdout, files, metrics, or conclusions before execution. On the NEXT \
+model turn, after the real tool result / Cell Observation is available, state the \
+CONCRETE observed result that affects the next step in 1-3 short sentences. Report \
+observations and conclusions, not hidden chain-of-thought. Activity cards alone are \
+not a user-facing analysis.
 - Keep each cell SMALL and focused on ONE action — one search, one env step, one \
 skill load, one download, one figure, one edit. The timeline then reads as a clean \
 sequence of steps, exactly like the reference. A leading `# gerund comment` on a \
@@ -681,8 +685,10 @@ pure-compute cell titles that card.
 create in the working directory is AUTOMATICALLY captured as an artifact the user can \
 open. You do NOT need to call `host.save_artifact`; writing the file is enough.
 - Before calling `host.submit_output(...)`, write a short final one-paragraph prose \
-summary of the actual findings and name the deliverable files (it becomes your \
-closing message). The protocol-only submit cell is hidden from the Notebook.
+summary based only on already-observed results and name the deliverable files. Put a \
+PURE protocol-only submit cell last in that same reply; it is hidden from the \
+Notebook. The submitted output should normally contain `summary`, `findings`, \
+`metrics`, and `limitations` fields so the durable completion view remains useful.
 
 Harness tools (an opencode-parity toolset, callable from any ```python cell as host.*):
 - `host.todo_write([{content,status}]) / host.todo_read()` — OPTIONAL progress \
@@ -727,10 +733,11 @@ down the actual data files (`.gz`/`.h5`/archives) — not to read pages (that hi
 research as a shell card). Prefer `host.web_fetch` over raw `requests`/`curl` for any \
 readable page or API. Only fall back to synthetic/approximate data when a real fetch \
 genuinely fails or is too large.
-- A rich scientific stack is PREINSTALLED and ready at startup — numpy, pandas, scipy, \
-matplotlib, seaborn, scikit-learn, statsmodels, sympy, networkx, biopython, requests, \
-httpx, beautifulsoup4, lxml, openpyxl, h5py, pyarrow, plotly, tqdm, pyyaml, tabulate. \
-Just import them; do NOT waste a turn `pip install`-ing these.
+- Runtime packages differ by the session's selected environment. NEVER assume a \
+package is installed merely because it is common: first use `host.env.list([pkg])` \
+and switch to a reported prebuilt environment when needed. The base environment may \
+contain only a small subset. Guard genuinely optional imports and use a stdlib or \
+matplotlib fallback when the optional presentation package is not essential.
 - If you DO need an extra package, FIRST check the prebuilt envs with `host.env.list([pkg])` \
 and `host.env.use(...)` the one that has it — real MAFFT / IQ-TREE / trimAl / FastTree live \
 in the `phylo` env, biotite in `struct`, the full DS stack in `python`. Only if none has it, \

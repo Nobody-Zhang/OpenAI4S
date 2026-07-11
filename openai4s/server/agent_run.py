@@ -18,19 +18,21 @@ from openai4s.agent.control import execute_native_batch
 from openai4s.agent.events import (
     ActionRouted,
     AgentEvent,
+    OutcomeProduced,
     ReplyReceived,
     TextDelta,
     TurnStarted,
 )
 from openai4s.agent.models import ExecutionOutcome, ModelReply, RunState
 from openai4s.agent.runtime import format_observation
-from openai4s.server.completions import action_narration
+from openai4s.server.completions import action_narration, outcome_narration
 from openai4s.tools import (
     MAX_TOOL_CALLS_PER_TURN,
     execute_tool_call,
     finalize_tool_batch,
     parse_fence_delimiter,
     parse_tool_calls,
+    scan_fenced_blocks,
     strip_fenced_blocks,
 )
 
@@ -39,15 +41,52 @@ def _never_cancelled() -> bool:
     return False
 
 
-class ProseStreamer:
-    """Stream narration while hiding every top-level fenced block."""
+def _is_action_fence(fence_char: str, info: str) -> bool:
+    """Match the fence kinds understood by the action/legacy routers."""
+    return fence_char == "`" and info in {"", "python", "py", "r", "tool"}
 
-    def __init__(self, send: Callable[[dict], None], root_frame_id: str):
+
+def _public_prose_before_action(text: str) -> str:
+    """Return visible prose before the first executable top-level fence.
+
+    Documentation fences such as ``json`` are still hidden from this plain
+    prose projection, but they do not seal the stream: prose following their
+    closing delimiter remains public until a Python/R/legacy-tool action.
+    """
+    blocks = scan_fenced_blocks(text)
+    cutoff = next(
+        (
+            block.start
+            for block in blocks
+            if _is_action_fence(block.fence_char, block.info)
+        ),
+        len(text),
+    )
+    return strip_fenced_blocks(text[:cutoff])
+
+
+class ProseStreamer:
+    """Stream narration while hiding top-level fenced blocks.
+
+    ``before_first_action`` is enabled by the Web event adapter.  The default
+    retains the older standalone helper behaviour for compatibility; actual
+    user-visible Web turns never resume streaming after their first action.
+    """
+
+    def __init__(
+        self,
+        send: Callable[[dict], None],
+        root_frame_id: str,
+        *,
+        before_first_action: bool = False,
+    ):
         self.send = send
         self.rid = root_frame_id
+        self.before_first_action = before_first_action
         self.acc = ""
         self.line_buf = ""
         self.fence_stack: list[tuple[str, int]] = []
+        self.action_started = False
         self.emitted_any = False
         self.emitted = ""
 
@@ -65,6 +104,8 @@ class ProseStreamer:
             if delimiter:
                 fence_char, fence_length, info = delimiter
                 if not self.fence_stack:
+                    if _is_action_fence(fence_char, info):
+                        self.action_started = True
                     self.fence_stack.append((fence_char, fence_length))
                 elif (
                     fence_char != self.fence_stack[-1][0]
@@ -75,7 +116,9 @@ class ProseStreamer:
                     self.fence_stack.append((fence_char, fence_length))
                 else:
                     self.fence_stack.pop()
-            elif not self.fence_stack:
+            elif not self.fence_stack and not (
+                self.before_first_action and self.action_started
+            ):
                 out.append(line)
         self._emit_prose("".join(out))
 
@@ -94,7 +137,11 @@ class ProseStreamer:
         self.emitted_any = True
 
     def finalize(self) -> None:
-        target = strip_fenced_blocks(self.acc)
+        target = (
+            _public_prose_before_action(self.acc)
+            if self.before_first_action
+            else strip_fenced_blocks(self.acc)
+        )
         if target.startswith(self.emitted) and len(target) > len(self.emitted):
             self._emit_prose(target[len(self.emitted) :])
 
@@ -113,12 +160,18 @@ class WebEventSink:
     current_prose: str = field(default="", init=False)
     model_prose: str = field(default="", init=False)
     _streamer: ProseStreamer | None = field(default=None, init=False)
+    _current_action: Action | None = field(default=None, init=False)
 
     def emit(self, event: AgentEvent) -> None:
         if isinstance(event, TurnStarted):
             self.current_prose = ""
             self.model_prose = ""
-            self._streamer = ProseStreamer(self.send, self.root_frame_id)
+            self._current_action = None
+            self._streamer = ProseStreamer(
+                self.send,
+                self.root_frame_id,
+                before_first_action=True,
+            )
         elif isinstance(event, TextDelta):
             self._ensure_streamer().feed(event.text)
         elif isinstance(event, ReplyReceived):
@@ -126,7 +179,7 @@ class WebEventSink:
             streamer.finalize()
             if event.reply.usage:
                 self.add_usage(event.reply.usage)
-            prose = strip_fenced_blocks(event.reply.content).strip()
+            prose = _public_prose_before_action(event.reply.content).strip()
             self.model_prose = prose
             self.current_prose = prose
             if prose:
@@ -142,31 +195,58 @@ class WebEventSink:
                             "chunk": prose + "\n",
                         }
                     )
+        elif isinstance(event, ActionRouted):
+            self._current_action = event.action
+            if (
+                self.narrate_actions
+                and not self.current_prose
+                and not self.cancelled()
+            ):
+                self._publish(
+                    action_narration(event.action, self.language), before_action=True
+                )
         elif (
-            isinstance(event, ActionRouted)
+            isinstance(event, OutcomeProduced)
             and self.narrate_actions
-            and not self.current_prose
             and not self.cancelled()
         ):
-            prose = action_narration(event.action, self.language)
-            if prose:
-                self.current_prose = prose
-                self.assistant_visible.append(
-                    {"at": int(time.time() * 1000) - 1, "text": prose}
-                )
-                self.send(
-                    {
-                        "type": "text_chunk",
-                        "frame_id": self.root_frame_id,
-                        "block_type": "text",
-                        "chunk": prose + "\n",
-                    }
-                )
+            self._publish(
+                outcome_narration(
+                    self._current_action,
+                    event.outcome,
+                    self.language,
+                    had_public_prose=bool(self.model_prose),
+                ),
+                before_action=False,
+            )
 
     def _ensure_streamer(self) -> ProseStreamer:
         if self._streamer is None:
-            self._streamer = ProseStreamer(self.send, self.root_frame_id)
+            self._streamer = ProseStreamer(
+                self.send,
+                self.root_frame_id,
+                before_first_action=True,
+            )
         return self._streamer
+
+    def _publish(self, prose: str, *, before_action: bool) -> None:
+        if not prose:
+            return
+        self.current_prose = prose
+        self.assistant_visible.append(
+            {
+                "at": int(time.time() * 1000) - (1 if before_action else 0),
+                "text": prose,
+            }
+        )
+        self.send(
+            {
+                "type": "text_chunk",
+                "frame_id": self.root_frame_id,
+                "block_type": "text",
+                "chunk": prose + "\n",
+            }
+        )
 
 
 @dataclass

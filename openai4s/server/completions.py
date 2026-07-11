@@ -7,12 +7,7 @@ import re
 from typing import Any, Iterable
 from urllib.parse import quote
 
-from openai4s.agent.actions import (
-    Action,
-    CodeCell,
-    NativeToolBatch,
-    is_completion_only_cell,
-)
+from openai4s.agent.actions import Action, CodeCell, NativeToolBatch
 
 _CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 _SUMMARY_KEYS = (
@@ -25,6 +20,22 @@ _SUMMARY_KEYS = (
     "结论",
     "回答",
 )
+_FINDING_KEYS = ("findings", "key_findings", "发现", "关键发现")
+_METRIC_KEYS = ("metrics", "measurements", "指标", "测量结果")
+_LIMITATION_KEYS = ("limitations", "caveats", "限制", "局限性")
+_ARTIFACT_KEYS = {"artifact", "artifacts", "report_file", "file", "files"}
+_STRUCTURED_KEYS = set(
+    (*_SUMMARY_KEYS, *_FINDING_KEYS, *_METRIC_KEYS, *_LIMITATION_KEYS)
+)
+_ERROR_SECTION = re.compile(
+    r"(?:^|\n)ERROR(?: \(cell line \d+\))?:\n(?P<body>.*?)(?=\n\[usage|\Z)",
+    re.DOTALL,
+)
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\b(api[_-]?key|token|secret|password|authorization)\b"
+    r"(\s*[:=]\s*)([^\s,;]+)"
+)
+_BEARER = re.compile(r"(?i)\bbearer\s+[a-z0-9._~+/=-]+")
 
 
 def response_language(text: Any) -> str:
@@ -36,19 +47,11 @@ def action_narration(action: Action | None, language: str = "en") -> str:
     """Describe an action without inventing reasoning or scientific results."""
     zh = language == "zh"
     if isinstance(action, CodeCell):
-        if is_completion_only_cell(action):
-            return ""
-        if action.language == "r":
-            return (
-                "我正在用 R 完成这一阶段的分析，关键输出会保留在 Notebook 中。"
-                if zh
-                else "I am running this analysis stage in R; its key outputs will remain in the Notebook."
-            )
-        return (
-            "我正在运行这一阶段的分析，关键输出会保留在 Notebook 和最终结果中。"
-            if zh
-            else "I am running this analysis stage; key outputs will remain in the Notebook and final result."
-        )
+        # A code action has no trustworthy outcome until its kernel result is
+        # available.  Narrating it here produced the same generic sentence for
+        # every code-only turn and, worse, made that sentence look like a
+        # result.  ``outcome_narration`` owns the post-execution projection.
+        return ""
     if not isinstance(action, NativeToolBatch) or not action.calls:
         return ""
 
@@ -97,6 +100,62 @@ def action_narration(action: Action | None, language: str = "en") -> str:
     )
 
 
+def outcome_narration(
+    action: Action | None,
+    outcome: Any,
+    language: str = "en",
+    *,
+    had_public_prose: bool = False,
+) -> str:
+    """Project a real execution outcome without exposing code or reasoning.
+
+    Error text is reduced to one bounded, redacted exception headline.  A
+    successful code turn gets a deterministic notice only when the model gave
+    no public pre-action prose; this prevents both silent code-only loops and a
+    second boilerplate sentence after every well-narrated action.
+    """
+    if not isinstance(action, CodeCell):
+        return ""
+    if getattr(outcome, "stop_reason", None) == "cancelled":
+        return ""
+
+    observation = str(getattr(outcome, "observation", "") or "")
+    error = _error_headline(observation)
+    zh = language == "zh"
+    if error:
+        return (
+            f"这个 Cell 执行失败：`{error}`。下一轮会依据真实 traceback 修复。"
+            if zh
+            else f"This cell failed: `{error}`. The next step will repair it from the actual traceback."
+        )
+    if getattr(outcome, "completion", None) is not None or had_public_prose:
+        return ""
+
+    stdout_lines = _section_line_count(observation, "stdout:")
+    stderr_lines = _section_line_count(observation, "stderr:")
+    details: list[str] = []
+    if stdout_lines:
+        details.append(
+            f"stdout {stdout_lines} 行" if zh else f"{stdout_lines} stdout line(s)"
+        )
+    if stderr_lines:
+        details.append(
+            f"stderr {stderr_lines} 行" if zh else f"{stderr_lines} stderr line(s)"
+        )
+    if details:
+        joined = "、".join(details) if zh else " and ".join(details)
+        return (
+            f"这个 Cell 已成功完成，产生了 {joined}；实际输出已记录在 Notebook。"
+            if zh
+            else f"This cell completed successfully with {joined}; the actual output is recorded in the Notebook."
+        )
+    return (
+        "这个 Cell 已成功完成（没有 stdout 或 stderr）；运行状态已保留在 Notebook。"
+        if zh
+        else "This cell completed successfully with no stdout or stderr; its runtime state is recorded in the Notebook."
+    )
+
+
 def completion_message(
     completion: Any,
     artifacts: Iterable[dict] = (),
@@ -116,6 +175,21 @@ def completion_message(
     summary = _summary_text(output)
     if summary and not _summary_already_visible(output, summary, previous):
         parts.append(summary)
+
+    for heading_en, heading_zh, keys in (
+        ("Key findings:", "关键发现：", _FINDING_KEYS),
+        ("Metrics:", "指标：", _METRIC_KEYS),
+        ("Limitations:", "限制与局限：", _LIMITATION_KEYS),
+    ):
+        value = _first_value(output, keys)
+        body = _structured_body(value)
+        if body and _normalized(body) not in previous:
+            parts.append((heading_zh if zh else heading_en) + "\n" + body)
+
+    if not parts:
+        fallback = _fallback_output_text(output)
+        if fallback and _normalized(fallback) not in previous:
+            parts.append(fallback)
 
     fresh_bullets = [
         str(item).strip()
@@ -148,18 +222,88 @@ def _summary_text(output: Any) -> str:
     for key in _SUMMARY_KEYS:
         value = output.get(key)
         if isinstance(value, str) and value.strip():
-            return value.strip()
+            return value.strip()[:4000]
         if isinstance(value, (int, float, bool)):
             return f"{key}: {value}"
+    return ""
+
+
+def _fallback_output_text(output: Any) -> str:
+    """Keep legacy arbitrary outputs visible when no public fields exist."""
+    if not isinstance(output, dict):
+        return ""
     visible = {
         str(key): value
         for key, value in output.items()
-        if key not in {"artifact", "artifacts", "report_file", "file", "files"}
+        if key not in _ARTIFACT_KEYS and key not in _STRUCTURED_KEYS
     }
     if not visible or set(visible) <= {"ok", "status"}:
         return ""
     rendered = json.dumps(visible, ensure_ascii=False, indent=2, default=str)
     return f"```json\n{rendered[:4000]}\n```"
+
+
+def _first_value(output: Any, keys: tuple[str, ...]) -> Any:
+    if not isinstance(output, dict):
+        return None
+    for key in keys:
+        value = output.get(key)
+        if value not in (None, "", [], {}):
+            return value
+    return None
+
+
+def _structured_body(value: Any) -> str:
+    if value in (None, "", [], {}):
+        return ""
+    if isinstance(value, dict):
+        items = [
+            f"- {str(key)[:120]}: {_compact_value(item)}"
+            for key, item in list(value.items())[:20]
+        ]
+        return "\n".join(items)[:4000]
+    if isinstance(value, (list, tuple)):
+        items = [f"- {_compact_value(item)}" for item in list(value)[:20]]
+        return "\n".join(items)[:4000]
+    return str(value).strip()[:4000]
+
+
+def _compact_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()[:500]
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, ensure_ascii=False, default=str)[:500]
+    return str(value)[:500]
+
+
+def _error_headline(observation: str) -> str:
+    match = _ERROR_SECTION.search(observation)
+    if not match:
+        return ""
+    lines = [line.strip() for line in match.group("body").splitlines() if line.strip()]
+    if not lines:
+        return "execution error"
+    headline = lines[-1]
+    headline = _BEARER.sub("Bearer <redacted>", headline)
+    headline = _SECRET_ASSIGNMENT.sub(r"\1\2<redacted>", headline)
+    headline = headline.replace("`", "'")
+    return headline[:240]
+
+
+def _section_line_count(observation: str, marker: str) -> int:
+    needle = "\n" + marker + "\n"
+    start = observation.find(needle)
+    if start < 0:
+        return 0
+    body = observation[start + len(needle) :]
+    stops = [
+        index
+        for boundary in ("\nstderr:", "\nERROR", "\n[usage")
+        if (index := body.find(boundary)) >= 0
+    ]
+    if stops:
+        body = body[: min(stops)]
+    return len(body.rstrip().splitlines()) if body.rstrip() else 0
 
 
 def _summary_already_visible(output: Any, summary: str, previous: str) -> bool:
@@ -197,4 +341,9 @@ def _normalized(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip().casefold()
 
 
-__all__ = ["action_narration", "completion_message", "response_language"]
+__all__ = [
+    "action_narration",
+    "completion_message",
+    "outcome_narration",
+    "response_language",
+]

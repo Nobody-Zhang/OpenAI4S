@@ -475,7 +475,9 @@ def test_streamed_deltas_hide_fences_and_precede_tool_and_terminal_events(
         and event.get("block_type") == "text"
     ]
     visible = "".join(event["chunk"] for event in text_events)
-    assert visible == "Before.\nAfter."
+    # Anything after the action fence was generated before the cell ran and
+    # therefore cannot be a trustworthy result narration.
+    assert visible == "Before.\n"
     assert "host.submit_output" not in visible
 
     reset_index = next(
@@ -502,4 +504,93 @@ def test_streamed_deltas_hide_fences_and_precede_tool_and_terminal_events(
     assert tool_index < terminal_index
     stored = runner.store.list_messages(frame_id)
     assert stored[-1]["role"] == "assistant"
-    assert stored[-1]["content"] == "Before.\nAfter."
+    assert stored[-1]["content"] == "Before."
+
+
+def test_code_only_failure_is_visible_after_real_cell_outcome(monkeypatch, tmp_path):
+    dispatcher = SimpleNamespace(last_output=None)
+    runner, hub, frame_id = _prepare_message_runner(
+        monkeypatch, tmp_path, dispatcher
+    )
+    reply = "```python\nprint(missing_name)\n```\nThis worked perfectly."
+
+    def fake_chat(messages, cfg, on_delta=None, **kwargs):
+        del messages, cfg, kwargs
+        assert callable(on_delta)
+        on_delta(reply)
+        return {"content": reply, "usage": {}}
+
+    def fake_execute(state, code, origin, emit, stream=True, language="python"):
+        del state, code, origin, emit, stream, language
+        return {
+            "result": {
+                "stdout": "",
+                "stderr": "",
+                "error": "NameError: name 'missing_name' is not defined",
+            }
+        }
+
+    monkeypatch.setattr(gateway_mod, "chat", fake_chat)
+    monkeypatch.setattr(runner, "_execute_and_log", fake_execute)
+
+    result = runner.run_message(frame_id, "default", "Run one broken cell")
+
+    assert result["status"] == "failed"
+    visible = "".join(
+        event.get("chunk", "")
+        for event in hub.events
+        if event.get("type") == "text_chunk"
+        and event.get("block_type") == "text"
+    )
+    assert "This cell failed" in visible
+    assert "NameError" in visible
+    assert "This worked perfectly" not in visible
+    stored = runner.store.list_messages(frame_id)
+    assert any("NameError" in message["content"] for message in stored)
+
+
+def test_conversational_json_fence_does_not_cut_off_later_public_prose(
+    monkeypatch, tmp_path
+):
+    dispatcher = SimpleNamespace(last_output=None)
+    runner, hub, frame_id = _prepare_message_runner(
+        monkeypatch, tmp_path, dispatcher
+    )
+    reply = (
+        "The public response shape is:\n"
+        "```json\n{\"summary\": \"...\"}\n```\n"
+        "I will now verify the values.\n"
+        "```python\nhost.submit_output({'summary': 'verified'}, ['Verified values'])\n```\n"
+        "Unverified trailing claim."
+    )
+
+    def fake_chat(messages, cfg, on_delta=None, **kwargs):
+        del messages, cfg, kwargs
+        assert callable(on_delta)
+        for offset in range(0, len(reply), 7):
+            on_delta(reply[offset : offset + 7])
+        return {"content": reply, "usage": {}}
+
+    def fake_execute(state, code, origin, emit, stream=True, language="python"):
+        del code, origin, emit, stream, language
+        state.dispatcher.last_output = {
+            "output": {"summary": "verified"},
+            "completion_bullets": ["Verified values"],
+        }
+        return {"result": {"stdout": "", "stderr": "", "error": None}}
+
+    monkeypatch.setattr(gateway_mod, "chat", fake_chat)
+    monkeypatch.setattr(runner, "_execute_and_log", fake_execute)
+
+    result = runner.run_message(frame_id, "default", "Verify the values")
+
+    assert result["status"] == "completed"
+    visible = "".join(
+        event.get("chunk", "")
+        for event in hub.events
+        if event.get("type") == "text_chunk"
+        and event.get("block_type") == "text"
+    )
+    assert "I will now verify the values." in visible
+    assert '"summary": "..."' not in visible
+    assert "Unverified trailing claim." not in visible
