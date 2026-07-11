@@ -254,6 +254,18 @@ def test_send_starts_an_async_background_turn() -> None:
     ), "a 202 acknowledgement is not completion; wait for the terminal WS event"
 
 
+def test_restart_approval_is_explicitly_continued_instead_of_auto_replayed() -> None:
+    render_source = _extract_js_function(APP_JS, "renderPermissionCard")
+    mark_source = _extract_js_function(APP_JS, "markPermCard")
+    assert "resolution.ok !== true" in render_source
+    assert "resolution_context === \"after_restart\"" in mark_source
+    assert "requires_continue === true" in mark_source
+    assert 'send(t("perm.continuePrompt"))' in mark_source
+    assert "perm.status.afterRestartAllowed" in mark_source
+    assert "perm.status.afterRestartDenied" in mark_source
+    assert ".perm-continue" in STYLE_CSS
+
+
 def test_review_is_a_streamed_step_with_manual_and_session_controls() -> None:
     body_source = _extract_js_function(APP_JS, "stepBody")
     state_source = _extract_js_function(APP_JS, "applyStepState")

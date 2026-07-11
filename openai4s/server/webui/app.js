@@ -590,7 +590,9 @@ Object.assign(I18N.zh, {
   "palette.searchPlaceholder": "搜索会话、产物、技能，或执行命令…",
   "perm.badge.subAgent": "子智能体",
   "perm.btn.allow": "允许",
+  "perm.btn.continueReplan": "继续并重新规划",
   "perm.btn.deny": "拒绝",
+  "perm.continuePrompt": "继续。刚才批准的是守护进程重启前被中断的操作；请先重新评估当前状态，只在仍有必要时发起新的操作，不要假设原操作已经执行。",
   "perm.lbl.rememberRule": "记住规则（可用 * 通配）",
   "perm.lbl.rememberScope": "记住范围",
   "perm.placeholder.denyReason": "（可选）拒绝原因，会反馈给智能体",
@@ -600,6 +602,8 @@ Object.assign(I18N.zh, {
   "perm.scope.project": "本项目",
   "perm.status.allowed": "已允许",
   "perm.status.allowedScope": "已允许（{0}）",
+  "perm.status.afterRestartAllowed": "批准已记录；守护进程重启后，原操作未执行。",
+  "perm.status.afterRestartDenied": "已拒绝；守护进程重启后，原操作未执行。",
   "perm.status.denied": "已拒绝",
   "perm.sub.approvalNeeded": "智能体请求执行下面的操作，需要你的批准。",
   "perm.title.run": "运行 {0}",
@@ -1271,7 +1275,9 @@ Object.assign(I18N.en, {
   "palette.searchPlaceholder": "Search sessions, artifacts, skills, or run a command…",
   "perm.badge.subAgent": "Subagent",
   "perm.btn.allow": "Allow",
+  "perm.btn.continueReplan": "Continue and replan",
   "perm.btn.deny": "Deny",
+  "perm.continuePrompt": "Continue. The operation I just approved was interrupted before the daemon restarted. Re-evaluate the current state first, issue a fresh action only if it is still needed, and do not assume the original operation executed.",
   "perm.lbl.rememberRule": "Remember rule (use * as wildcard)",
   "perm.lbl.rememberScope": "Remember scope",
   "perm.placeholder.denyReason": "(Optional) reason for denial, will be sent to the agent",
@@ -1281,6 +1287,8 @@ Object.assign(I18N.en, {
   "perm.scope.project": "This project",
   "perm.status.allowed": "Allowed",
   "perm.status.allowedScope": "Allowed ({0})",
+  "perm.status.afterRestartAllowed": "Approval recorded; the original operation did not execute after the daemon restart.",
+  "perm.status.afterRestartDenied": "Denied; the original operation did not execute after the daemon restart.",
   "perm.status.denied": "Denied",
   "perm.sub.approvalNeeded": "The agent requests to perform the operation below and needs your approval.",
   "perm.title.run": "Run {0}",
@@ -2812,9 +2820,13 @@ function renderPermissionCard(m) {
     const body = { decision_id: m.decision_id, allow: ok, scope };
     if (scope !== "once") body.pattern = patIn.value.trim() || "*";
     if (!ok && fb.value.trim()) body.message = fb.value.trim();
-    try { await api(`/frames/${encodeURIComponent(m.frame_id)}/decision`, { method: "POST", body: JSON.stringify(body) }); }
+    let resolution;
+    try {
+      resolution = await api(`/frames/${encodeURIComponent(m.frame_id)}/decision`, { method: "POST", body: JSON.stringify(body) });
+      if (!resolution || resolution.ok !== true) throw new Error((resolution && resolution.error) || "permission decision was not accepted");
+    }
     catch (e) { allow.disabled = deny.disabled = false; hint(t("toast.submitFailed", e.message), true); return; }
-    markPermCard(m.decision_id, ok, scope);
+    markPermCard(m.decision_id, ok, scope, resolution);
   };
   allow.onclick = () => send(true);
   deny.onclick = () => send(false);
@@ -2825,21 +2837,35 @@ function renderPermissionCard(m) {
   S.permCards[m.decision_id] = { card, allow, deny, resolved: false };
   down();
 }
-function markPermCard(id, allowed, scope) {
+function markPermCard(id, allowed, scope, resolution) {
   const reg = S.permCards || {};
   if (!Object.prototype.hasOwnProperty.call(reg, id)) return;  // ignore __proto__/constructor keys
-  const h = reg[id]; h.resolved = true;
+  const h = reg[id]; h.resolved = true; h.resolution = resolution || null;
   if (h.allow) h.allow.disabled = true; if (h.deny) h.deny.disabled = true;
   h.card.classList.add("resolved", allowed ? "allowed" : "denied");
   let st = h.card.querySelector(".perm-status");
   if (!st) { st = el("div", "perm-status"); h.card.appendChild(st); }
-  st.textContent = allowed ? ((scope && scope !== "once") ? t("perm.status.allowedScope", permScopeCn(scope)) : t("perm.status.allowed")) : t("perm.status.denied");
+  const afterRestart = resolution && resolution.resolution_context === "after_restart";
+  st.textContent = afterRestart
+    ? (allowed ? t("perm.status.afterRestartAllowed") : t("perm.status.afterRestartDenied"))
+    : (allowed ? ((scope && scope !== "once") ? t("perm.status.allowedScope", permScopeCn(scope)) : t("perm.status.allowed")) : t("perm.status.denied"));
+  const oldContinue = h.card.querySelector(".perm-continue"); if (oldContinue) oldContinue.remove();
+  if (allowed && resolution && resolution.requires_continue === true) {
+    const cont = el("button", "perm-continue", t("perm.btn.continueReplan"));
+    cont.onclick = async () => {
+      if (S.running) { hint(t("toast.running"), false, true); return; }
+      cont.disabled = true;
+      try { await send(t("perm.continuePrompt")); }
+      finally { if (cont.isConnected && !S.running) cont.disabled = false; }
+    };
+    h.card.appendChild(cont);
+  }
 }
 function resolvePermissionCard(m) {
   const reg = S.permCards || {};
   if (!Object.prototype.hasOwnProperty.call(reg, m.decision_id)) return;  // ignore __proto__/constructor keys
   const h = reg[m.decision_id];
-  if (!h.resolved) markPermCard(m.decision_id, !!m.allow, m.scope || null);
+  if (!h.resolved) markPermCard(m.decision_id, !!m.allow, m.scope || null, m);
 }
 
 /* ---------- dashboard ---------- */

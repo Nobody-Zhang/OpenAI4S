@@ -49,6 +49,17 @@ absence of a browser subscriber never silently allows a request. Headless
 execution defaults to deny unless the operator explicitly sets
 `OPENAI4S_UNATTENDED_APPROVAL=allow`.
 
+A durable card is not a replay token. While the daemon is still running, a
+decision wakes the exact blocked call. After a daemon restart that thread is
+gone: approving the surviving card records that the old operation **did not
+execute**, appends an argument-free `permission_resolution` marker to the
+Action Ledger, and returns `requires_continue=true`. The browser then requires
+an explicit **Continue and replan** action. Conversation/project/global choices
+persist the selected standing rule. A `once` choice instead creates one exact
+`root_frame_id` + tool + permission-target grant, expires after 15 minutes, and
+is consumed atomically only when a fresh matching action reaches an `ask`
+decision. Stored/redacted approval payloads are never executed as arguments.
+
 ### The Notebook REPL is off by default
 
 The web UI's right-hand Notebook is a **read-only execution trace** by default.

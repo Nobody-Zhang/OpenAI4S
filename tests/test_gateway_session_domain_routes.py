@@ -185,6 +185,108 @@ def test_unknown_session_workbench_routes_fail_with_one_404_contract(tmp_path):
         runner.close()
 
 
+def test_restart_permission_route_requires_explicit_continuation(tmp_path):
+    runner, _handler, frame_id = _setup(tmp_path)
+    payload = {
+        "type": "await_permission",
+        "frame_id": frame_id,
+        "decision_id": "perm-route-restart",
+        "tool": "mcp_call",
+        "target": "lab/send",
+    }
+    runner.store.append_tool_action_group(
+        root_frame_id=frame_id,
+        turn_id="turn-before-restart",
+        assistant_message={
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-before-restart",
+                    "name": "mcp_call",
+                    "arguments": {"server": "lab", "tool": "send"},
+                }
+            ],
+        },
+        events=[
+            {
+                "type": "proposed",
+                "tool_call_id": "call-before-restart",
+                "canonical_arguments": {
+                    "name": "mcp_call",
+                    "arguments": {"server": "lab", "tool": "send"},
+                },
+            }
+        ],
+    )
+    runner.store.create_permission_request(
+        decision_id="perm-route-restart",
+        root_frame_id=frame_id,
+        frame_id=frame_id,
+        project_id="project-domain",
+        tool="mcp_call",
+        target="lab/send",
+        payload=payload,
+    )
+    runner.close()
+    runner.store.close()
+
+    config = Config(
+        data_dir=tmp_path,
+        llm=LLMConfig(provider="deepseek", api_key="test-key"),
+    )
+    hub = _Hub()
+    restarted = gateway_mod.SessionRunner(
+        config, hub, start_idle_sweeper=False
+    )
+    handler_class = gateway_mod.make_handler(config, hub, restarted)
+    handler = object.__new__(handler_class)
+    try:
+        assert restarted._sessions == {}
+        code, security = _call(
+            handler, "GET", f"/frames/{frame_id}/security"
+        )
+        assert code == 200
+        assert security["permission"]["pending_count"] == 1
+
+        code, resolution = _call(
+            handler,
+            "POST",
+            f"/frames/{frame_id}/decision",
+            body={
+                "decision_id": "perm-route-restart",
+                "allow": True,
+                "scope": "once",
+            },
+        )
+        assert code == 200
+        assert resolution["ok"] is True
+        assert resolution["decision_id"] == "perm-route-restart"
+        assert resolution["resolution_context"] == "after_restart"
+        assert resolution["requires_continue"] is True
+        assert resolution["original_action_executed"] is False
+        assert resolution["continuation_authorization"] == "once"
+        assert resolution["continuation_expires_at"] is not None
+        request = restarted.store.get_permission_request("perm-route-restart")
+        assert request["state"] == "allowed"
+        assert request["continuation_consumed_at"] is None
+        marker = restarted.store.list_action_groups(frame_id)[-1]
+        assert marker["kind"] == "permission_resolution"
+        assert "arguments" not in repr(marker["events"][0]["result"])
+
+        events = [
+            event
+            for event in hub.events
+            if event.get("type") == "permission_resolved"
+        ]
+        assert len(events) == 1
+        assert events[0]["requires_continue"] is True
+        assert events[0]["original_action_executed"] is False
+    finally:
+        restarted.close()
+        restarted.store.close()
+
+
 def test_fork_from_cell_route_fails_closed_until_supported(tmp_path):
     runner, handler, frame_id = _setup(tmp_path)
     try:

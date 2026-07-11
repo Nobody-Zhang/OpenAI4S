@@ -6,9 +6,12 @@ import time
 
 import pytest
 
+from openai4s.agent.ledger import restore_action_history
 from openai4s.config import Config, LLMConfig
 from openai4s.permissions import PermissionBroker, broker, suggest_patterns
+from openai4s.server.action_timeline import ActionTimelineService
 from openai4s.store import get_store
+from openai4s.tools.taxonomy import SIDE_EFFECT_CLASSES
 
 
 def _store(tmp_path):
@@ -146,6 +149,7 @@ def test_upsert_and_delete_rule(tmp_path):
 def test_broker_headless_fails_closed_unless_operator_explicitly_allows(
     tmp_path, monkeypatch
 ):
+    monkeypatch.delenv("OPENAI4S_UNATTENDED_APPROVAL", raising=False)
     st = _store(tmp_path)
     b = PermissionBroker()
     # No UI channel registered: an ask action is auditable and denied by
@@ -182,9 +186,17 @@ def test_broker_blocks_until_allowed_and_persists(tmp_path):
         time.sleep(0.01)
     ask = next(e for e in events if e.get("type") == "await_permission")
     assert ask["tool"] == "bash" and ask["scopes"][0] == "once"
-    assert b.resolve(
-        ask["decision_id"], allow=True, scope="conversation", pattern="pytest *"
+    decision = b.resolve_result(
+        ask["decision_id"],
+        allow=True,
+        scope="conversation",
+        pattern="pytest *",
+        store=st,
+        root_frame_id="root1",
     )
+    assert decision["ok"] is True
+    assert decision["resolution_context"] == "live_thread"
+    assert decision["requires_continue"] is False
     t.join(timeout=5)
     assert out["res"]["allow"] is True
     durable = st.get_permission_request(ask["decision_id"])
@@ -275,16 +287,310 @@ def test_durable_pending_request_survives_broker_restart_and_can_be_resolved(tmp
         payload=payload,
     )
 
+    st.close()
+    st = _store(tmp_path)
     restarted = PermissionBroker()
     restarted.register_channel(
         "root-durable", lambda event: None, store=st
     )
     assert restarted.pending_events("root-durable") == [payload]
-    assert restarted.resolve("perm-durable", allow=False, message="reviewed")
+    resolution = restarted.resolve_result(
+        "perm-durable",
+        allow=False,
+        message="reviewed",
+        store=st,
+        root_frame_id="root-durable",
+    )
+    assert resolution["ok"] is True
+    assert resolution["requires_continue"] is False
+    assert resolution["original_action_executed"] is False
     row = st.get_permission_request("perm-durable")
     assert row["state"] == "denied"
     assert row["message"] == "reviewed"
+    assert row["continuation_required"] == 0
     assert restarted.pending_events("root-durable") == []
+    history = restore_action_history(st, "root-durable")
+    assert history[-1]["role"] == "system"
+    assert "denied" in history[-1]["content"]
+    assert "did not execute" in history[-1]["content"]
+
+
+def test_restart_approval_requires_fresh_turn_and_never_replays_arguments(tmp_path):
+    st = _store(tmp_path)
+    st.append_tool_action_group(
+        root_frame_id="root-restart",
+        turn_id="turn-before-crash",
+        assistant_message={
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-before-crash",
+                    "name": "mcp_call",
+                    "arguments": {"server": "lab", "tool": "send"},
+                }
+            ],
+        },
+        events=[
+            {
+                "type": "proposed",
+                "tool_call_id": "call-before-crash",
+                "canonical_arguments": {
+                    "name": "mcp_call",
+                    "arguments": {"server": "lab", "tool": "send"},
+                },
+            }
+        ],
+    )
+    payload = {
+        "type": "await_permission",
+        "frame_id": "root-restart",
+        "decision_id": "perm-restart",
+        "tool": "mcp_call",
+        "target": "lab/send",
+    }
+    st.create_permission_request(
+        decision_id="perm-restart",
+        root_frame_id="root-restart",
+        frame_id="root-restart",
+        project_id="default",
+        tool="mcp_call",
+        target="lab/send",
+        payload=payload,
+    )
+
+    st.close()
+    st = _store(tmp_path)
+    restarted = PermissionBroker()
+    # No runtime/channel needs to be reconstructed merely to resurface the card.
+    assert restarted.pending_events("root-restart", store=st) == [payload]
+    result = restarted.resolve_result(
+        "perm-restart",
+        allow=True,
+        scope="once",
+        store=st,
+        root_frame_id="root-restart",
+    )
+    assert result["ok"] is True
+    assert result["allow"] is True
+    assert result["scope"] == "once"
+    assert result["resolution_context"] == "after_restart"
+    assert result["requires_continue"] is True
+    assert result["original_action_executed"] is False
+    assert result["continuation_authorization"] == "once"
+    assert result["continuation_expires_at"] > int(time.time() * 1000)
+    row = st.get_permission_request("perm-restart")
+    assert row["state"] == "allowed"
+    assert row["continuation_required"] == 1
+    assert row["continuation_expires_at"] == result["continuation_expires_at"]
+    assert row["continuation_consumed_at"] is None
+    retry = restarted.resolve_result(
+        "perm-restart",
+        allow=True,
+        scope="once",
+        store=st,
+        root_frame_id="root-restart",
+    )
+    assert retry["ok"] is True
+    assert retry["continuation_expires_at"] == result["continuation_expires_at"]
+    escalation = restarted.resolve_result(
+        "perm-restart",
+        allow=True,
+        scope="global",
+        pattern="*",
+        store=st,
+        root_frame_id="root-restart",
+    )
+    assert escalation["ok"] is False
+    assert "cannot be changed" in escalation["error"]
+
+    history = restore_action_history(st, "root-restart")
+    assert [message["role"] for message in history] == [
+        "assistant",
+        "tool",
+        "system",
+    ]
+    assert "interrupted" in history[1]["content"]
+    assert "original operation did not execute" in history[2]["content"]
+    marker = st.list_action_groups("root-restart")[-1]
+    assert marker["kind"] == "permission_resolution"
+    assert "arguments" not in repr(marker["events"][0]["result"])
+    assert marker["events"][0]["side_effect_class"] == "runtime_mutation"
+    assert marker["events"][0]["side_effect_class"] in SIDE_EFFECT_CLASSES
+    assert len(marker["events"]) == 1
+    timeline_group = ActionTimelineService(st).get("root-restart")["groups"][-1]
+    assert timeline_group["status"] == "completed"
+    assert "Approval recorded after restart" in timeline_group["title"]
+
+    standing = st.set_permission_rule(
+        scope="conversation",
+        scope_id="root-restart",
+        tool="mcp_call",
+        pattern="lab/send",
+        decision="deny",
+    )
+    assert restarted.gate(
+        store=st,
+        frame_id="root-restart",
+        method="mcp_call",
+        target="lab/send",
+    )["allow"] is False
+    assert st.get_permission_request("perm-restart")["continuation_consumed_at"] is None
+    st.set_permission_rule(
+        scope="conversation",
+        scope_id="root-restart",
+        tool="mcp_call",
+        pattern="lab/send",
+        decision="allow",
+    )
+    assert restarted.gate(
+        store=st,
+        frame_id="root-restart",
+        method="mcp_call",
+        target="lab/send",
+    )["allow"] is True
+    assert st.get_permission_request("perm-restart")["continuation_consumed_at"] is None
+    st.delete_permission_rule(standing)
+
+    # A fresh, exact action consumes the durable once grant. No handler args
+    # from the interrupted action are replayed by approval resolution itself.
+    assert restarted.gate(
+        store=st,
+        frame_id="root-restart",
+        method="mcp_call",
+        target="lab/send",
+    )["allow"] is True
+    assert st.get_permission_request("perm-restart")["continuation_consumed_at"]
+    consumed_retry = restarted.resolve_result(
+        "perm-restart",
+        allow=True,
+        scope="once",
+        store=st,
+        root_frame_id="root-restart",
+    )
+    assert consumed_retry["requires_continue"] is False
+    assert consumed_retry["continuation_authorization"] == "consumed"
+
+
+def test_restart_resolution_scopes_rule_and_rejects_cross_frame_decision(tmp_path):
+    st = _store(tmp_path)
+    st.create_permission_request(
+        decision_id="perm-conversation",
+        root_frame_id="root-a",
+        frame_id="root-a",
+        project_id="science",
+        tool="mcp_call",
+        target="lab/send",
+        payload={"type": "await_permission", "frame_id": "root-a"},
+    )
+    restarted = PermissionBroker()
+    mismatch = restarted.resolve_result(
+        "perm-conversation",
+        allow=True,
+        scope="conversation",
+        pattern="lab/*",
+        store=st,
+        root_frame_id="root-b",
+    )
+    assert mismatch["ok"] is False
+    assert st.get_permission_request("perm-conversation")["state"] == "pending"
+
+    result = restarted.resolve_result(
+        "perm-conversation",
+        allow=True,
+        scope="conversation",
+        pattern="lab/*",
+        store=st,
+        root_frame_id="root-a",
+    )
+    assert result["requires_continue"] is True
+    assert (
+        st.resolve_permission(
+            root_frame_id="root-a",
+            project_id="science",
+            tool="mcp_call",
+            pattern_input="lab/other",
+        )
+        == "allow"
+    )
+    assert (
+        st.resolve_permission(
+            root_frame_id="root-b",
+            project_id="science",
+            tool="mcp_call",
+            pattern_input="lab/other",
+        )
+        == "ask"
+    )
+
+
+def test_racing_restart_retry_cannot_escalate_once_to_global(tmp_path):
+    st = _store(tmp_path)
+    st.create_permission_request(
+        decision_id="perm-race",
+        root_frame_id="root-race",
+        frame_id="root-race",
+        project_id="science",
+        tool="mcp_call",
+        target="lab/send",
+        payload={"type": "await_permission", "frame_id": "root-race"},
+    )
+    global_read = threading.Event()
+    once_resolved = threading.Event()
+
+    class StaleGlobalView:
+        def __getattr__(self, name):
+            return getattr(st, name)
+
+        def get_permission_request(self, decision_id):
+            request = st.get_permission_request(decision_id)
+            global_read.set()
+            return request
+
+        def resolve_permission_request(self, *args, **kwargs):
+            assert once_resolved.wait(2)
+            return st.resolve_permission_request(*args, **kwargs)
+
+    restarted = PermissionBroker()
+    raced: dict = {}
+
+    def global_retry():
+        raced.update(
+            restarted.resolve_result(
+                "perm-race",
+                allow=True,
+                scope="global",
+                pattern="*",
+                store=StaleGlobalView(),
+                root_frame_id="root-race",
+            )
+        )
+
+    thread = threading.Thread(target=global_retry)
+    thread.start()
+    assert global_read.wait(1)
+    once = restarted.resolve_result(
+        "perm-race",
+        allow=True,
+        scope="once",
+        store=st,
+        root_frame_id="root-race",
+    )
+    assert once["ok"] is True
+    once_resolved.set()
+    thread.join(2)
+    assert not thread.is_alive()
+    assert raced["ok"] is False
+    assert "cannot be changed" in raced["error"]
+    assert (
+        st.resolve_permission(
+            root_frame_id="another-root",
+            project_id="science",
+            tool="mcp_call",
+            pattern_input="anything",
+        )
+        == "ask"
+    )
 
 
 def test_suggest_patterns_generalizes():

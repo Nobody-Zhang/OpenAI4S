@@ -167,7 +167,7 @@ success response body. Serializer shapes are in §4.
 
 | Method & path | Behavior |
 | --- | --- |
-| `POST /frames/{fid}/decision` | Answers a pending `await_permission` prompt. Body `{decision_id,allow,scope?("once"),pattern?,message?}` → `{"ok":bool}` (`false` when the decision id is unknown/expired). |
+| `POST /frames/{fid}/decision` | Answers a pending `await_permission` prompt. Body `{decision_id,allow,scope?("once"),pattern?,message?}`. A live decision returns `{ok,decision_id,allow,scope,resolution_context:"live_thread",requires_continue:false,original_action_executed:null}` and wakes the exact blocked call. After daemon restart it returns `resolution_context:"after_restart"`, `original_action_executed:false`, and `requires_continue:true` for an approval; no stored arguments are replayed. A restart `once` approval also returns its exact-grant `continuation_expires_at` and `continuation_authorization`; broader scopes persist a standing rule. Unknown, cross-frame, conflicting, or expired decisions return `ok:false` with `error`. |
 | `GET /frames/{fid}/permissions` | `{"root_frame_id","project_id","rules":[…]}` — rules effective for that conversation. |
 | `POST /permissions` | Upsert a rule. Body `{scope("global"),scope_id?,frame_id?,tool("*"),pattern("*"),decision("ask")}`; when `scope_id` is omitted but `frame_id` given, the scope id is derived from the frame → `{"ok":true,"rule_id"}`. |
 | `POST /permissions/reset` | Re-seeds defaults → `{"ok":true,"rules":[…]}`. |
@@ -346,7 +346,7 @@ JSON form every 25 s).
 | Message | Effect |
 | --- | --- |
 | `{"type":"ping"}` | → `{"type":"pong"}`. |
-| `{"type":"view_session","root_frame_id":fid}` | Subscribes this connection to `fid`'s events. If a turn is in flight, the buffered current-turn events are replayed (`replay_begin` … events … `replay_end`); any pending `await_permission` prompts are re-sent. `frame_id` is accepted as an alias. |
+| `{"type":"view_session","root_frame_id":fid}` | Subscribes this connection to `fid`'s events. If a turn is in flight, the buffered current-turn events are replayed (`replay_begin` … events … `replay_end`); any pending `await_permission` prompts are re-sent from durable storage even when no session runtime has been rebuilt after restart. `frame_id` is accepted as an alias. |
 | `{"type":"unview_session","root_frame_id":fid}` | Unsubscribes. |
 | `{"type":"cancel_execution","root_frame_id":fid,"execution_id", "owner":kind,"owner_id":id}` | Requests exact-ticket cancellation and receives `execution_cancel_result`. `cancel` is accepted as a compatibility type, but missing/stale/mismatched identity fails closed. |
 
@@ -373,7 +373,7 @@ m.frame_id`.
 | `plan_ready` | `frame_id`, `plan_id`, `status`, `plan`, `artifact_id` | A plan-mode turn produced a structured plan. |
 | `plan_progress` | `frame_id`, `plan_id`, `step_id`, `status`, `note` | A plan step ticked during auto-execution. |
 | `await_permission` | `frame_id`, `decision_id`, `tool`, `kind`, `title`, `input`, `target`, `suggested_patterns`, `scopes`, `sub_agent` | A tool call is blocked awaiting user approval (answer via `POST /api/frames/{fid}/decision`). Emitted from `openai4s/permissions.py`. |
-| `permission_resolved` | `frame_id`, `decision_id`, `allow`, `scope` | The pending prompt was answered / timed out. |
+| `permission_resolved` | `frame_id`, `decision_id`, `allow`, `scope`, and after restart: `resolution_context`, `requires_continue`, `original_action_executed`, `continuation_expires_at`, `continuation_authorization` | The pending prompt was answered / timed out. An after-restart event explicitly says the old operation did not execute and whether the user must start a fresh continuation. |
 | `frame_update` | `frame_id`, `status`, `task_summary` (only with `status:"titled"`) | Turn/session lifecycle. Emitted statuses: `processing`, `completed`, `failed`, `cancelled`, `success` (REPL cell), `updated` (rename/PATCH), and `titled` — the background auto-title thread's upgrade of the placeholder session title, which carries an extra `task_summary` field (the new title) that no other status has. The frontend treats `completed|failed|cancelled|success|done` as terminal — note `done` is in the frontend's terminal set but is **never emitted** by the gateway as a `frame_update` status (it is only the *stored* frame status for a completed turn). |
 | `kernel_status` | `frame_id`, `status` ∈ `restarted|stopped|started|env_changed|packages_installed|ended`, plus per-status extras (`generation`, `env`, `installed`, `ok`, `state`, `ended_reason`, `requires_kernel_recovery`) | Kernel lifecycle changes. A successful branch revert emits `ended` after invalidating both language slots. |
 | `execution_state` | `frame_id`, `execution_id`, `owner:{kind,id}`, `status` (`queued|running|finalizing|completed|failed|cancelled`), `queue_position`, `reason` | One exact ticket changed state. |

@@ -823,6 +823,8 @@ body.has-key-banner #sidebar,body.has-key-banner #main,body.has-key-banner #righ
 .perm-status{margin-top:8px;font-size:12.5px;font-weight:600}
 .perm-card.allowed .perm-status{color:var(--success-text)}
 .perm-card.denied .perm-status{color:var(--danger)}
+.perm-continue{width:100%;margin-top:10px;background:var(--accent);color:#fff;border:0;border-radius:var(--radius);height:32px;font-weight:600;font-size:13px}
+.perm-continue:hover{background:var(--accent-fill)}
 /* permissions settings tab */
 .perm-sec{margin:14px 0}
 .perm-sec-h{font-weight:600;font-size:13px;color:var(--text-000);margin-bottom:4px}

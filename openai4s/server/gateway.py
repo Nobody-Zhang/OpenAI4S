@@ -307,6 +307,11 @@ class WSHub:
 
     def _record(self, rid: str, obj: dict) -> None:
         t = obj.get("type")
+        # Approval cards have their own durable replay source.  In particular,
+        # resolving a card after daemon restart is not a live Agent turn and
+        # must not create a phantom running resume buffer.
+        if t in {"await_permission", "permission_resolved"}:
+            return
         buf = self._live.get(rid)
         if t == "text_reset":
             # a new turn begins — start a fresh buffer
@@ -1087,12 +1092,13 @@ class SessionRunner:
         with self._lock:
             return self._sessions.get(root_frame_id)
 
-    @staticmethod
-    def _pending_permissions(root_frame_id: str) -> list[dict]:
+    def _pending_permissions(self, root_frame_id: str) -> list[dict]:
         try:
             from openai4s.permissions import broker
 
-            return list(broker().pending_events(root_frame_id))
+            return list(
+                broker().pending_events(root_frame_id, store=self.store)
+            )
         except Exception:  # noqa: BLE001 - status fails closed to no payload
             return []
 
@@ -5177,14 +5183,46 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 b = self._body()
                 from openai4s.permissions import broker
 
-                okd = broker().resolve(
+                frame = store.get_frame(m.group(1))
+                if frame is None:
+                    self._json({"ok": False, "error": "session not found"}, 404)
+                    return
+                root = frame.get("root_frame_id") or m.group(1)
+                resolution = broker().resolve_result(
                     b.get("decision_id"),
                     allow=bool(b.get("allow")),
                     scope=b.get("scope") or "once",
                     pattern=b.get("pattern"),
                     message=b.get("message"),
+                    store=store,
+                    root_frame_id=root,
                 )
-                self._json({"ok": okd})
+                if (
+                    resolution.get("ok")
+                    and resolution.get("resolution_context") == "after_restart"
+                ):
+                    hub.broadcast(
+                        root,
+                        {
+                            "type": "permission_resolved",
+                            "frame_id": root,
+                            "decision_id": b.get("decision_id"),
+                            "allow": bool(resolution.get("allow")),
+                            "scope": resolution.get("scope"),
+                            "resolution_context": "after_restart",
+                            "requires_continue": bool(
+                                resolution.get("requires_continue")
+                            ),
+                            "original_action_executed": False,
+                            "continuation_expires_at": resolution.get(
+                                "continuation_expires_at"
+                            ),
+                            "continuation_authorization": resolution.get(
+                                "continuation_authorization"
+                            ),
+                        },
+                    )
+                self._json(resolution)
                 return
             # ---- permission rules: list (per conversation) / upsert / delete ----
             m = re.fullmatch(r"/frames/([^/]+)/permissions", sub)
@@ -6652,7 +6690,9 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                             try:
                                 from openai4s.permissions import broker
 
-                                for ev in broker().pending_events(rid):
+                                for ev in broker().pending_events(
+                                    rid, store=store
+                                ):
                                     conn.send_json(ev)
                             except Exception:  # noqa: BLE001
                                 pass

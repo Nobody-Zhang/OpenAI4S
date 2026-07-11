@@ -406,6 +406,10 @@ CREATE TABLE IF NOT EXISTS permission_requests (
     scope          TEXT,
     pattern        TEXT,
     message        TEXT,
+    resolution_context TEXT,
+    continuation_required INTEGER NOT NULL DEFAULT 0,
+    continuation_expires_at INTEGER,
+    continuation_consumed_at INTEGER,
     created_at     INTEGER NOT NULL,
     expires_at     INTEGER,
     resolved_at    INTEGER
@@ -620,6 +624,12 @@ class Store:
             ("figures", "TEXT"),
             ("files_read", "TEXT"),
             ("files_written", "TEXT"),
+        ],
+        "permission_requests": [
+            ("resolution_context", "TEXT"),
+            ("continuation_required", "INTEGER NOT NULL DEFAULT 0"),
+            ("continuation_expires_at", "INTEGER"),
+            ("continuation_consumed_at", "INTEGER"),
         ],
     }
 
@@ -1570,6 +1580,8 @@ class Store:
         scope: str | None = None,
         pattern: str | None = None,
         message: str | None = None,
+        resolution_context: str | None = None,
+        continuation_required: bool = False,
         resolved_at: int | None = None,
     ) -> dict:
         return self._permissions.resolve_request(
@@ -1578,7 +1590,37 @@ class Store:
             scope=scope,
             pattern=pattern,
             message=message,
+            resolution_context=resolution_context,
+            continuation_required=continuation_required,
             resolved_at=resolved_at,
+        )
+
+    def consume_restart_permission_grant(
+        self,
+        *,
+        root_frame_id: str,
+        tool: str,
+        target: str = "",
+        project_id: str | None = None,
+        consumed_at: int | None = None,
+    ) -> dict | None:
+        return self._permissions.consume_restart_once_grant(
+            root_frame_id=root_frame_id,
+            tool=tool,
+            target=target,
+            project_id=project_id,
+            consumed_at=consumed_at,
+        )
+
+    def activate_restart_permission_continuation(
+        self,
+        decision_id: str,
+        *,
+        expires_at: int | None = None,
+    ) -> dict:
+        return self._permissions.activate_restart_continuation(
+            decision_id,
+            expires_at=expires_at,
         )
 
     def get_permission_request(self, decision_id: str) -> dict | None:

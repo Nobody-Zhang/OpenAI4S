@@ -37,6 +37,21 @@ def _cfg(tmp_path):
     )
 
 
+def test_permission_resolution_does_not_create_live_turn_buffer():
+    hub = gateway_mod.WSHub()
+    hub.broadcast(
+        "root-restart",
+        {
+            "type": "permission_resolved",
+            "frame_id": "root-restart",
+            "decision_id": "perm-restart",
+            "resolution_context": "after_restart",
+            "requires_continue": True,
+        },
+    )
+    assert hub.is_running("root-restart") is False
+
+
 def test_gateway_plain_answer_is_nudged_until_structured_submit(monkeypatch, tmp_path):
     cfg = _cfg(tmp_path)
     hub = _Hub()

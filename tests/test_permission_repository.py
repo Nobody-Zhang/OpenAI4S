@@ -15,7 +15,7 @@ from openai4s.storage.permissions import (
     PermissionRuleRepository,
     perm_match,
 )
-from openai4s.store import get_store
+from openai4s.store import Store, get_store
 
 
 def _repository(tmp_path):
@@ -346,3 +346,129 @@ def test_durable_permission_request_is_append_only_and_terminal_is_immutable(tmp
     )["resolved_at"] == 200
     with pytest.raises(RuntimeError, match="already allowed"):
         store.resolve_permission_request("perm-request-1", state="denied")
+
+
+def test_restart_once_grant_is_exact_and_consumed_atomically(tmp_path):
+    store = get_store(Config(data_dir=tmp_path).db_path)
+    store.create_permission_request(
+        decision_id="perm-restart-once",
+        root_frame_id="root-1",
+        frame_id="root-1",
+        project_id="science",
+        tool="mcp_call",
+        target="lab/send",
+        payload={"type": "await_permission"},
+    )
+    store.resolve_permission_request(
+        "perm-restart-once",
+        state="allowed",
+        scope="once",
+        resolution_context="after_restart",
+        continuation_required=False,
+    )
+    assert (
+        store.consume_restart_permission_grant(
+            root_frame_id="root-1",
+            project_id="science",
+            tool="mcp_call",
+            target="lab/other",
+        )
+        is None
+    )
+    store.activate_restart_permission_continuation(
+        "perm-restart-once", expires_at=9_999_999_999_999
+    )
+
+    barrier = threading.Barrier(8)
+
+    def consume(_index):
+        barrier.wait()
+        return store.consume_restart_permission_grant(
+            root_frame_id="root-1",
+            project_id="science",
+            tool="mcp_call",
+            target="lab/send",
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        consumed = list(pool.map(consume, range(8)))
+
+    winners = [item for item in consumed if item is not None]
+    assert [item["decision_id"] for item in winners] == ["perm-restart-once"]
+    request = store.get_permission_request("perm-restart-once")
+    assert request["continuation_required"] == 1
+    assert request["continuation_consumed_at"] is not None
+
+    store.create_permission_request(
+        decision_id="perm-restart-expired",
+        root_frame_id="root-1",
+        frame_id="root-1",
+        project_id="science",
+        tool="mcp_call",
+        target="lab/expired",
+        payload={},
+    )
+    store.resolve_permission_request(
+        "perm-restart-expired",
+        state="allowed",
+        scope="once",
+        resolution_context="after_restart",
+    )
+    store.activate_restart_permission_continuation(
+        "perm-restart-expired", expires_at=1
+    )
+    assert (
+        store.consume_restart_permission_grant(
+            root_frame_id="root-1",
+            project_id="science",
+            tool="mcp_call",
+            target="lab/expired",
+            consumed_at=2,
+        )
+        is None
+    )
+    assert (
+        store.get_permission_request("perm-restart-expired")[
+            "continuation_consumed_at"
+        ]
+        is None
+    )
+
+
+def test_existing_permission_request_table_gains_restart_continuation_columns(tmp_path):
+    db_path = tmp_path / "legacy.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "CREATE TABLE permission_requests ("
+            "decision_id TEXT PRIMARY KEY,root_frame_id TEXT,frame_id TEXT,"
+            "project_id TEXT,tool TEXT NOT NULL,target TEXT NOT NULL DEFAULT '',"
+            "payload TEXT,state TEXT NOT NULL DEFAULT 'pending',scope TEXT,"
+            "pattern TEXT,message TEXT,created_at INTEGER NOT NULL,"
+            "expires_at INTEGER,resolved_at INTEGER)"
+        )
+        connection.execute(
+            "INSERT INTO permission_requests(decision_id,root_frame_id,tool,"
+            "target,state,created_at) VALUES('legacy','root','mcp_call','x',"
+            "'pending',1)"
+        )
+        connection.commit()
+
+    store = Store(db_path)
+    try:
+        columns = {
+            row["name"]
+            for row in store._conn.execute(
+                "PRAGMA table_info(permission_requests)"
+            ).fetchall()
+        }
+        assert {
+            "resolution_context",
+            "continuation_required",
+            "continuation_expires_at",
+            "continuation_consumed_at",
+        } <= columns
+        request = store.get_permission_request("legacy")
+        assert request["continuation_required"] == 0
+        assert request["continuation_expires_at"] is None
+    finally:
+        store.close()

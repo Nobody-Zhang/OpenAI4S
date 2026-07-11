@@ -116,6 +116,15 @@ default. `auto` mode degrades visibly if its real self-test fails;
 generation-bound one-shot `host.bash` capability are separate policy layers;
 see [Security](security.md).
 
+Durable approval preserves the decision, not a Python call stack. A live
+decision resumes the exact blocked gate. After daemon restart, the surviving
+request is surfaced directly from SQLite; approval records an argument-free
+`permission_resolution` Action Ledger marker, states that the old operation
+did not execute, and requires an explicit fresh continuation/replan. A
+restart-only `once` grant is exact to conversation/tool/target, expires after
+15 minutes, and is atomically consumed only by a matching fresh `ask` action.
+Stored approval payloads are never replayed as execution arguments.
+
 ## Native JSON control tools
 
 [`openai4s/tools/`](../openai4s/tools) defines every deterministic control

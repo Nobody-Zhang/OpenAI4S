@@ -19,6 +19,7 @@ delegation subsystem needing to know anything about the gate.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import threading
@@ -27,6 +28,94 @@ import uuid
 from typing import Any, Callable
 
 _SCOPES = ("once", "conversation", "project", "global")
+
+
+def _scope(value: str | None) -> str:
+    return value if value in _SCOPES else "once"
+
+
+def _restart_resolution_marker(store, request: dict, *, allow: bool) -> bool:
+    """Append an idempotent, argument-free restart decision to the ledger.
+
+    Permission payloads may be redacted or incomplete and are never replayable
+    execution input.  This marker only teaches the next model turn the one fact
+    it may rely on: the old action did not execute and must be reconsidered.
+    """
+
+    decision_id = str(request.get("decision_id") or "")
+    root = str(request.get("root_frame_id") or "")
+    tool = re.sub(
+        r"[^A-Za-z0-9_.:-]+", "_", str(request.get("tool") or "unknown")
+    )[:120]
+    if not decision_id or not root:
+        return False
+    suffix = hashlib.sha256(decision_id.encode("utf-8")).hexdigest()[:16]
+    group_id = f"ag-permission-{suffix}"
+    event_id = f"ae-permission-{suffix}"
+    if allow:
+        content = (
+            f"[system] A human approved the previously interrupted {tool} "
+            "request after the daemon restarted. The original operation did "
+            "not execute. Re-evaluate current state and issue a fresh action "
+            "only if it is still needed; never assume the old action succeeded."
+        )
+        result = {
+            "status": "requires_continue",
+            "allow": True,
+            "requires_continue": True,
+            "original_action_executed": False,
+            "tool": tool,
+        }
+    else:
+        content = (
+            f"[system] A human denied the previously interrupted {tool} "
+            "request after the daemon restarted. The original operation did "
+            "not execute. Do not assume it succeeded."
+        )
+        result = {
+            "status": "denied",
+            "allow": False,
+            "requires_continue": False,
+            "original_action_executed": False,
+            "tool": tool,
+        }
+    try:
+        group = store.get_action_group(group_id)
+        if group is None:
+            try:
+                store.append_action_group(
+                    root_frame_id=root,
+                    turn_id=f"permission-{suffix}",
+                    kind="permission_resolution",
+                    group_id=group_id,
+                    assistant_content=content,
+                    assistant_message={"role": "system", "content": content},
+                )
+            except Exception:  # noqa: BLE001 - retry an idempotent race below
+                if store.get_action_group(group_id) is None:
+                    raise
+            group = store.get_action_group(group_id)
+        events = list((group or {}).get("events") or ())
+        if not any(event.get("event_id") == event_id for event in events):
+            try:
+                store.append_action_event(
+                    group_id=group_id,
+                    event_id=event_id,
+                    type="completed" if allow else "denied",
+                    result=result,
+                    side_effect_class="runtime_mutation",
+                    resource_keys=[f"permission:{tool}"],
+                )
+            except Exception:  # noqa: BLE001 - accept only a completed race
+                group = store.get_action_group(group_id)
+                if not any(
+                    event.get("event_id") == event_id
+                    for event in (group or {}).get("events") or ()
+                ):
+                    raise
+        return True
+    except Exception:  # noqa: BLE001 - caller keeps continuation disabled
+        return False
 
 
 def suggest_patterns(method: str, target: str) -> list[str]:
@@ -126,7 +215,7 @@ class PermissionBroker:
         with self._lock:
             self._channels.pop(root_frame_id, None)
 
-    def pending_events(self, root_frame_id: str) -> list[dict]:
+    def pending_events(self, root_frame_id: str, *, store=None) -> list[dict]:
         """Outstanding await_permission payloads for a conversation (for a
         client reconnecting mid-pause)."""
         with self._lock:
@@ -136,7 +225,7 @@ class PermissionBroker:
                 if d in self._pending
             ]
             channel = self._channels.get(root_frame_id) or {}
-            store = channel.get("store")
+            store = store or channel.get("store")
         if store is None:
             return memory
         seen = {item.get("decision_id") for item in memory}
@@ -207,6 +296,22 @@ class PermissionBroker:
                 "allow": False,
                 "message": "blocked by a standing 'deny' permission rule",
             }
+        restart_once_grant = None
+        try:
+            if root:
+                restart_once_grant = store.consume_restart_permission_grant(
+                    root_frame_id=root,
+                    project_id=proj or "default",
+                    tool=method,
+                    target=target,
+                )
+        except Exception:  # noqa: BLE001 - an unusable grant never fails open
+            restart_once_grant = None
+        if restart_once_grant is not None:
+            return {
+                "allow": True,
+                "continuation_decision_id": restart_once_grant.get("decision_id"),
+            }
 
         # decision == "ask": allocate the durable identity before deciding how
         # the caller will wait, so even a headless denial is auditable.
@@ -266,6 +371,7 @@ class PermissionBroker:
                     state=state,
                     scope="once",
                     message=message,
+                    resolution_context="unattended",
                 )
             except Exception:  # noqa: BLE001
                 allowed = False
@@ -276,7 +382,11 @@ class PermissionBroker:
         if cancel_ev is not None and cancel_ev.is_set():
             try:
                 store.resolve_permission_request(
-                    did, state="cancelled", scope="once", message="turn cancelled"
+                    did,
+                    state="cancelled",
+                    scope="once",
+                    message="turn cancelled",
+                    resolution_context="live_thread",
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -337,6 +447,7 @@ class PermissionBroker:
                 scope=pend.scope,
                 pattern=pend.pattern,
                 message=pend.message,
+                resolution_context="live_thread",
             )
         except Exception:  # noqa: BLE001 — the action is already decided in memory
             if pend.allow:
@@ -377,42 +488,186 @@ class PermissionBroker:
         pattern: str | None = None,
         message: str | None = None,
     ) -> bool:
+        return bool(
+            self.resolve_result(
+                decision_id,
+                allow=allow,
+                scope=scope,
+                pattern=pattern,
+                message=message,
+            ).get("ok")
+        )
+
+    def resolve_result(
+        self,
+        decision_id: str | None,
+        *,
+        allow: bool,
+        scope: str = "once",
+        pattern: str | None = None,
+        message: str | None = None,
+        store=None,
+        root_frame_id: str | None = None,
+    ) -> dict:
+        """Resolve an approval and describe whether another turn is required.
+
+        A live decision wakes the exact blocked thread.  After a daemon restart
+        that thread no longer exists, so this method never replays stored tool
+        arguments.  Instead it records an argument-free ledger marker and
+        returns ``requires_continue``; a fresh model turn must replan the work.
+        """
+
         if not decision_id:
-            return False
+            return {"ok": False, "error": "decision_id is required"}
+        normalized_scope = _scope(scope)
         with self._lock:
             pend = self._pending.get(decision_id)
             if pend is not None:
+                pending_root = str(pend.payload.get("frame_id") or "")
+                if root_frame_id and pending_root != root_frame_id:
+                    return {"ok": False, "error": "decision does not belong to frame"}
+                if pend.event.is_set():
+                    return {"ok": False, "error": "decision is already resolving"}
                 pend.allow = bool(allow)
-                pend.scope = scope if scope in _SCOPES else "once"
+                pend.scope = normalized_scope
                 pend.pattern = pattern
                 pend.message = message
                 pend.event.set()
-                return True
+                return {
+                    "ok": True,
+                    "decision_id": decision_id,
+                    "allow": bool(allow),
+                    "scope": normalized_scope,
+                    "resolution_context": "live_thread",
+                    "requires_continue": False,
+                    "original_action_executed": None,
+                }
             # After a daemon restart there is no blocked thread, but the
-            # durable request must still be resolvable and auditable. The
-            # ledger/runtime layer can then resume or close the action group.
-            stores = [
+            # durable request must still be resolvable and auditable.
+            stores = ([store] if store is not None else []) + [
                 channel.get("store")
                 for channel in self._channels.values()
                 if channel.get("store") is not None
             ]
         terminal = "allowed" if allow else "denied"
-        for store in stores:
+        seen_stores: set[int] = set()
+        for durable_store in stores:
+            if durable_store is None or id(durable_store) in seen_stores:
+                continue
+            seen_stores.add(id(durable_store))
             try:
-                request = store.get_permission_request(decision_id)
-                if request is None or request.get("state") != "pending":
+                request = durable_store.get_permission_request(decision_id)
+                if request is None:
                     continue
-                store.resolve_permission_request(
-                    decision_id,
-                    state=terminal,
-                    scope=scope if scope in _SCOPES else "once",
-                    pattern=pattern,
-                    message=message,
+                request_root = str(request.get("root_frame_id") or "")
+                if root_frame_id and request_root != root_frame_id:
+                    return {"ok": False, "error": "decision does not belong to frame"}
+                state = str(request.get("state") or "")
+                if state == "pending":
+                    request = durable_store.resolve_permission_request(
+                        decision_id,
+                        state=terminal,
+                        scope=normalized_scope,
+                        pattern=pattern,
+                        message=message,
+                        resolution_context="after_restart",
+                        # Activated only after the ledger marker is durable.
+                        continuation_required=False,
+                    )
+                elif not (
+                    state == terminal
+                    and request.get("resolution_context") == "after_restart"
+                ):
+                    return {
+                        "ok": False,
+                        "error": f"decision is already {state or 'resolved'}",
+                    }
+                if (
+                    _scope(request.get("scope")) != normalized_scope
+                    or (request.get("pattern") or None) != (pattern or None)
+                ):
+                    return {
+                        "ok": False,
+                        "error": "resolved decision scope or pattern cannot be changed",
+                    }
+
+                if not _restart_resolution_marker(
+                    durable_store, request, allow=bool(allow)
+                ):
+                    return {
+                        "ok": False,
+                        "decision_recorded": True,
+                        "error": "approval was recorded but its continuation marker failed",
+                        "requires_continue": False,
+                        "original_action_executed": False,
+                    }
+
+                if allow:
+                    request = durable_store.activate_restart_permission_continuation(
+                        decision_id,
+                        expires_at=(
+                            int((time.time() + self.DEFAULT_TIMEOUT) * 1000)
+                            if normalized_scope == "once"
+                            else None
+                        ),
+                    )
+
+                if normalized_scope != "once":
+                    scope_id = {
+                        "conversation": request_root,
+                        "project": request.get("project_id") or "default",
+                        "global": "",
+                    }[normalized_scope]
+                    durable_store.set_permission_rule(
+                        scope=normalized_scope,
+                        scope_id=scope_id,
+                        tool=str(request.get("tool") or ""),
+                        pattern=(pattern or request.get("target") or "*"),
+                        decision=("allow" if allow else "deny"),
+                    )
+                once_consumed = bool(request.get("continuation_consumed_at"))
+                once_expired = bool(
+                    allow
+                    and normalized_scope == "once"
+                    and (
+                        not request.get("continuation_expires_at")
+                        or int(request["continuation_expires_at"])
+                        <= int(time.time() * 1000)
+                    )
                 )
-                return True
+                requires_continue = bool(
+                    allow
+                    and (
+                        normalized_scope != "once"
+                        or (not once_consumed and not once_expired)
+                    )
+                )
+                return {
+                    "ok": True,
+                    "decision_id": decision_id,
+                    "allow": bool(allow),
+                    "scope": normalized_scope,
+                    "resolution_context": "after_restart",
+                    "requires_continue": requires_continue,
+                    "original_action_executed": False,
+                    "continuation_expires_at": (
+                        request.get("continuation_expires_at") if allow else None
+                    ),
+                    "continuation_authorization": (
+                        (
+                            "consumed"
+                            if once_consumed
+                            else ("expired" if once_expired else "once")
+                        )
+                        if allow and normalized_scope == "once"
+                        else "standing_rule"
+                    )
+                    if allow
+                    else None,
+                }
             except Exception:  # noqa: BLE001 — try another registered store
                 continue
-        return False
+        return {"ok": False, "error": "unknown or expired decision"}
 
     def cancel_root(self, root_frame_id: str) -> None:
         """Deny every pending prompt for a conversation (on turn cancel)."""

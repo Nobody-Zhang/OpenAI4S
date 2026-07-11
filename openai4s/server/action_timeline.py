@@ -262,6 +262,15 @@ def _title(group: Mapping[str, Any], events: Sequence[Mapping[str, Any]]) -> str
             if isinstance(result, Mapping) and result.get("reason"):
                 return f"Run {result['reason']}"
         return "Run finished"
+    if kind == "permission_resolution":
+        for event in events:
+            result = event.get("result")
+            if isinstance(result, Mapping):
+                tool = _one_line(result.get("tool"), 80)
+                if result.get("allow"):
+                    return f"Approval recorded after restart: {tool or 'action'}"
+                return f"Approval denied after restart: {tool or 'action'}"
+        return "Approval resolved after restart"
     return _one_line(group.get("assistant_content")) or kind.replace("_", " ").title()
 
 

@@ -621,7 +621,7 @@ def reduce_action_groups(groups: Sequence[Mapping[str, Any]]) -> list[dict[str, 
             continue
         raw_message = group.get("assistant_message")
         message = copy.deepcopy(dict(raw_message)) if isinstance(raw_message, Mapping) else None
-        if kind in {"user", "system"}:
+        if kind in {"user", "system", "permission_resolution"}:
             if message and message.get("role") in {"user", "system"}:
                 history.append(message)
             continue

@@ -87,7 +87,10 @@ responsibility:
 
 Human approval is represented as a durable control-plane state. An operation
 may pause with a pending approval and later resume the same session; approval
-must not be inferred from model text.
+must not be inferred from model text. A live approval wakes the exact blocked
+call. A daemon restart destroys that call stack, so a later approval never
+replays persisted arguments: it records the interrupted action as unexecuted
+and requires a fresh, explicit continuation/replan turn.
 
 ## One authoritative agent engine
 

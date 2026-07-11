@@ -290,6 +290,8 @@ class PermissionRuleRepository:
         scope: str | None = None,
         pattern: str | None = None,
         message: str | None = None,
+        resolution_context: str | None = None,
+        continuation_required: bool = False,
         resolved_at: int | None = None,
     ) -> dict:
         terminal = {"allowed", "denied", "timed_out", "cancelled"}
@@ -307,14 +309,113 @@ class PermissionRuleRepository:
                 )
             cursor = self._connection.execute(
                 "UPDATE permission_requests SET state=?,scope=?,pattern=?,"
-                "message=?,resolved_at=? WHERE decision_id=? AND state='pending'",
-                (state, scope, pattern, message, now, decision_id),
+                "message=?,resolution_context=?,continuation_required=?,"
+                "resolved_at=? WHERE decision_id=? AND state='pending'",
+                (
+                    state,
+                    scope,
+                    pattern,
+                    message,
+                    resolution_context,
+                    int(bool(continuation_required)),
+                    now,
+                    decision_id,
+                ),
             )
             if cursor.rowcount != 1:
                 self._connection.rollback()
                 raise RuntimeError(f"permission request {decision_id!r} raced")
             self._connection.commit()
             row = self._request_row_locked(decision_id)
+        return self._normalize_request(row)
+
+    def consume_restart_once_grant(
+        self,
+        *,
+        root_frame_id: str,
+        tool: str,
+        target: str = "",
+        project_id: str | None = None,
+        consumed_at: int | None = None,
+    ) -> dict | None:
+        """Atomically consume one exact post-restart, ``once`` approval.
+
+        A daemon restart destroys the blocked Python thread, so an approval can
+        never resume that stack.  The safe replacement is a durable grant for
+        one *fresh* action with the same conversation, tool and permission
+        target.  It is intentionally narrower than a conversation rule and is
+        consumed before the new handler runs.
+        """
+
+        if not root_frame_id or not tool:
+            return None
+        now = self._clock_ms() if consumed_at is None else int(consumed_at)
+        clauses = [
+            "root_frame_id=?",
+            "tool=?",
+            "target=?",
+            "state='allowed'",
+            "scope='once'",
+            "resolution_context='after_restart'",
+            "continuation_required=1",
+            "continuation_expires_at IS NOT NULL",
+            "continuation_expires_at>?",
+            "continuation_consumed_at IS NULL",
+        ]
+        params: list[Any] = [root_frame_id, tool, target or "", now]
+        if project_id is not None:
+            clauses.append("project_id=?")
+            params.append(project_id)
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT decision_id FROM permission_requests WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY resolved_at,created_at,decision_id LIMIT 1",
+                params,
+            ).fetchone()
+            if row is None:
+                return None
+            decision_id = row["decision_id"]
+            cursor = self._connection.execute(
+                "UPDATE permission_requests SET continuation_consumed_at=? "
+                "WHERE decision_id=? AND continuation_consumed_at IS NULL "
+                "AND continuation_expires_at>?",
+                (now, decision_id, now),
+            )
+            if cursor.rowcount != 1:
+                self._connection.rollback()
+                return None
+            self._connection.commit()
+            resolved = self._request_row_locked(decision_id)
+        return self._normalize_request(resolved)
+
+    def activate_restart_continuation(
+        self,
+        decision_id: str,
+        *,
+        expires_at: int | None = None,
+    ) -> dict:
+        """Make a post-restart approval consumable after its ledger marker exists."""
+
+        with self._lock:
+            row = self._request_row_locked(decision_id)
+            if (
+                row["state"] != "allowed"
+                or row["resolution_context"] != "after_restart"
+            ):
+                raise RuntimeError(
+                    f"permission request {decision_id!r} is not a restart approval"
+                )
+            if not row["continuation_required"]:
+                self._connection.execute(
+                    "UPDATE permission_requests SET continuation_required=1,"
+                    "continuation_expires_at=? "
+                    "WHERE decision_id=? AND state='allowed' "
+                    "AND resolution_context='after_restart'",
+                    (expires_at, decision_id),
+                )
+                self._connection.commit()
+                row = self._request_row_locked(decision_id)
         return self._normalize_request(row)
 
     def get_request(self, decision_id: str) -> dict | None:
