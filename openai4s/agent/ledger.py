@@ -18,7 +18,7 @@ import json
 import re
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from openai4s.tools import get_tool
 
@@ -85,9 +85,23 @@ def _key_name(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", "_", str(value).strip().lower()).strip("_")
 
 
-def _tool_secret_keys(name: str) -> frozenset[str]:
+ToolResolver = Callable[[str], Any | None]
+
+
+def _resolve_tool(name: str, resolver: ToolResolver | None = None) -> Any | None:
+    if resolver is None:
+        return get_tool(name)
+    try:
+        return resolver(name)
+    except Exception:  # noqa: BLE001 - audit metadata must remain total
+        return None
+
+
+def _tool_secret_keys(
+    name: str, resolver: ToolResolver | None = None
+) -> frozenset[str]:
     """Read explicit/plugin metadata and JSON-schema secret annotations."""
-    tool = get_tool(name)
+    tool = _resolve_tool(name, resolver)
     if tool is None:
         return frozenset()
     keys: set[str] = set()
@@ -192,9 +206,12 @@ def _redact_raw_arguments(raw: Any, secret_keys: frozenset[str]) -> Any:
     )
 
 
-def redact_tool_call(call: NativeToolCall) -> tuple[dict[str, Any], Any]:
+def redact_tool_call(
+    call: NativeToolCall,
+    tool_resolver: ToolResolver | None = None,
+) -> tuple[dict[str, Any], Any]:
     """Return redacted canonical declaration and provider raw arguments."""
-    keys = _tool_secret_keys(call.name)
+    keys = _tool_secret_keys(call.name, tool_resolver)
     canonical = {
         "name": call.name,
         "ordinal": call.ordinal,
@@ -205,7 +222,10 @@ def redact_tool_call(call: NativeToolCall) -> tuple[dict[str, Any], Any]:
     return canonical, _redact_raw_arguments(call.raw_arguments, keys)
 
 
-def _sanitize_reply(reply: ModelReply) -> tuple[dict[str, Any], dict[str, Any]]:
+def _sanitize_reply(
+    reply: ModelReply,
+    tool_resolver: ToolResolver | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """Keep normalized replay state while removing secret tool arguments."""
     message = copy.deepcopy(dict(reply.assistant_message))
     wire_state = copy.deepcopy(dict(reply.wire_state))
@@ -214,7 +234,7 @@ def _sanitize_reply(reply: ModelReply) -> tuple[dict[str, Any], dict[str, Any]]:
     for item in message.get("tool_calls") or ():
         call = item if isinstance(item, Mapping) else {}
         name = str(call.get("name") or "")
-        keys = _tool_secret_keys(name)
+        keys = _tool_secret_keys(name, tool_resolver)
         all_keys.update(keys)
         clean = _redact_value(dict(call), keys)
         if "raw_arguments" in clean:
@@ -251,8 +271,12 @@ def _redact_embedded_argument_json(value: Any, keys: frozenset[str]) -> Any:
     return value
 
 
-def _tool_policy(name: str, arguments: Any) -> tuple[str, list[str]]:
-    tool = get_tool(name)
+def _tool_policy(
+    name: str,
+    arguments: Any,
+    resolver: ToolResolver | None = None,
+) -> tuple[str, list[str]]:
+    tool = _resolve_tool(name, resolver)
     if tool is None:
         return "unknown", [f"tool:{name or '<unnamed>'}"]
     side_effect = str(getattr(tool, "side_effect_class", "") or "unknown")
@@ -273,6 +297,7 @@ class RuntimeActionLedger:
     provider: str | None = None
     model: str | None = None
     branch_id: str | None = None
+    tool_resolver: ToolResolver | None = field(default=None, repr=False)
     current_group_id: str | None = field(default=None, init=False)
     terminal_recorded: bool = field(default=False, init=False)
     _reply: ModelReply | None = field(default=None, init=False, repr=False)
@@ -320,11 +345,11 @@ class RuntimeActionLedger:
         if self._reply is None:
             raise RuntimeError("ActionRouted arrived before ReplyReceived")
         reply = self._reply
-        message, wire_state = _sanitize_reply(reply)
+        message, wire_state = _sanitize_reply(reply, self.tool_resolver)
         self._action = action
         if isinstance(action, FinalizeAction):
             call = action.call
-            canonical, raw = redact_tool_call(call)
+            canonical, raw = redact_tool_call(call, self.tool_resolver)
             group = self.store.append_action_group(
                 root_frame_id=self.root_frame_id,
                 branch_id=self.branch_id,
@@ -354,9 +379,11 @@ class RuntimeActionLedger:
         elif isinstance(action, NativeToolBatch):
             events: list[dict[str, Any]] = []
             for sequence, call in enumerate(action.calls):
-                canonical, raw = redact_tool_call(call)
+                canonical, raw = redact_tool_call(call, self.tool_resolver)
                 side_effect, resources = _tool_policy(
-                    call.name, canonical.get("arguments")
+                    call.name,
+                    canonical.get("arguments"),
+                    self.tool_resolver,
                 )
                 events.append(
                     {
@@ -446,7 +473,7 @@ class RuntimeActionLedger:
                         cancelled=False,
                         detail="tool executor returned no canonical result",
                     )
-                keys = _tool_secret_keys(call.name)
+                keys = _tool_secret_keys(call.name, self.tool_resolver)
                 self.store.append_action_event(
                     group_id=group_id,
                     type="result",

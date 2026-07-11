@@ -138,11 +138,14 @@ def test_cli_non_scientific_finalize_uses_live_catalog_and_engine_result(monkeyp
         raise AssertionError("a structured-finalize-only CLI turn spawned a kernel")
 
     monkeypatch.setattr(loop_mod, "Kernel", unexpected_kernel)
-    result = Agent(
+    agent = Agent(
         use_skills=False,
         allow_delegate=False,
         max_turns=1,
-    ).run("Explain the already-known result without scientific computation")
+    )
+    result = agent.run(
+        "Explain the already-known result without scientific computation"
+    )
 
     assert "finalize_response" in seen_tools[0]
     assert "bash" not in seen_tools[0]
@@ -153,6 +156,10 @@ def test_cli_non_scientific_finalize_uses_live_catalog_and_engine_result(monkeyp
         "completion_bullets": ["Completed the requested explanation"],
     }
     assert result["final_message"] == "The requested explanation was completed."
+    assert [
+        group["kind"]
+        for group in agent.dispatcher.store.list_action_groups(agent.frame_id)
+    ] == ["user", "finalize", "terminal"]
 
 
 def test_submit_output_soft_fail_does_not_complete(monkeypatch):

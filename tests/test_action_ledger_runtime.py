@@ -11,7 +11,10 @@ from openai4s.agent.events import (
 )
 from openai4s.agent.ledger import REDACTED, RuntimeActionLedger, restore_action_history
 from openai4s.agent.models import EngineResult, ExecutionOutcome, ModelReply
+from openai4s.server.action_timeline import ActionTimelineService
 from openai4s.store import Store
+from openai4s.tools.catalog import SessionToolCatalog
+from openai4s.tools.dynamic import DynamicToolRegistry
 
 
 def _call(index: int, *, token: str = "live-secret") -> NativeToolCall:
@@ -125,6 +128,121 @@ def test_runtime_writer_roundtrips_native_group_and_redacts_arguments(tmp_path):
     assert history[-1]["tool_call_id"] == "call-0"
     assert history[-1]["is_error"] is False
     store.close()
+
+
+def test_session_dynamic_tool_taxonomy_survives_restart_projection(tmp_path):
+    class Worker:
+        def invoke(self, manifest, arguments):
+            del manifest
+            return {"total": sum(arguments["values"])}
+
+    implementation_marker = "MODEL_CODE_MUST_NOT_REACH_TIMELINE"
+    registry = DynamicToolRegistry(
+        "root-dynamic",
+        tmp_path,
+        tmp_path / "dynamic-manifests",
+        worker=Worker(),
+    )
+    manifest = registry.define(
+        {
+            "name": "sum_session_values",
+            "description": "Sum session measurements.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "values": {"type": "array", "items": {"type": "number"}},
+                    "access_token": {"type": "string"},
+                },
+                "required": ["values", "access_token"],
+                "additionalProperties": False,
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {"total": {"type": "number"}},
+                "required": ["total"],
+                "additionalProperties": False,
+            },
+            "implementation": (
+                "def execute(args):\n"
+                f"    # {implementation_marker}\n"
+                "    return {'total': sum(args['values'])}\n"
+            ),
+            "smoke_args": {"values": [1, 2], "access_token": "smoke-token"},
+            "ttl_s": 600,
+        }
+    )
+    catalog = SessionToolCatalog(registry)
+    proxy = catalog.get("sum_session_values")
+    assert proxy is not None
+    store = Store(tmp_path / "dynamic-ledger.db")
+    ledger = RuntimeActionLedger(
+        store,
+        "root-dynamic",
+        "turn-dynamic",
+        tool_resolver=catalog.get,
+    )
+    ledger.append_user("sum the values")
+    secret = "session-private-token"
+    arguments = {"values": [3, 4], "access_token": secret}
+    call = NativeToolCall(
+        id="call-dynamic",
+        wire_id="wire-dynamic",
+        name="sum_session_values",
+        ordinal=0,
+        raw_arguments=(
+            '{"values":[3,4],"access_token":"session-private-token"}'
+        ),
+        arguments=arguments,
+    )
+    reply = _reply((call,), content="Using the session capability.")
+    ledger.emit(ReplyReceived(reply, 0))
+    ledger.emit(ActionRouted(NativeToolBatch((call,)), 0))
+    ledger.emit(
+        OutcomeProduced(
+            ExecutionOutcome(
+                (
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "wire_id": call.wire_id,
+                        "name": call.name,
+                        "content": {"total": 7},
+                        "is_error": False,
+                    },
+                )
+            ),
+            0,
+        )
+    )
+    ledger.emit(RunFinished(EngineResult((), None, "max_turns", 1, reply)))
+
+    native = store.list_action_groups("root-dynamic")[1]
+    proposed = native["events"][0]
+    assert proposed["side_effect_class"] == proxy.side_effect_class == "read_only"
+    assert proposed["resource_keys"] == list(proxy.resource_keys(arguments)) == [
+        f"dynamic_tool:{manifest.manifest_id}"
+    ]
+    assert secret not in repr(native)
+    assert proposed["canonical_arguments"]["arguments"]["access_token"] == REDACTED
+    store.close()
+
+    reopened = Store(tmp_path / "dynamic-ledger.db")
+    timeline = ActionTimelineService(reopened).get("root-dynamic")
+    dynamic_group = next(
+        group for group in timeline["groups"] if group["kind"] == "native_tools"
+    )
+    public_event = dynamic_group["events"][0]
+    assert public_event["side_effect_class"] == "read_only"
+    assert public_event["resource_keys"] == [
+        f"dynamic_tool:{manifest.manifest_id}"
+    ]
+    assert not {"arguments", "raw_arguments", "wire_id"} & set(public_event)
+    assert secret not in repr(timeline)
+    assert implementation_marker not in repr(timeline)
+    history = restore_action_history(reopened, "root-dynamic")
+    assert [message["role"] for message in history] == ["user", "assistant", "tool"]
+    assert secret not in repr(history)
+    reopened.close()
 
 
 def test_reducer_closes_interrupted_native_group_atomically(tmp_path):

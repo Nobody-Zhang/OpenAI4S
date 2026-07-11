@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 
@@ -16,6 +17,7 @@ from openai4s.agent.delegation import (
 )
 from openai4s.agent.models import RunState
 from openai4s.config import get_config
+from openai4s.store import get_store
 
 
 def _submitted(output=None):
@@ -36,6 +38,52 @@ def _wait_for(predicate, timeout: float = 2.0) -> None:
             return
         time.sleep(0.001)
     raise AssertionError("condition not reached before timeout")
+
+
+def test_delegated_agent_writes_its_own_canonical_ledger(monkeypatch):
+    arguments = {
+        "summary": "The delegated task is complete.",
+        "completion_bullets": ["Completed delegated work"],
+    }
+
+    def finalize_chat(messages, cfg, **kwargs):
+        del messages, cfg, kwargs
+        call = {
+            "id": "delegate-finalize",
+            "wire_id": "delegate-finalize",
+            "name": "finalize_response",
+            "ordinal": 0,
+            "raw_arguments": json.dumps(arguments),
+            "arguments": arguments,
+            "parse_error": None,
+            "provider_meta": {"provider": "test"},
+        }
+        return {
+            "content": "",
+            "tool_calls": [call],
+            "assistant_message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [call],
+            },
+        }
+
+    monkeypatch.setattr(loop_mod, "chat", finalize_chat)
+    cfg = get_config()
+    store = get_store(cfg.db_path)
+    parent = store.new_frame(kind="turn", project_id="default")
+    runner = DelegationRunner(cfg, parent_frame_id=parent, store=store)
+    try:
+        result = runner({"request": "Finish this delegated task"})
+    finally:
+        runner.close()
+
+    assert result["stop_reason"] == "submitted"
+    child_frame_id = result["frame_id"]
+    assert child_frame_id
+    assert [
+        group["kind"] for group in store.list_action_groups(child_frame_id)
+    ] == ["user", "finalize", "terminal"]
 
 
 def test_nested_runners_share_one_tree_budget_and_stats(monkeypatch):

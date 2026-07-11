@@ -15,6 +15,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from openai4s.agent.engine import AgentEngine
 from openai4s.agent.finalize import with_finalize_response
+from openai4s.agent.ledger import RuntimeActionLedger, new_turn_id
 from openai4s.agent.runtime import (
     ChatModel,
     CompactionPolicy,
@@ -149,6 +150,18 @@ class _CancellationAwareModel:
             return bool(self._cancelled())
         except Exception:  # noqa: BLE001 - cancellation telemetry cannot crash a run
             return False
+
+
+class _LedgerTranscriptEventSink:
+    """Persist canonical events before updating the compatible CLI transcript."""
+
+    def __init__(self, ledger: RuntimeActionLedger, transcript: Any) -> None:
+        self.ledger = ledger
+        self.transcript = transcript
+
+    def emit(self, event: Any) -> None:
+        self.ledger.emit(event)
+        self.transcript.emit(event)
 
 
 def _cancelled_model_reply() -> dict[str, Any]:
@@ -361,6 +374,13 @@ class Agent:
         try:
             with lazy_kernel:
                 tool_catalog = self.dispatcher.tool_catalog()
+                transcript_events = TranscriptEventSink(transcript, log=self._log)
+                action_ledger = self._action_ledger(tool_catalog, task)
+                event_sink: Any = (
+                    _LedgerTranscriptEventSink(action_ledger, transcript_events)
+                    if action_ledger is not None
+                    else transcript_events
+                )
                 model: Any = ChatModel(
                     self.cfg.llm,
                     chat,
@@ -387,7 +407,7 @@ class Agent:
                         self.context_policy
                         or CompactionPolicy(self.cfg, log=self._log)
                     ),
-                    event_sink=TranscriptEventSink(transcript, log=self._log),
+                    event_sink=event_sink,
                     cancellation=self.cancellation,
                     completion=CompletionSignal(lambda: self.dispatcher.last_output),
                     max_turns=self.max_turns,
@@ -407,6 +427,27 @@ class Agent:
             result.stop_reason,
             completion=result.completion,
         )
+
+    def _action_ledger(
+        self, tool_catalog: Any, task: str
+    ) -> RuntimeActionLedger | None:
+        """Bind local/child runs to their authoritative session tool view."""
+
+        assert self.dispatcher is not None
+        store = getattr(self.dispatcher, "store", None)
+        root_frame_id = self.frame_id or getattr(self.dispatcher, "frame_id", None)
+        if store is None or not str(root_frame_id or "").strip():
+            return None
+        ledger = RuntimeActionLedger(
+            store,
+            str(root_frame_id),
+            new_turn_id(),
+            provider=getattr(self.cfg.llm, "provider", None),
+            model=getattr(self.cfg.llm, "model", None),
+            tool_resolver=tool_catalog.get,
+        )
+        ledger.append_user({"role": "user", "content": task})
+        return ledger
 
     def _execute_r(self, code: str) -> dict:
         """Run one ```r cell on the persistent R kernel, spawning it lazily.

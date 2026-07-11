@@ -3064,12 +3064,20 @@ class SessionRunner:
                 else resolved
             )
             llm_cfg = self._llm_cfg(st)
+            catalog_factory = getattr(st.dispatcher, "tool_catalog", None)
+            tool_catalog = catalog_factory() if callable(catalog_factory) else None
+            tool_resolver = (
+                getattr(tool_catalog, "get", None)
+                if tool_catalog is not None
+                else None
+            )
             action_ledger = RuntimeActionLedger(
                 self.store,
                 root_frame_id,
                 new_turn_id(),
                 provider=getattr(llm_cfg, "provider", None),
                 model=getattr(llm_cfg, "model", None),
+                tool_resolver=(tool_resolver if callable(tool_resolver) else None),
             )
             user_message = {"role": "user", "content": content}
             action_ledger.append_user(user_message)
