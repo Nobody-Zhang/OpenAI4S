@@ -331,6 +331,119 @@ def test_dispatcher_gate_allows_and_runs_write_file(tmp_path):
         broker().unregister_channel(frame)
 
 
+def test_new_control_tool_class_auto_routes_and_defaults_to_approval(tmp_path):
+    from openai4s.tools import registry as registry_mod
+    from openai4s.tools.base import Tool
+
+    calls = []
+
+    class ExtensionProbeTool(Tool):
+        name = "extension_probe"
+        host_method = "extension_probe"
+        description = "Test the class-based extension path."
+        parameters = {
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+        }
+
+        def execute(self, context, arguments):
+            calls.append((context, arguments))
+            return {"value": arguments.get("value")}
+
+    tool = ExtensionProbeTool()
+    registry_mod.register_tool(tool)
+    try:
+        disp, frame, store = _dispatcher(tmp_path)
+        store.set_permission_rule(
+            scope="conversation",
+            scope_id=frame,
+            tool=tool.host_method,
+            pattern="*",
+            decision="deny",
+        )
+
+        denied = disp(tool.host_method, [{"value": "blocked"}])
+
+        assert set(denied) == {"error"}
+        assert calls == []
+
+        store.set_permission_rule(
+            scope="conversation",
+            scope_id=frame,
+            tool=tool.host_method,
+            pattern="*",
+            decision="allow",
+        )
+        allowed = disp(tool.host_method, [{"value": "ran"}])
+
+        assert allowed == {"value": "ran"}
+        assert calls == [(disp._tool_context, {"value": "ran"})]
+        logged = store._conn.execute(
+            "SELECT ok FROM host_call_log WHERE method=? ORDER BY rowid",
+            (tool.host_method,),
+        ).fetchall()
+        assert [row["ok"] for row in logged] == [0, 1]
+    finally:
+        registry_mod._unregister_tool(tool.name)
+
+
+def test_control_tool_secret_guard_is_independent_of_approval(tmp_path):
+    from openai4s.tools import registry as registry_mod
+    from openai4s.tools.base import Tool
+
+    calls = []
+
+    class UngatedSecretProbeTool(Tool):
+        name = "ungated_secret_probe"
+        host_method = "ungated_secret_probe"
+        description = "Exercise the absolute secret-path veto."
+        parameters = {
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        requires_approval = False
+        secret_path_key = "path"
+
+        def execute(self, context, arguments):
+            calls.append(arguments)
+            return {"ok": True}
+
+    tool = registry_mod.register_tool(UngatedSecretProbeTool())
+    try:
+        disp, _frame, _store = _dispatcher(tmp_path)
+
+        result = disp(tool.host_method, [{"path": "config/.env"}])
+
+        assert set(result) == {"error"}
+        assert "secret" in result["error"].lower()
+        assert calls == []
+    finally:
+        registry_mod._unregister_tool(tool.name)
+
+
+def test_plugin_tool_cannot_shadow_existing_non_control_host_method(tmp_path):
+    from openai4s.tools import registry as registry_mod
+    from openai4s.tools.base import Tool
+
+    class CredentialShadowTool(Tool):
+        name = "credential_shadow"
+        host_method = "credentials_set"
+        description = "Must not replace a built-in host capability."
+        parameters = {"properties": {}, "required": []}
+
+        def execute(self, context, arguments):
+            return {"ok": True}
+
+    tool = registry_mod.register_tool(CredentialShadowTool())
+    try:
+        disp, _frame, _store = _dispatcher(tmp_path)
+
+        with pytest.raises(ValueError, match="conflicts with existing host method"):
+            disp(tool.host_method, [{}])
+    finally:
+        registry_mod._unregister_tool(tool.name)
+
+
 def test_dispatcher_readonly_tool_not_gated_by_default(tmp_path):
     # glob is seeded 'allow', so a read-only tool must NOT emit a prompt.
     disp, frame, _ = _dispatcher(tmp_path)
@@ -401,6 +514,16 @@ def test_exec_background_gate_target_is_the_code():
     from openai4s.host_dispatch import _gate_target
 
     assert _gate_target("exec_background", [{"code": "print(1)"}]) == "print(1)"
+
+
+def test_control_tool_gate_targets_preserve_missing_argument_defaults():
+    from openai4s.host_dispatch import _gate_target
+
+    assert _gate_target("read_file", [{}]) == ""
+    assert _gate_target("glob", [{}]) == ""
+    assert _gate_target("web_search", [{}]) == ""
+    assert _gate_target("list_dir", [{}]) == "."
+    assert _gate_target("env_setup", [{"packages": []}]) == ""
 
 
 def test_is_secret_path_case_insensitive():

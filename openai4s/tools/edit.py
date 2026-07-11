@@ -32,6 +32,8 @@ class EditFileTool(Tool):
     }
     read_only = False
     writes_files = True
+    permission_target_key = "path"
+    secret_path_key = "path"
 
     def native_precheck(self, arguments: dict) -> str | None:
         """Reject degenerate model calls before asking for edit approval."""

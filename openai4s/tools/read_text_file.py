@@ -26,6 +26,8 @@ class ReadTextFileTool(Tool):
         },
         "required": ["path"],
     }
+    permission_target_key = "path"
+    secret_path_key = "path"
 
     def execute(self, workspace: WorkspaceToolContext, arguments: dict) -> dict:
         path = workspace.resolve(arguments.get("path", ""), must_exist=True)

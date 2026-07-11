@@ -171,8 +171,11 @@ openai4s/
                                skills, memories, notes, and host-call logs
 
   tools/
-    registry.py                native JSON control-tool schemas
-    executor.py                tool-call pairing and dispatcher adapter
+    base.py                    executable Tool interface + safe policy defaults
+    contexts.py                narrow workspace/environment runtime ports
+    <capability>.py            named class with schema, policy, and behaviour
+    registry.py                explicit ordered class catalogue + call protocol
+    native.py                  provider-neutral native JSON declarations
 
   security/                    classifier, permissions, egress, shell checks,
                                biosecurity, injection screening, audit hook
@@ -254,6 +257,9 @@ Current implementation status:
   separate runtime/event adapters;
 - fenced `tool` remains a silent compatibility parser, while new runs expose
   provider-native JSON schemas;
+- all native control tools are named classes whose schema, safety policy, and
+  behaviour live together; HostDispatcher supplies one generic protected
+  execution path and narrow runtime contexts;
 - host, kernel, storage, and gateway service extraction remains incremental.
 
 ### Phase 1 — Architecture and contract baseline

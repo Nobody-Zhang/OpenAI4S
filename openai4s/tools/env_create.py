@@ -28,6 +28,14 @@ class EnvCreateTool(Tool):
     }
     read_only = False
 
+    def permission_target(self, arguments: Any) -> str:
+        if not isinstance(arguments, dict):
+            return ""
+        packages = arguments.get("packages") or []
+        if packages:
+            return " ".join(str(package) for package in packages)
+        return str(arguments.get("name") or "")
+
     def execute(self, _runtime: Any, arguments: dict) -> dict:
         from openai4s.kernel import preinstall
 

@@ -48,7 +48,8 @@ def test_dispatcher_envelope_calls_registered_file_tool_class(tmp_path, monkeypa
     result = dispatcher("list_dir", [{"path": "."}])
 
     assert result == {"path": ".", "count": 0, "entries": []}
-    assert seen == [(dispatcher._files, {"path": "."})]
+    assert seen == [(dispatcher._tool_context, {"path": "."})]
+    assert seen[0][0].workspace() == dispatcher._workspace()
 
 
 def test_workspace_service_keeps_legacy_operation_facade(tmp_path):

@@ -48,17 +48,53 @@ TOOL_TYPES: tuple[type[Tool], ...] = (
 )
 FILE_TOOL_TYPES = TOOL_TYPES[:6]
 
-REGISTRY: list[Tool] = [tool_type() for tool_type in TOOL_TYPES]
+_FORBIDDEN_CONTROL_NAMES = frozenset({"bash", "submit_output"})
+_PORTABLE_TOOL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$")
+REGISTRY: list[Tool] = []
+_BY_NAME: dict[str, Tool] = {}
+_BY_HOST_METHOD: dict[str, Tool] = {}
 
-_BY_NAME: dict[str, Tool] = {t.name: t for t in REGISTRY}
-_BY_HOST_METHOD: dict[str, Tool] = {t.host_method: t for t in REGISTRY}
 
-if len(_BY_NAME) != len(REGISTRY):
-    raise RuntimeError("duplicate public tool name in REGISTRY")
-if len(_BY_HOST_METHOD) != len(REGISTRY):
-    raise RuntimeError("duplicate host method in REGISTRY")
-if any(type(tool).execute is Tool.execute for tool in REGISTRY):
-    raise RuntimeError("built-in REGISTRY entries must implement Tool.execute()")
+def register_tool(tool: Tool) -> Tool:
+    """Register one executable class instance during application bootstrap."""
+    if not isinstance(tool, Tool) or type(tool).execute is Tool.execute:
+        raise TypeError("control tools must be concrete Tool subclasses")
+    if not tool.name or not tool.host_method:
+        raise ValueError("control tools require a name and host_method")
+    if not _PORTABLE_TOOL_NAME.fullmatch(tool.name):
+        raise ValueError(f"tool name is not provider-portable: {tool.name!r}")
+    if (
+        tool.name in _FORBIDDEN_CONTROL_NAMES
+        or tool.host_method in _FORBIDDEN_CONTROL_NAMES
+    ):
+        raise ValueError("shell and completion cannot be registered as control tools")
+    if tool.name in _BY_NAME:
+        raise ValueError(f"duplicate public tool name: {tool.name!r}")
+    if tool.host_method in _BY_HOST_METHOD:
+        raise ValueError(f"duplicate host method: {tool.host_method!r}")
+    if tool.needs_network and not tool.screen_untrusted_output:
+        raise ValueError("network tools must screen untrusted output")
+    REGISTRY.append(tool)
+    _BY_NAME[tool.name] = tool
+    _BY_HOST_METHOD[tool.host_method] = tool
+    return tool
+
+
+def _unregister_tool(name: str) -> None:
+    """Test/plugin-cleanup counterpart; runtime hot-unload is unsupported."""
+    tool = _BY_NAME.pop(name, None)
+    if tool is None:
+        return
+    _BY_HOST_METHOD.pop(tool.host_method, None)
+    REGISTRY.remove(tool)
+
+
+for _tool_type in TOOL_TYPES:
+    register_tool(_tool_type())
+
+BUILTIN_CONTROL_HOST_METHODS = frozenset(
+    tool.host_method for tool in REGISTRY
+)
 
 
 def get_tool(name: str) -> Tool | None:
@@ -342,6 +378,10 @@ def _render_result_body(result: Any) -> str:
     if set(result.keys()) == {"error"}:
         return f"error: {result['error']}"
     parts: list[str] = []
+    warning = result.get("_security_warning")
+    if isinstance(warning, str) and warning:
+        parts.append(f"[SECURITY WARNING]\n{warning}")
+    warning_parts = len(parts)
     for key in ("content", "stdout", "output"):
         val = result.get(key)
         if isinstance(val, str) and val:
@@ -358,6 +398,12 @@ def _render_result_body(result: Any) -> str:
         parts.append(f"ok={result['ok']}")
     if result.get("error"):
         parts.append(f"error: {result['error']}")
+    if len(parts) == warning_parts:
+        payload = {
+            key: value for key, value in result.items() if key != "_security_warning"
+        }
+        if payload:
+            parts.append(_safe_json(payload))
     if not parts:
         return _safe_json(result)
     return "\n".join(parts)

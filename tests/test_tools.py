@@ -8,7 +8,6 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from openai4s.host_dispatch import HostDispatcher
 from openai4s.security.shellcheck import precheck_command
 from openai4s.tools import (
     MAX_TOOL_CALLS_PER_TURN,
@@ -16,7 +15,10 @@ from openai4s.tools import (
     REGISTRY,
     execute_tool_call,
     format_tool_result,
+    get_tool,
+    get_tool_by_host_method,
     parse_tool_calls,
+    register_tool,
     render_tools_prompt,
     run_tool_calls,
 )
@@ -35,9 +37,7 @@ def _tool_block(json_body: str) -> str:
 
 # --- registry ---------------------------------------------------------------
 def test_registry_is_populated_and_every_tool_resolves_to_a_handler():
-    """Every declared Tool has a non-empty name + host_method, and each
-    host_method resolves to a real _m_<method> handler on HostDispatcher —
-    the drift guard the routing depends on."""
+    """Every declared Tool resolves to its concrete class implementation."""
     # 11 tools: the shell tool is deliberately absent — the host executes only
     # python/R cells, and shell commands run inside the kernel (host.bash).
     assert len(REGISTRY) >= 11
@@ -47,9 +47,7 @@ def test_registry_is_populated_and_every_tool_resolves_to_a_handler():
     for t in REGISTRY:
         assert isinstance(t.name, str) and t.name
         assert isinstance(t.host_method, str) and t.host_method
-        assert hasattr(
-            HostDispatcher, f"_m_{t.host_method}"
-        ), f"{t.name} -> unresolvable host_method {t.host_method!r}"
+        assert get_tool_by_host_method(t.host_method) is t
 
 
 def test_builtin_tools_are_named_classes_with_local_execute_behavior():
@@ -88,6 +86,60 @@ def test_concrete_tool_instances_do_not_share_mutable_schemas():
     first.parameters["properties"]["path"]["description"] = "first only"
 
     assert second.parameters["properties"]["path"]["description"] != "first only"
+
+
+def test_control_tool_classes_own_their_security_policy():
+    approval_methods = {
+        tool.host_method for tool in REGISTRY if tool.requires_approval
+    }
+    assert approval_methods == {
+        "list_dir",
+        "read_file",
+        "write_file",
+        "glob",
+        "grep",
+        "edit_file",
+        "env_setup",
+        "web_search",
+        "web_fetch",
+    }
+    assert get_tool("read_text_file").secret_path({"path": "config/.env"}) == (
+        "config/.env"
+    )
+    assert get_tool("web_fetch").permission_target(
+        {"url": "https://www.example.org/a"}
+    ) == "example.org"
+
+
+def test_registration_rejects_shell_completion_and_metadata_only_tools():
+    schema = {"properties": {}, "required": []}
+    with pytest.raises(TypeError, match="concrete Tool subclasses"):
+        register_tool(Tool("metadata_only", "metadata_only", "bad", schema))
+
+    class ShellAliasTool(Tool):
+        name = "shell_alias"
+        host_method = "bash"
+        description = "Forbidden shell escape."
+        parameters = schema
+
+        def execute(self, context, arguments):
+            return {"ok": True}
+
+    with pytest.raises(ValueError, match="shell and completion"):
+        register_tool(ShellAliasTool())
+
+    class UnscreenedNetworkTool(Tool):
+        name = "unscreened_network"
+        host_method = "unscreened_network"
+        description = "Network output without injection screening."
+        parameters = schema
+        needs_network = True
+
+        def execute(self, context, arguments):
+            return {"content": "data"}
+
+    with pytest.raises(ValueError, match="screen untrusted output"):
+        register_tool(UnscreenedNetworkTool())
 
 
 # --- parsing model replies --------------------------------------------------

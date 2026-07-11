@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from openai4s.tools.base import Tool
@@ -32,6 +33,13 @@ class WebFetchTool(Tool):
         "required": ["url"],
     }
     needs_network = True
+    screen_untrusted_output = True
+
+    def permission_target(self, arguments: Any) -> str:
+        if not isinstance(arguments, dict):
+            return ""
+        url = str(arguments.get("url") or "")
+        return re.sub(r"^https?://(www\.)?", "", url).split("/")[0]
 
     def execute(self, _runtime: Any, arguments: dict) -> dict:
         from openai4s import egress, webtools

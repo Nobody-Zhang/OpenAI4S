@@ -22,6 +22,7 @@ class GlobFilesTool(Tool):
         },
         "required": ["pattern"],
     }
+    permission_target_key = "pattern"
 
     def execute(self, workspace: WorkspaceToolContext, arguments: dict) -> dict:
         pattern = arguments.get("pattern") or "**/*"

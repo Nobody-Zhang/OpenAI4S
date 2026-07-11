@@ -80,12 +80,15 @@ The engine is **pure Python stdlib**: the kernel is a subprocess speaking a hard
 
 ## Native JSON control tools
 
-[`openai4s/tools/`](../openai4s/tools) declares deterministic operations such
-as list/read/glob/grep/web/env/edit/write once, then the LLM adapters translate
-those declarations to OpenAI Chat, OpenAI Responses, Anthropic, or Gemini wire
-formats. Provider responses normalize to one lossless tool-call type containing
-the local ID, wire ID, raw arguments, parsed arguments, parse error, and opaque
-provider metadata.
+[`openai4s/tools/`](../openai4s/tools) defines every deterministic control
+operation as a named `Tool` class, following the CoreCoder-style explicit
+catalogue. Each class keeps its public name, schema, safety policy, and real
+`execute()` behaviour together in the corresponding file. `TOOL_TYPES` is the
+single ordered composition root; the LLM adapters translate its instances to
+OpenAI Chat, OpenAI Responses, Anthropic, or Gemini wire formats. Provider
+responses normalize to one lossless tool-call type containing the local ID,
+wire ID, raw arguments, parsed arguments, parse error, and opaque provider
+metadata.
 
 The control executor routes each valid call through the same `HostDispatcher`
 as in-kernel `host.*`, so permissions, egress, injection screening, activity
@@ -103,12 +106,24 @@ longer advertised to the refactored agent.
 `HostDispatcher` is the shared orchestration envelope, not the implementation
 home for every capability. It retains wire decoding, permissions and human
 approval, audit/replay recording, injection screening, and activity events,
-then forwards domain work to small host-side services. For example,
-[`host/files.py`](../openai4s/host/files.py) owns workspace resolution and the
-read/write/edit/glob/grep/list operations. The service receives the current
-frame ID through a provider so a dispatcher whose frame is assigned after
-construction still targets the correct session workspace. It does not depend
-on the Store, Kernel, Gateway, permission broker, or event transport.
+then calls the selected class with a `ControlToolContext`. File tools are typed
+against the workspace path port; environment tools are typed against the
+active-runtime hooks. This is a maintainable API boundary for trusted built-in
+code, not an in-process security sandbox. [`host/files.py`](../openai4s/host/files.py)
+owns path confinement and late-bound session workspace selection, while
+read/write/edit/glob/grep/list behaviour stays in the corresponding tool
+classes.
+
+To add a built-in control tool, define one `Tool` subclass with `execute()` and
+add its type to `TOOL_TYPES`; plugins may call `register_tool()` during
+application bootstrap with a new, non-conflicting host method. The dispatcher
+resolves it generically, so no new `_m_*` branch is required. New tools require
+permission by default and may declare their permission target, direct
+secret-path argument, and untrusted-output screening policy on the class.
+Network tools must enable result screening before registration succeeds.
+Model-originated calls use `Tool.invoke()` and must never call `execute()`
+directly, so class extensibility cannot bypass the shared policy envelope.
+Runtime hot-unload is intentionally unsupported.
 
 ## Session kernel ownership
 

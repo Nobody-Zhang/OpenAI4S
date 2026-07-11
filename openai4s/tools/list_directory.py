@@ -22,6 +22,8 @@ class ListDirectoryTool(Tool):
         },
         "required": [],
     }
+    permission_target_key = "path"
+    permission_target_default = "."
 
     def execute(self, workspace: WorkspaceToolContext, arguments: dict) -> dict:
         relative = arguments.get("path") or "."

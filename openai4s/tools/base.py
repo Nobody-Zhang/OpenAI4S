@@ -37,6 +37,11 @@ class Tool:
     mutates_cwd: bool = False
     dangerous: bool = False
     output_limit: int = 20_000
+    requires_approval: bool = True
+    permission_target_key: str | None = None
+    permission_target_default: str = ""
+    secret_path_key: str | None = None
+    screen_untrusted_output: bool = False
 
     _METADATA_FIELDS = (
         "name",
@@ -49,6 +54,11 @@ class Tool:
         "mutates_cwd",
         "dangerous",
         "output_limit",
+        "requires_approval",
+        "permission_target_key",
+        "permission_target_default",
+        "secret_path_key",
+        "screen_untrusted_output",
     )
 
     def __init__(
@@ -63,6 +73,11 @@ class Tool:
         mutates_cwd: bool | None = None,
         dangerous: bool | None = None,
         output_limit: int | None = None,
+        requires_approval: bool | None = None,
+        permission_target_key: str | None = None,
+        permission_target_default: str | None = None,
+        secret_path_key: str | None = None,
+        screen_untrusted_output: bool | None = None,
     ) -> None:
         # No arguments snapshots the concrete subclass's class declarations.
         overrides = {
@@ -76,6 +91,11 @@ class Tool:
             "mutates_cwd": mutates_cwd,
             "dangerous": dangerous,
             "output_limit": output_limit,
+            "requires_approval": requires_approval,
+            "permission_target_key": permission_target_key,
+            "permission_target_default": permission_target_default,
+            "secret_path_key": secret_path_key,
+            "screen_untrusted_output": screen_untrusted_output,
         }
         for field, value in overrides.items():
             if value is None:
@@ -119,6 +139,28 @@ class Tool:
     def native_precheck(self, arguments: dict) -> str | None:
         """Return a cheap pre-dispatch error for native/fenced calls, if any."""
         return None
+
+    def permission_target(self, arguments: Any) -> str:
+        """Return the value matched by the permission broker.
+
+        The secure default is the tool name. Concrete tools can declare a
+        simple argument key or override this method for derived targets.
+        """
+        if self.permission_target_key and isinstance(arguments, dict):
+            value = arguments.get(self.permission_target_key)
+            if value not in (None, ""):
+                return str(value)
+            return self.permission_target_default
+        if isinstance(arguments, str) and arguments:
+            return arguments
+        return self.permission_target_default or self.name
+
+    def secret_path(self, arguments: Any) -> str | None:
+        """Return a direct file target requiring the hard secret denylist."""
+        if not self.secret_path_key or not isinstance(arguments, dict):
+            return None
+        value = arguments.get(self.secret_path_key)
+        return str(value or "")
 
     def signature_line(self) -> str:
         """Return ``name(arg1, arg2?, ...)`` using declared parameter order."""

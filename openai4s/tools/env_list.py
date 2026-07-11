@@ -25,6 +25,7 @@ class EnvListTool(Tool):
         },
         "required": [],
     }
+    requires_approval = False
 
     @staticmethod
     def current_environment_name(runtime: EnvironmentToolContext) -> str:

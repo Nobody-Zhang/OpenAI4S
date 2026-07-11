@@ -28,6 +28,8 @@ class WebSearchTool(Tool):
         "required": ["query"],
     }
     needs_network = True
+    screen_untrusted_output = True
+    permission_target_key = "query"
 
     def execute(self, _runtime: Any, arguments: dict) -> dict:
         from openai4s import egress, webtools

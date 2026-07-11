@@ -13,7 +13,11 @@ zero side effects. Wiring into the agent loops happens elsewhere.
 """
 from openai4s.tools.base import Tool
 from openai4s.tools.content_search import ContentSearchTool
-from openai4s.tools.contexts import EnvironmentToolContext, WorkspaceToolContext
+from openai4s.tools.contexts import (
+    ControlToolContext,
+    EnvironmentToolContext,
+    WorkspaceToolContext,
+)
 from openai4s.tools.edit import EditFileTool
 from openai4s.tools.env_create import EnvCreateTool
 from openai4s.tools.env_list import EnvListTool
@@ -35,6 +39,7 @@ from openai4s.tools.registry import (
     get_tool_by_host_method,
     parse_fence_delimiter,
     parse_tool_calls,
+    register_tool,
     render_tools_prompt,
     run_tool_calls,
     scan_fenced_blocks,
@@ -49,6 +54,7 @@ __all__ = [
     "ToolSpec",
     "WorkspaceToolContext",
     "EnvironmentToolContext",
+    "ControlToolContext",
     "ListDirectoryTool",
     "ReadTextFileTool",
     "WriteFileTool",
@@ -64,6 +70,7 @@ __all__ = [
     "REGISTRY",
     "get_tool",
     "get_tool_by_host_method",
+    "register_tool",
     "all_tools",
     "parse_fence_delimiter",
     "parse_tool_calls",

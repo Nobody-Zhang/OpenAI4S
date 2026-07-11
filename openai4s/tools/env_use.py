@@ -21,6 +21,7 @@ class EnvUseTool(Tool):
         },
         "required": ["name"],
     }
+    requires_approval = False
 
     def execute(self, runtime: EnvironmentToolContext, arguments: dict | str) -> dict:
         from openai4s.kernel import environments as envmod
