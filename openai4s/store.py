@@ -40,6 +40,7 @@ from typing import Any
 from openai4s.storage.agents import AgentProfileRepository
 from openai4s.storage.annotations import AnnotationRepository
 from openai4s.storage.connectors import ConnectorRepository
+from openai4s.storage.frames import FrameRepository
 from openai4s.storage.memories import MemoryRepository
 from openai4s.storage.metadata import (
     DERIVABLE_HOST_CALLS,
@@ -444,6 +445,16 @@ class Store:
             self._lock,
             clock_ms=lambda: _now_ms(),
         )
+        self._frames = FrameRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+            get_frame=lambda frame_id: self.get_frame(frame_id),
+            resolve_frame_scope=lambda frame_id, **kwargs: self.resolve_frame_scope(
+                frame_id, **kwargs
+            ),
+            get_project=lambda project_id: self.get_project(project_id),
+        )
         self._notes = NotesRepository(
             self._conn,
             self._lock,
@@ -555,43 +566,15 @@ class Store:
         depth: int = 0,
         status: str = "processing",
     ) -> str:
-        frame_id = f"f-{uuid.uuid4().hex[:12]}"
-        if parent_id is None:
-            root = frame_id
-        else:
-            parent = self.get_frame(parent_id)
-            if parent is None:
-                # Preserve the legacy orphan fallback during delete/delegate
-                # races: the new frame becomes its own root rather than pointing
-                # root_frame_id at a row that does not exist.
-                root = frame_id
-            else:
-                scope = self.resolve_frame_scope(
-                    parent_id,
-                    fallback_project=project_id,
-                )
-                root = scope["root_frame_id"] or frame_id
-                project_id = scope["project_id"]
-        now = _now_ms()
-        self._exec(
-            "INSERT INTO frames(frame_id,parent_id,project_id,root_frame_id,kind,"
-            "name,model,status,depth,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                frame_id,
-                parent_id,
-                project_id,
-                root,
-                kind,
-                name,
-                model,
-                status,
-                depth,
-                now,
-                now,
-            ),
+        return self._frames.new_frame(
+            parent_id=parent_id,
+            project_id=project_id,
+            kind=kind,
+            name=name,
+            model=model,
+            depth=depth,
+            status=status,
         )
-        return frame_id
 
     def resolve_frame_scope(
         self,
@@ -599,48 +582,13 @@ class Store:
         *,
         fallback_project: str = "default",
     ) -> dict:
-        """Resolve actor, root session, and root-owned project dynamically."""
-        if not frame_id:
-            return {
-                "frame_id": frame_id,
-                "root_frame_id": frame_id,
-                "project_id": fallback_project,
-            }
-        with self._lock:
-            frame = self._conn.execute(
-                "SELECT frame_id,root_frame_id,project_id FROM frames "
-                "WHERE frame_id=?",
-                (frame_id,),
-            ).fetchone()
-            if not frame:
-                return {
-                    "frame_id": frame_id,
-                    "root_frame_id": frame_id,
-                    "project_id": fallback_project,
-                }
-            root_frame_id = frame["root_frame_id"] or frame["frame_id"]
-            root = self._conn.execute(
-                "SELECT project_id FROM frames WHERE frame_id=?",
-                (root_frame_id,),
-            ).fetchone()
-        return {
-            "frame_id": frame["frame_id"],
-            "root_frame_id": root_frame_id,
-            "project_id": (
-                (root["project_id"] if root else None)
-                or frame["project_id"]
-                or fallback_project
-            ),
-        }
+        return self._frames.resolve_frame_scope(
+            frame_id,
+            fallback_project=fallback_project,
+        )
 
     def update_frame(self, frame_id: str, **fields: Any) -> None:
-        if not fields:
-            return
-        fields["updated_at"] = _now_ms()
-        cols = ", ".join(f"{k}=?" for k in fields)
-        self._exec(
-            f"UPDATE frames SET {cols} WHERE frame_id=?", (*fields.values(), frame_id)
-        )
+        self._frames.update_frame(frame_id, **fields)
 
     def add_frame_tokens(
         self,
@@ -650,14 +598,12 @@ class Store:
         output_tokens: int = 0,
         cost_usd: float = 0.0,
     ) -> None:
-        with self._lock:
-            self._conn.execute(
-                "UPDATE frames SET input_tokens=COALESCE(input_tokens,0)+?,"
-                "output_tokens=COALESCE(output_tokens,0)+?,"
-                "cost_usd=COALESCE(cost_usd,0)+?,updated_at=? WHERE frame_id=?",
-                (input_tokens, output_tokens, cost_usd, _now_ms(), frame_id),
-            )
-            self._conn.commit()
+        self._frames.add_frame_tokens(
+            frame_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_usd=cost_usd,
+        )
 
     # --- projects --------------------------------------------------------
     def create_project(
@@ -669,138 +615,25 @@ class Store:
         project_id: str | None = None,
         is_example: bool = False,
     ) -> dict:
-        pid = project_id or f"proj_{uuid.uuid4().hex[:12]}"
-        now = _now_ms()
-        self._exec(
-            "INSERT OR REPLACE INTO projects(project_id,name,description,context,"
-            "is_example,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-            (pid, name, description, context, 1 if is_example else 0, now, now),
+        return self._frames.create_project(
+            name=name,
+            description=description,
+            context=context,
+            project_id=project_id,
+            is_example=is_example,
         )
-        return self.get_project(pid) or {}
 
     def get_project(self, project_id: str) -> dict | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM projects WHERE project_id=?", (project_id,)
-            ).fetchone()
-        return dict(row) if row else None
+        return self._frames.get_project(project_id)
 
     def update_project(self, project_id: str, **fields: Any) -> None:
-        if not fields:
-            return
-        fields["updated_at"] = _now_ms()
-        cols = ", ".join(f"{k}=?" for k in fields)
-        self._exec(
-            f"UPDATE projects SET {cols} WHERE project_id=?",
-            (*fields.values(), project_id),
-        )
+        self._frames.update_project(project_id, **fields)
 
     def delete_project(self, project_id: str) -> dict:
-        """Cascade-delete a project and everything it owns: frames, messages,
-        cells, artifacts + versions, lineage edges, folders, notes, memories,
-        compaction archives, host-call log rows and per-message feedback. Returns
-        {"stale_paths": [...], "frame_ids": [...]} so the caller can free the
-        artifact files AND the session workspace dirs from disk (M1)."""
-        with self._lock:
-            cur = self._conn
-            frame_ids = [
-                r["frame_id"]
-                for r in cur.execute(
-                    "SELECT frame_id FROM frames WHERE project_id=?", (project_id,)
-                ).fetchall()
-            ]
-            # every version path (live workspace files + immutable snapshots)
-            stale_paths = [
-                r["path"]
-                for r in cur.execute(
-                    "SELECT v.path FROM artifact_versions v JOIN artifacts a "
-                    "ON v.artifact_id=a.artifact_id WHERE a.project_id=? AND v.path IS NOT NULL",
-                    (project_id,),
-                ).fetchall()
-            ]
-            # lineage edges keyed by the project's version ids (frame_id is often
-            # NULL, so filtering by frame_id alone orphans rows) — delete by version
-            cur.execute(
-                "DELETE FROM lineage_edges WHERE input_version_id IN "
-                "(SELECT version_id FROM artifact_versions WHERE artifact_id IN "
-                "(SELECT artifact_id FROM artifacts WHERE project_id=?)) "
-                "OR output_version_id IN "
-                "(SELECT version_id FROM artifact_versions WHERE artifact_id IN "
-                "(SELECT artifact_id FROM artifacts WHERE project_id=?))",
-                (project_id, project_id),
-            )
-            cur.execute(
-                "DELETE FROM artifact_versions WHERE artifact_id IN "
-                "(SELECT artifact_id FROM artifacts WHERE project_id=?)",
-                (project_id,),
-            )
-            cur.execute("DELETE FROM artifacts WHERE project_id=?", (project_id,))
-            if frame_ids:
-                qmarks = ",".join("?" * len(frame_ids))
-                cur.execute(
-                    f"DELETE FROM messages WHERE root_frame_id IN ({qmarks})", frame_ids
-                )
-                cur.execute(
-                    f"DELETE FROM execution_log WHERE root_frame_id IN ({qmarks})"
-                    f" OR frame_id IN ({qmarks})",
-                    frame_ids + frame_ids,
-                )
-                cur.execute(
-                    f"DELETE FROM host_call_log WHERE frame_id IN ({qmarks})", frame_ids
-                )
-                cur.execute(
-                    f"DELETE FROM frame_steps WHERE frame_id IN ({qmarks})", frame_ids
-                )
-                cur.execute(
-                    f"DELETE FROM plans WHERE frame_id IN ({qmarks})", frame_ids
-                )
-                cur.execute(
-                    f"DELETE FROM annotations WHERE root_frame_id IN ({qmarks})",
-                    frame_ids,
-                )
-                # per-message feedback lives in settings as fb:<frame>:<key>
-                for fid in frame_ids:
-                    cur.execute(
-                        "DELETE FROM settings WHERE key LIKE ?", (f"fb:{fid}:%",)
-                    )
-                    cur.execute(
-                        "DELETE FROM permission_rules WHERE scope='conversation' "
-                        "AND scope_id=?",
-                        (fid,),
-                    )
-            cur.execute(
-                "DELETE FROM permission_rules WHERE scope='project' AND scope_id=?",
-                (project_id,),
-            )
-            cur.execute("DELETE FROM frames WHERE project_id=?", (project_id,))
-            cur.execute("DELETE FROM folders WHERE project_id=?", (project_id,))
-            cur.execute("DELETE FROM notes WHERE project_id=?", (project_id,))
-            cur.execute("DELETE FROM memories WHERE project_id=?", (project_id,))
-            cur.execute(
-                "DELETE FROM compaction_archives WHERE project_id=?", (project_id,)
-            )
-            cur.execute("DELETE FROM projects WHERE project_id=?", (project_id,))
-            self._conn.commit()
-        return {"stale_paths": stale_paths, "frame_ids": frame_ids}
+        return self._frames.delete_project(project_id)
 
     def list_projects(self) -> list[dict]:
-        """Projects with derived conversation_count + last_active_at."""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM projects ORDER BY updated_at DESC"
-            ).fetchall()
-            out = []
-            for r in rows:
-                d = dict(r)
-                agg = self._conn.execute(
-                    "SELECT COUNT(*) AS n, MAX(updated_at) AS last FROM frames "
-                    "WHERE project_id=? AND parent_id IS NULL",
-                    (d["project_id"],),
-                ).fetchone()
-                d["conversation_count"] = agg["n"] or 0
-                d["last_active_at"] = agg["last"] or d["updated_at"]
-                out.append(d)
-        return out
+        return self._frames.list_projects()
 
     # --- messages --------------------------------------------------------
     def add_message(
@@ -813,67 +646,29 @@ class Store:
         metadata: dict | None = None,
         created_at: int | None = None,
     ) -> dict:
-        # `created_at` may be back-dated so a message stamps to the moment its
-        # content was produced (e.g. a mid-turn prose block persisted at turn
-        # end) — this keeps it correctly interleaved with the frame's steps,
-        # which the UI orders by timestamp. Defaults to now.
-        now = created_at if created_at is not None else _now_ms()
-        mid = f"m-{uuid.uuid4().hex[:12]}"
-        with self._lock:
-            seq = self._conn.execute(
-                "SELECT COALESCE(MAX(seq),-1)+1 AS s FROM messages WHERE root_frame_id=?",
-                (root_frame_id,),
-            ).fetchone()["s"]
-            self._conn.execute(
-                "INSERT INTO messages(message_id,root_frame_id,frame_id,seq,role,"
-                "content,metadata,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                (
-                    mid,
-                    root_frame_id,
-                    frame_id,
-                    seq,
-                    role,
-                    content,
-                    json.dumps(metadata, ensure_ascii=False) if metadata else None,
-                    now,
-                ),
-            )
-            self._conn.commit()
-        return {
-            "message_id": mid,
-            "root_frame_id": root_frame_id,
-            "seq": seq,
-            "role": role,
-            "content": content,
-            "created_at": now,
-        }
+        return self._frames.add_message(
+            root_frame_id=root_frame_id,
+            role=role,
+            content=content,
+            frame_id=frame_id,
+            metadata=metadata,
+            created_at=created_at,
+        )
 
     def list_messages(
         self, root_frame_id: str, *, start: int = 0, limit: int = 300
     ) -> list[dict]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT role,content,metadata,created_at,seq FROM messages "
-                "WHERE root_frame_id=? ORDER BY seq ASC LIMIT ? OFFSET ?",
-                (root_frame_id, limit, start),
-            ).fetchall()
-        return [dict(r) for r in rows]
+        return self._frames.list_messages(
+            root_frame_id,
+            start=start,
+            limit=limit,
+        )
 
     def message_count(self, root_frame_id: str) -> int:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM messages WHERE root_frame_id=?",
-                (root_frame_id,),
-            ).fetchone()
-        return row["n"] or 0
+        return self._frames.message_count(root_frame_id)
 
     def cell_count(self, root_frame_id: str) -> int:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM execution_log WHERE root_frame_id=?",
-                (root_frame_id,),
-            ).fetchone()
-        return row["n"] or 0
+        return self._frames.cell_count(root_frame_id)
 
     # --- semantic activity steps (plan / search / env / skill / edit / …) ----
     # Every visible host.* tool call becomes a persisted "step" so a reopened
@@ -888,32 +683,14 @@ class Store:
         input: dict | None = None,
         status: str = "running",
     ) -> dict:
-        now = _now_ms()
-        with self._lock:
-            seq = self._conn.execute(
-                "SELECT COALESCE(MAX(seq),-1)+1 AS s FROM frame_steps WHERE frame_id=?",
-                (frame_id,),
-            ).fetchone()["s"]
-            self._conn.execute(
-                "INSERT INTO frame_steps(step_id,frame_id,seq,kind,title,input,"
-                "output,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (
-                    step_id,
-                    frame_id,
-                    seq,
-                    kind,
-                    title,
-                    json.dumps(input, ensure_ascii=False, default=str)
-                    if input is not None
-                    else None,
-                    None,
-                    status,
-                    now,
-                    now,
-                ),
-            )
-            self._conn.commit()
-        return {"step_id": step_id, "seq": seq, "created_at": now}
+        return self._frames.add_step(
+            step_id=step_id,
+            frame_id=frame_id,
+            kind=kind,
+            title=title,
+            input=input,
+            status=status,
+        )
 
     def update_step(
         self,
@@ -924,56 +701,21 @@ class Store:
         title: str | None = None,
         summary: str | None = None,
     ) -> None:
-        now = _now_ms()
-        sets, params = [], []
-        if status is not None:
-            sets.append("status=?")
-            params.append(status)
-        if title is not None:
-            sets.append("title=?")
-            params.append(title)
-        if summary is not None:
-            sets.append("summary=?")
-            params.append(summary)
-        if output is not None:
-            sets.append("output=?")
-            params.append(json.dumps(output, ensure_ascii=False, default=str))
-        sets.append("updated_at=?")
-        params.append(now)
-        params.append(step_id)
-        with self._lock:
-            self._conn.execute(
-                f"UPDATE frame_steps SET {','.join(sets)} WHERE step_id=?", params
-            )
-            self._conn.commit()
+        self._frames.update_step(
+            step_id,
+            status=status,
+            output=output,
+            title=title,
+            summary=summary,
+        )
 
     def list_steps(
         self, frame_id: str, *, start: int = 0, limit: int = 800
     ) -> list[dict]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT step_id,seq,kind,title,summary,input,output,status,created_at "
-                "FROM frame_steps WHERE frame_id=? ORDER BY seq ASC LIMIT ? OFFSET ?",
-                (frame_id, limit, max(0, start)),
-            ).fetchall()
-        out = []
-        for r in rows:
-            d = dict(r)
-            for k in ("input", "output"):
-                if d.get(k):
-                    try:
-                        d[k] = json.loads(d[k])
-                    except (ValueError, TypeError):
-                        pass
-            out.append(d)
-        return out
+        return self._frames.list_steps(frame_id, start=start, limit=limit)
 
     def step_count(self, frame_id: str) -> int:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM frame_steps WHERE frame_id=?", (frame_id,)
-            ).fetchone()
-        return row["n"] or 0
+        return self._frames.step_count(frame_id)
 
     # --- frame browse / detail / search --------------------------
     def browse_frames(
@@ -984,101 +726,30 @@ class Store:
         roots_only: bool = True,
         limit: int = 50,
     ) -> list[dict]:
-        clauses, params = [], []
-        if project_id and project_id != "all":
-            clauses.append("project_id=?")
-            params.append(project_id)
-        if status:
-            clauses.append("status=?")
-            params.append(status)
-        if roots_only:
-            clauses.append("parent_id IS NULL")
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT frame_id,parent_id,root_frame_id,project_id,kind,name,"
-                "task_summary,model,status,depth,input_tokens,output_tokens,"
-                "cost_usd,created_at,updated_at FROM frames"
-                + where
-                + " ORDER BY created_at DESC LIMIT ?",
-                (*params, limit),
-            ).fetchall()
-        return [dict(r) for r in rows]
+        return self._frames.browse_frames(
+            project_id=project_id,
+            status=status,
+            roots_only=roots_only,
+            limit=limit,
+        )
 
     def frame_detail(
         self, frame_id: str, *, page: int = 0, page_size: int = 50
     ) -> dict | None:
-        """Detail view: frame meta + its cells oldest-first (latest = last page).
-
-        Newest activity is on the LAST page: to find the most
-        recent `[delegate]` dispatch line you must page to the end.
-        """
-        with self._lock:
-            frow = self._conn.execute(
-                "SELECT * FROM frames WHERE frame_id=?", (frame_id,)
-            ).fetchone()
-            if frow is None:
-                return None
-            total = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM execution_log WHERE frame_id=?", (frame_id,)
-            ).fetchone()["n"]
-            cells = self._conn.execute(
-                "SELECT producing_cell_id,cell_seq,origin,code,stdout,stderr,"
-                "error,interrupted,wall_s,cpu_s,created_at FROM execution_log "
-                "WHERE frame_id=? ORDER BY created_at ASC LIMIT ? OFFSET ?",
-                (frame_id, page_size, page * page_size),
-            ).fetchall()
-            children = self._conn.execute(
-                "SELECT frame_id,kind,name,status,depth FROM frames "
-                "WHERE parent_id=? ORDER BY created_at ASC",
-                (frame_id,),
-            ).fetchall()
-        n_pages = max(1, (total + page_size - 1) // page_size)
-        return {
-            "frame": dict(frow),
-            "cells": [dict(c) for c in cells],
-            "children": [dict(c) for c in children],
-            "page": page,
-            "page_size": page_size,
-            "n_pages": n_pages,
-            "total_cells": total,
-            "last_page": page >= n_pages - 1,
-        }
+        return self._frames.frame_detail(
+            frame_id,
+            page=page,
+            page_size=page_size,
+        )
 
     def search_frames(
         self, pattern: str, *, project_id: str | None = "default", limit: int = 50
     ) -> list[dict]:
-        """Regex search over frame name + its cells' code/stdout."""
-        rx = re.compile(pattern, re.IGNORECASE)
-        clauses, params = [], []
-        if project_id and project_id != "all":
-            clauses.append("f.project_id=?")
-            params.append(project_id)
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT DISTINCT f.frame_id,f.kind,f.name,f.status,f.depth,"
-                "f.project_id,f.created_at FROM frames f "
-                "LEFT JOIN execution_log e ON e.frame_id=f.frame_id"
-                + where
-                + " ORDER BY f.created_at DESC",
-                tuple(params),
-            ).fetchall()
-            out = []
-            for r in rows:
-                hay = [r["name"] or ""]
-                cells = self._conn.execute(
-                    "SELECT code,stdout FROM execution_log WHERE frame_id=?",
-                    (r["frame_id"],),
-                ).fetchall()
-                for c in cells:
-                    hay.append(c["code"] or "")
-                    hay.append(c["stdout"] or "")
-                if rx.search("\n".join(hay)):
-                    out.append(dict(r))
-                if len(out) >= limit:
-                    break
-        return out
+        return self._frames.search_frames(
+            pattern,
+            project_id=project_id,
+            limit=limit,
+        )
 
     # --- execution_log ---------------------------------------------------
     def log_cell(
@@ -1098,114 +769,33 @@ class Store:
         files_read: list | None = None,
         files_written: list | None = None,
     ) -> str:
-        cell_id = result.get("id") or f"c-{uuid.uuid4().hex[:12]}"
-        usage = result.get("usage") or {}
-        status = (
-            "error"
-            if result.get("error")
-            else ("interrupted" if result.get("interrupted") else "ok")
+        return self._frames.log_cell(
+            frame_id=frame_id,
+            code=code,
+            result=result,
+            origin=origin,
+            cell_seq=cell_seq,
+            project_id=project_id,
+            root_frame_id=root_frame_id,
+            cell_index=cell_index,
+            kernel_id=kernel_id,
+            language=language,
+            figures=figures,
+            files_read=files_read,
+            files_written=files_written,
         )
-        self._exec(
-            "INSERT OR REPLACE INTO execution_log(producing_cell_id,frame_id,"
-            "root_frame_id,project_id,cell_seq,cell_index,kernel_id,language,"
-            "status,origin,code,stdout,stderr,error,figures,files_read,"
-            "files_written,interrupted,wall_s,cpu_s,peak_rss_kb,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                cell_id,
-                frame_id,
-                root_frame_id,
-                project_id,
-                cell_seq,
-                cell_index,
-                kernel_id,
-                language,
-                status,
-                origin,
-                code,
-                result.get("stdout"),
-                result.get("stderr"),
-                result.get("error"),
-                json.dumps(figures or [], ensure_ascii=False),
-                json.dumps(files_read or [], ensure_ascii=False),
-                json.dumps(files_written or [], ensure_ascii=False),
-                1 if result.get("interrupted") else 0,
-                usage.get("wall_s"),
-                usage.get("cpu_s"),
-                usage.get("peak_rss_kb"),
-                _now_ms(),
-            ),
-        )
-        return cell_id
 
     def list_cells(self, root_frame_id: str) -> list[dict]:
-        """Notebook execution log for a session (oldest first)."""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT producing_cell_id,cell_index,kernel_id,language,status,"
-                "code,stdout,stderr,error,figures,files_read,files_written,"
-                "cpu_s,peak_rss_kb,created_at FROM execution_log "
-                "WHERE root_frame_id=? ORDER BY created_at ASC",
-                (root_frame_id,),
-            ).fetchall()
-        out = []
-        for r in rows:
-            d = dict(r)
-            for k in ("figures", "files_read", "files_written"):
-                try:
-                    d[k] = json.loads(d.get(k) or "[]")
-                except (TypeError, ValueError):
-                    d[k] = []
-            out.append(d)
-        return out
+        return self._frames.list_cells(root_frame_id)
 
     def cell_detail(self, producing_cell_id: str) -> dict | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM execution_log WHERE producing_cell_id=?",
-                (producing_cell_id,),
-            ).fetchone()
-        if not row:
-            return None
-        d = dict(row)
-        for k in ("figures", "files_read", "files_written"):
-            try:
-                d[k] = json.loads(d.get(k) or "[]")
-            except (TypeError, ValueError):
-                d[k] = []
-        return d
+        return self._frames.cell_detail(producing_cell_id)
 
     def delete_frame(self, frame_id: str) -> None:
-        """Delete a session (root frame) and its descendants + messages/cells."""
-        with self._lock:
-            self._conn.execute(
-                "DELETE FROM messages WHERE root_frame_id=?", (frame_id,)
-            )
-            self._conn.execute(
-                "DELETE FROM execution_log WHERE root_frame_id=? OR frame_id=?",
-                (frame_id, frame_id),
-            )
-            self._conn.execute("DELETE FROM frame_steps WHERE frame_id=?", (frame_id,))
-            self._conn.execute("DELETE FROM plans WHERE frame_id=?", (frame_id,))
-            self._conn.execute(
-                "DELETE FROM annotations WHERE root_frame_id=?", (frame_id,)
-            )
-            self._conn.execute(
-                "DELETE FROM permission_rules WHERE scope='conversation' AND scope_id=?",
-                (frame_id,),
-            )
-            self._conn.execute(
-                "DELETE FROM frames WHERE frame_id=? OR root_frame_id=?",
-                (frame_id, frame_id),
-            )
-            self._conn.commit()
+        self._frames.delete_frame(frame_id)
 
     def get_frame(self, frame_id: str) -> dict | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM frames WHERE frame_id=?", (frame_id,)
-            ).fetchone()
-        return dict(row) if row else None
+        return self._frames.get_frame(frame_id)
 
     def get_artifact(self, artifact_id: str) -> dict | None:
         with self._lock:

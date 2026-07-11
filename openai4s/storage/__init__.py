@@ -3,6 +3,7 @@
 from openai4s.storage.agents import AgentProfileRepository
 from openai4s.storage.annotations import AnnotationRepository
 from openai4s.storage.connectors import ConnectorRepository
+from openai4s.storage.frames import FrameRepository
 from openai4s.storage.memories import MemoryRepository
 from openai4s.storage.metadata import (
     CompactionRepository,
@@ -19,6 +20,7 @@ __all__ = [
     "AgentProfileRepository",
     "AnnotationRepository",
     "ConnectorRepository",
+    "FrameRepository",
     "MemoryRepository",
     "CompactionRepository",
     "EndpointRepository",
