@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from openai4s.config import Config, get_config
+from openai4s.host.credentials import CredentialService
 from openai4s.host.files import WorkspaceFileService
 from openai4s.host.files import is_secret_path as _is_secret_path
 from openai4s.host.skills import SkillService
@@ -563,8 +564,7 @@ class HostDispatcher:
         self.steer_fns: dict[str, Callable[..., Any]] = {}
         self._skill_service = SkillService(self.cfg)
         self._skills = self._skill_service.loader  # private compatibility alias
-        # in-memory credential vault (never persisted —)
-        self._credentials: dict[str, str] = {}
+        self._credential_service = CredentialService()
         # app tiles rendered this session
         self._app_tiles: list[dict] = []
         # background executor (exec_peek / exec_interrupt), built lazily.
@@ -2022,16 +2022,13 @@ class HostDispatcher:
 
     # --- credentials (never persisted) ----------------------------
     def _m_credentials_set(self, spec: dict) -> dict:
-        self._credentials[spec["name"]] = spec.get("value", "")
-        return {"ok": True, "name": spec["name"]}
+        return self._credential_service.set(spec)
 
     def _m_credentials_get(self, name: str) -> dict:
-        if name not in self._credentials:
-            raise KeyError(f"no credential {name!r}")
-        return {"name": name, "value": self._credentials[name]}
+        return self._credential_service.get(name)
 
     def _m_credentials_list(self, *_a: Any) -> list:
-        return sorted(self._credentials.keys())
+        return self._credential_service.list()
 
     # --- mcp ------------------------------------------------------
     def _connector(self, server: str) -> dict | None:
