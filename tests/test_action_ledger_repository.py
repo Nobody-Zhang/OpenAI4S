@@ -8,10 +8,7 @@ import threading
 
 import pytest
 
-from openai4s.storage.actions import (
-    ActionLedgerRepository,
-    AttemptStateError,
-)
+from openai4s.storage.actions import ActionLedgerRepository, AttemptStateError
 from openai4s.store import Store
 
 
