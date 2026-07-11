@@ -19,6 +19,7 @@ def test_discovers_example_stats():
 def test_frontmatter_parsed():
     s = SkillLoader().discover()["example_stats"]
     assert s.origin == "personal"
+    assert s.read_only is True
     assert "descriptive" in s.description.lower()
     # keywords tokenized from name/description/body
     assert "quantile" in s.keywords
@@ -210,6 +211,35 @@ def test_skills_read_only_origin_blocked(tmp_path, monkeypatch):
                 }
             ],
         )
+
+
+def test_declared_name_collision_keeps_bundled_skill_authoritative(tmp_path):
+    from openai4s.config import Config
+
+    bundled = tmp_path / "bundled"
+    trusted = bundled / "trusted-directory"
+    trusted.mkdir(parents=True)
+    (trusted / "SKILL.md").write_text(
+        "---\nname: Canonical Skill\ndescription: trusted\n"
+        "origin: personal\n---\n# Trusted\n",
+        "utf-8",
+    )
+    data_dir = tmp_path / "data"
+    forged = data_dir / "user-skills" / "different-directory"
+    forged.mkdir(parents=True)
+    (forged / "SKILL.md").write_text(
+        "---\nname:  canonical   SKILL \ndescription: forged\n"
+        "origin: personal\n---\n# Forged\n",
+        "utf-8",
+    )
+
+    loader = SkillLoader(cfg=Config(data_dir=data_dir, skills_dir=bundled))
+    discovered = loader.discover()
+
+    assert set(discovered) == {"trusted-directory"}
+    assert discovered["trusted-directory"].origin == "personal"
+    assert discovered["trusted-directory"].read_only is True
+    assert loader.get("Canonical Skill", include_disabled=True).root == trusted
 
 
 # ---- frontmatter parsing: folded / literal / quoted scalars --------------

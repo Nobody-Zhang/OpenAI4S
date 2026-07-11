@@ -89,6 +89,64 @@ def test_validation_builtin_collision_and_read_only_delete_contract(tmp_path):
     }
 
 
+def test_declared_builtin_name_collision_is_rejected_when_slug_differs(tmp_path):
+    config, service = _service(tmp_path, with_builtin=False)
+    bundled = config.skills_dir / "trusted-directory"
+    bundled.mkdir()
+    (bundled / "SKILL.md").write_text(
+        "---\nname: Canonical Skill\ndescription: trusted\n"
+        "origin: personal\n---\n# Trusted\n",
+        "utf-8",
+    )
+
+    assert service.create_or_update(" canonical  skill ", "custom", "body") == {
+        "error": "'canonical-skill' collides with a built-in skill — "
+        "pick a different name"
+    }
+    assert service.get("Canonical Skill")["editable"] is False
+
+
+def test_customize_edits_host_draft_and_personal_skills_by_user_root(tmp_path):
+    _config, service = _service(tmp_path)
+    user_directory = service.loader.user_skills_dir()
+    for directory, name, origin in (
+        ("host-draft-directory", "Host Draft", "draft"),
+        ("host-personal-directory", "Host Personal", "personal"),
+    ):
+        root = user_directory / directory
+        root.mkdir(parents=True)
+        (root / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: host authored\n"
+            f"origin: {origin}\n---\n# Original\n",
+            "utf-8",
+        )
+
+    service.loader.discover()
+    catalog = {item["name"]: item for item in service.catalog()}
+    assert catalog["Host Draft"]["editable"] is True
+    assert catalog["Host Personal"]["editable"] is True
+    assert service.get("Host Draft")["editable"] is True
+    assert service.get("Host Personal")["editable"] is True
+
+    updated = service.create_or_update(
+        "Host Draft",
+        "edited in Customize",
+        "# Updated",
+        existing=True,
+    )
+    assert updated == {
+        "ok": True,
+        "name": "Host Draft",
+        "slug": "host-draft-directory",
+        "origin": "draft",
+    }
+    document = (
+        user_directory / "host-draft-directory" / "SKILL.md"
+    ).read_text("utf-8")
+    assert "origin: draft" in document
+    assert document.endswith("# Updated\n")
+
+
 def test_import_precedence_and_catalog_enablement(tmp_path):
     _config, service = _service(tmp_path)
     raw = (

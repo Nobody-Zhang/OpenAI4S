@@ -100,6 +100,9 @@ class SkillService:
                 f"skill {name!r} origin={existing.origin} is read-only"
             )
 
+        if relative == "SKILL.md" and old_string is None:
+            self._reject_bundled_name_collision(content, fallback=name)
+
         if existing is not None:
             root = existing.root
         else:
@@ -123,7 +126,7 @@ class SkillService:
 
         target = self._safe_path(root, relative)
         if old_string is None:
-            target.write_text(content, "utf-8")
+            updated_content = content
             mode = "overwrite"
         else:
             if not target.exists():
@@ -133,8 +136,15 @@ class SkillService:
             current = target.read_text("utf-8")
             if old_string not in current:
                 raise ValueError("old_string not found in file")
-            target.write_text(current.replace(old_string, content, 1), "utf-8")
+            updated_content = current.replace(old_string, content, 1)
             mode = "str_replace"
+
+        if relative == "SKILL.md":
+            self._reject_bundled_name_collision(
+                updated_content,
+                fallback=existing.name if existing is not None else name,
+            )
+        target.write_text(updated_content, "utf-8")
 
         result: dict[str, Any] = {
             "ok": True,
@@ -178,6 +188,16 @@ class SkillService:
             raise PermissionError(f"skill {name!r} is read-only")
         shutil.rmtree(skill.root)
         return {"ok": True, "deleted": name}
+
+    def _reject_bundled_name_collision(self, content: str, *, fallback: str) -> None:
+        metadata, _body = self.loader.parse_document(content)
+        declared_name = metadata.get("name") or fallback
+        collision = self.loader.bundled_name_collision(declared_name)
+        if collision is not None:
+            raise PermissionError(
+                f"skill name {declared_name!r} collides with read-only bundled "
+                f"skill {collision.name!r}"
+            )
 
     @staticmethod
     def _safe_path(root: Path, relative: str) -> Path:

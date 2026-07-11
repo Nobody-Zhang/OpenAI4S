@@ -15,14 +15,16 @@ SKILL.md may start with a YAML-ish frontmatter block:
     origin: personal
     ---
 
-`description` becomes the one-line summary shown in the prompt. `origin` is one
-of openai4s|organization|personal|draft|unknown and drives the permission gate.
+`description` becomes the one-line summary shown in the prompt. `origin` is
+lifecycle/display metadata; the configured discovery root, not frontmatter,
+determines whether a skill is writable.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -30,9 +32,20 @@ from openai4s.capabilities import CapabilityStateService
 from openai4s.config import Config, get_config
 
 _VALID_ORIGINS = ("openai4s", "organization", "personal", "draft", "unknown")
-# origins whose sidecar/doc is read-only (cannot be edited/deleted via CRUD)
-_READONLY_ORIGINS = ("openai4s",)
 _WORD = re.compile(r"[a-z0-9]+")
+
+
+def _canonical_skill_name(value: str) -> str:
+    """Return the collision identity for a declared skill name.
+
+    Directory names are an implementation detail: capability state and agent
+    retrieval use the frontmatter ``name``.  Normalize that public identity so
+    a user directory cannot shadow a bundled skill through casing, compatible
+    Unicode, or whitespace differences.
+    """
+
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    return " ".join(normalized.split()).casefold()
 
 
 class _StoreCapabilityRepository:
@@ -185,6 +198,10 @@ class Skill:
     has_kernel: bool  # kernel.py sidecar present?
     description: str = ""  # one-line summary for progressive disclosure
     origin: str = "unknown"
+    # Filesystem discovery source is authoritative for ownership. Frontmatter
+    # origin remains lifecycle/display metadata and is intentionally unable to
+    # make a bundled directory writable.
+    source: str = "bundled"
     keywords: set[str] = field(default_factory=set)
     version: str = ""
     document_sha256: str = ""
@@ -192,7 +209,7 @@ class Skill:
 
     @property
     def read_only(self) -> bool:
-        return self.origin in _READONLY_ORIGINS
+        return self.source == "bundled"
 
     @property
     def import_hint(self) -> str | None:
@@ -399,15 +416,27 @@ class SkillLoader:
         read-only skills). Discovered alongside the bundled ones."""
         return self.cfg.data_dir / "user-skills"
 
+    @staticmethod
+    def parse_document(content: str) -> tuple[dict, str]:
+        """Parse one SKILL.md document with the loader's frontmatter rules."""
+
+        return _parse_frontmatter(content)
+
     def discover(self) -> dict[str, Skill]:
         self._skills = {}
         # bundled skills first, then user-authored ones. A user skill must NOT
-        # silently shadow a trusted BUNDLED skill of the same dir-name — bundled
-        # wins on collision (else agent loads untrusted content under a trusted name).
-        for base in (self.skills_dir, self.user_skills_dir()):
+        # silently shadow a trusted BUNDLED skill by directory or declared
+        # canonical name. Bundled wins on collision, otherwise the agent could
+        # load untrusted content under a trusted capability identity.
+        claimed_names: set[str] = set()
+        roots = (
+            ("bundled", self.skills_dir),
+            ("user", self.user_skills_dir()),
+        )
+        for source, base in roots:
             if not base or not base.exists():
                 continue
-            is_user = base.resolve() == self.user_skills_dir().resolve()
+            is_user = source == "user"
             for child in sorted(base.iterdir()):
                 if not child.is_dir():
                     continue
@@ -433,6 +462,9 @@ class SkillLoader:
                 if len(description) > 200:
                     description = description[:197] + "..."
                 name = meta.get("name") or child.name
+                canonical_name = _canonical_skill_name(name)
+                if canonical_name in claimed_names:
+                    continue
                 document_sha256 = hashlib.sha256(raw.encode("utf-8")).hexdigest()
                 sidecar = child / "kernel.py"
                 sidecar_sha256 = None
@@ -453,12 +485,25 @@ class SkillLoader:
                     has_kernel=(child / "kernel.py").exists(),
                     description=description,
                     origin=origin,
+                    source=source,
                     keywords=_tokenize(name, description, body),
                     version=version,
                     document_sha256=document_sha256,
                     sidecar_sha256=sidecar_sha256,
                 )
+                claimed_names.add(canonical_name)
         return self._skills
+
+    def bundled_name_collision(self, name: str) -> Skill | None:
+        """Return the bundled owner of a declared-name identity, if any."""
+
+        wanted = _canonical_skill_name(name)
+        if not wanted:
+            return None
+        for skill in self.discover().values():
+            if skill.read_only and _canonical_skill_name(skill.name) == wanted:
+                return skill
+        return None
 
     def is_enabled(self, name: str) -> bool:
         return self.capabilities.is_enabled("skill", name)

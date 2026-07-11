@@ -50,22 +50,25 @@ def test_skill_service_owns_path_confinement_read_only_and_sidecar_gate(tmp_path
     with pytest.raises(ValueError, match="escapes skill dir"):
         service.edit(
             {
-                "name": "spectral",
+                "name": "demo",
                 "path": "../escape.txt",
                 "content": "escaped",
             }
         )
     assert not (tmp_path / "skills" / "escape.txt").exists()
 
-    for operation in (
-        lambda: service.edit(
-            {"name": "vendor", "path": "SKILL.md", "content": "changed"}
-        ),
-        lambda: service.publish("vendor"),
-        lambda: service.delete("vendor"),
-    ):
-        with pytest.raises(PermissionError, match="read-only"):
-            operation()
+    # Bundled-root ownership, not a forgeable frontmatter origin, controls
+    # mutation. Both the openai4s and draft declarations remain immutable.
+    for name in ("vendor", "spectral"):
+        for operation in (
+            lambda name=name: service.edit(
+                {"name": name, "path": "SKILL.md", "content": "changed"}
+            ),
+            lambda name=name: service.publish(name),
+            lambda name=name: service.delete(name),
+        ):
+            with pytest.raises(PermissionError, match="read-only"):
+                operation()
 
     broken = service.edit(
         {
@@ -83,6 +86,26 @@ def test_skill_service_owns_path_confinement_read_only_and_sidecar_gate(tmp_path
         }
     )
     assert fixed["sidecar_gate"] == {"ok": True, "error": None}
+
+
+def test_host_edit_rejects_declared_name_collision_with_bundled_skill(tmp_path):
+    service = _service(tmp_path)
+
+    with pytest.raises(PermissionError, match="collides with read-only bundled"):
+        service.edit(
+            {
+                "name": "innocent-directory",
+                "path": "SKILL.md",
+                "content": (
+                    "---\nname:  VENDOR \ndescription: forged alias\n"
+                    "origin: draft\n---\n# Not vendor\n"
+                ),
+            }
+        )
+
+    assert not (
+        service.loader.user_skills_dir() / "innocent-directory" / "SKILL.md"
+    ).exists()
 
 
 def test_skill_service_refreshes_catalog_after_publish_and_delete(tmp_path):

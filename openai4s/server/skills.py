@@ -31,6 +31,12 @@ class SkillCustomizationService:
         except TypeError:
             return self.loader.skills()
 
+    def _find_skill(self, name: str):
+        for skill in self._all_skills().values():
+            if skill.name == name or skill.root.name == name:
+                return skill
+        return None
+
     @staticmethod
     def slug(name: str) -> str:
         value = re.sub(
@@ -62,9 +68,20 @@ class SkillCustomizationService:
             return {"error": "skill name is required"}
         slug = self.slug(name)
 
+        existing_skill = self._find_skill(name) if existing else None
+
         # Discovery gives bundled skills precedence, so reject a new user skill
-        # that would otherwise be written successfully and then ignored.
+        # that would otherwise be written successfully and then ignored. Check
+        # both its directory slug and its declared canonical identity.
         try:
+            collision = self.loader.bundled_name_collision(
+                existing_skill.name if existing_skill is not None else name
+            )
+            if collision is not None:
+                return {
+                    "error": f"'{slug}' collides with a built-in skill — "
+                    "pick a different name"
+                }
             if not existing and (self.loader.skills_dir / slug).is_dir():
                 return {
                     "error": f"'{slug}' collides with a built-in skill — "
@@ -76,27 +93,43 @@ class SkillCustomizationService:
         user_directory = self.loader.user_skills_dir()
         user_directory.mkdir(parents=True, exist_ok=True)
         user_directory = user_directory.resolve()
-        root = user_directory / slug
+        root = (
+            existing_skill.root
+            if existing_skill is not None
+            else user_directory / slug
+        )
         if root.is_symlink():
             return {"error": "unsafe user skill path"}
-        root.mkdir(parents=True, exist_ok=True)
         root = root.resolve()
         if root == user_directory or not root.is_relative_to(user_directory):
             return {"error": "unsafe user skill path"}
+        root.mkdir(parents=True, exist_ok=True)
         document = root / "SKILL.md"
         if document.is_symlink():
             return {"error": "unsafe user skill path"}
         description = " ".join((description or "").split())
+        document_name = existing_skill.name if existing_skill is not None else name
+        origin = (
+            existing_skill.origin
+            if existing_skill is not None
+            and existing_skill.origin in {"draft", "personal"}
+            else "user"
+        )
         frontmatter = (
-            f"---\nname: {name}\ndescription: {description}\n"
-            "origin: user\n---\n\n"
+            f"---\nname: {document_name}\ndescription: {description}\n"
+            f"origin: {origin}\n---\n\n"
         )
         document.write_text(
             frontmatter + (body or "").strip() + "\n",
             "utf-8",
         )
         self.loader.discover()
-        return {"ok": True, "name": name, "slug": slug, "origin": "user"}
+        return {
+            "ok": True,
+            "name": document_name,
+            "slug": root.name,
+            "origin": origin,
+        }
 
     def import_document(
         self,
@@ -118,18 +151,18 @@ class SkillCustomizationService:
         return self.create_or_update(name, description, body)
 
     def get(self, name: str) -> dict:
-        for skill in self._all_skills().values():
-            if skill.name == name or skill.root.name == name:
-                _metadata, body = self.parse_document(
-                    (skill.root / "SKILL.md").read_text("utf-8")
-                )
-                return {
-                    "name": skill.name,
-                    "description": skill.description,
-                    "body": body,
-                    "origin": skill.origin,
-                    "editable": skill.origin == "user",
-                }
+        skill = self._find_skill(name)
+        if skill is not None:
+            _metadata, body = self.parse_document(
+                (skill.root / "SKILL.md").read_text("utf-8")
+            )
+            return {
+                "name": skill.name,
+                "description": skill.description,
+                "body": body,
+                "origin": skill.origin,
+                "editable": not skill.read_only,
+            }
         return {"error": "skill not found"}
 
     def delete(self, name: str) -> dict:
@@ -163,6 +196,13 @@ class SkillCustomizationService:
         except Exception:  # noqa: BLE001 - Customize degrades to an empty catalog
             return []
 
+        try:
+            editable = {
+                skill.name: not skill.read_only
+                for skill in self._all_skills().values()
+            }
+        except Exception:  # noqa: BLE001 - preserve compatibility with test doubles
+            editable = {}
         output = []
         for item in catalog:
             name = item.get("name") if isinstance(item, dict) else str(item)
@@ -179,7 +219,7 @@ class SkillCustomizationService:
                     if isinstance(item, dict)
                     else "",
                     "origin": origin,
-                    "editable": origin == "user",
+                    "editable": editable.get(name, origin == "user"),
                     "enabled": name not in disabled_names,
                 }
             )
