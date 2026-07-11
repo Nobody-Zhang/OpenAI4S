@@ -34,6 +34,10 @@ from openai4s.host.files import WorkspaceFileService
 from openai4s.host.files import is_secret_path as _is_secret_path
 from openai4s.host.mcp import MCPService
 from openai4s.host.progress import PLAN_STEP_STATUSES, ProgressService
+from openai4s.host.remote_capabilities import RemoteCapabilityService
+from openai4s.host.remote_capabilities import (
+    normalize_remote_capability_probe as _normalize_remote_capability_probe,
+)
 from openai4s.host.skills import SkillService
 from openai4s.llm import chat
 from openai4s.store import SECRET_ARG_HOST_CALLS, get_store
@@ -55,119 +59,6 @@ _VALID_MARKER_ID = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
-
-
-_REMOTE_PROBE_BINARY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
-_REMOTE_PROBE_FORBIDDEN = (";", "|", "&", "`", "$(", "\r", "\n", "\x00")
-
-
-def _reject_remote_probe_metacharacters(value: str, field: str) -> None:
-    """Reject syntax that could add shell operations to a verification probe."""
-    bad = next((token for token in _REMOTE_PROBE_FORBIDDEN if token in value), None)
-    if bad is not None:
-        label = {"\r": "CR", "\n": "LF", "\x00": "NUL"}.get(bad, bad)
-        raise ValueError(f"{field} contains forbidden shell syntax {label!r}")
-
-
-def _normalize_remote_capability_probe(spec: dict) -> tuple[dict, str]:
-    """Return a canonical probe and the single safe remote command it represents.
-
-    New callers use a structured ``probe``.  The legacy ``verify_command`` input
-    remains accepted only for the two historical probe grammars, and is parsed
-    and rebuilt rather than executed verbatim.  A script-only registration is a
-    structured ``path_exists`` probe by default.
-    """
-    import shlex as _shlex
-
-    has_structured = "probe" in spec and spec.get("probe") is not None
-    legacy_raw = spec.get("verify_command")
-    if legacy_raw is None:
-        legacy = ""
-    elif isinstance(legacy_raw, str):
-        legacy = legacy_raw.strip()
-    else:
-        raise ValueError("verify_command must be a string")
-
-    if has_structured and legacy:
-        raise ValueError("provide probe or verify_command, not both")
-
-    if has_structured:
-        raw = spec.get("probe")
-        if not isinstance(raw, dict):
-            raise ValueError("probe must be an object")
-        kind = raw.get("kind")
-        if kind == "path_exists":
-            expected = {"kind", "path"}
-            if set(raw) != expected:
-                raise ValueError("path_exists probe accepts exactly kind and path")
-            path = raw.get("path")
-            if not isinstance(path, str) or not path.strip():
-                raise ValueError("path_exists probe requires a non-empty string path")
-            _reject_remote_probe_metacharacters(path, "probe.path")
-            probe = {"kind": "path_exists", "path": path}
-            return probe, f"test -e {_shlex.quote(path)}"
-        if kind == "executable_exists":
-            expected = {"kind", "binary"}
-            if set(raw) != expected:
-                raise ValueError(
-                    "executable_exists probe accepts exactly kind and binary"
-                )
-            binary = raw.get("binary")
-            if not isinstance(binary, str) or not _REMOTE_PROBE_BINARY.fullmatch(
-                binary
-            ):
-                raise ValueError(
-                    "executable_exists binary must be one plain executable name"
-                )
-            probe = {"kind": "executable_exists", "binary": binary}
-            return probe, f"which {binary}"
-        raise ValueError(f"unknown probe kind {kind!r}")
-
-    if legacy:
-        _reject_remote_probe_metacharacters(legacy, "verify_command")
-        try:
-            tokens = _shlex.split(legacy, posix=True)
-        except ValueError as exc:
-            raise ValueError(f"invalid verify_command quoting: {exc}") from exc
-        if len(tokens) == 3 and tokens[:2] == ["test", "-e"]:
-            path = tokens[2]
-            if not path.strip():
-                raise ValueError("legacy test probe requires a non-empty path")
-            _reject_remote_probe_metacharacters(path, "verify_command path")
-            # Pre-change verify_command was handed to the remote shell verbatim,
-            # so ~ and $VAR expanded there. The rebuilt command is quoted and
-            # never expands; reject rather than silently probe a literal path.
-            if path.startswith("~") or "$" in path:
-                raise ValueError(
-                    "verify_command path would no longer be shell-expanded; "
-                    "use an absolute path"
-                )
-            probe = {"kind": "path_exists", "path": path}
-            return probe, f"test -e {_shlex.quote(path)}"
-        if len(tokens) == 2 and tokens[0] == "which":
-            binary = tokens[1]
-            if not _REMOTE_PROBE_BINARY.fullmatch(binary):
-                raise ValueError(
-                    "legacy which probe requires one plain executable name"
-                )
-            probe = {"kind": "executable_exists", "binary": binary}
-            return probe, f"which {binary}"
-        raise ValueError(
-            "verify_command must be exactly 'test -e <path>' or 'which <binary>'"
-        )
-
-    script_raw = spec.get("script")
-    if script_raw is None:
-        script = ""
-    elif isinstance(script_raw, str):
-        script = script_raw.strip()
-    else:
-        raise ValueError("script must be a string")
-    if not script:
-        raise ValueError("provide probe, verify_command, or script")
-    _reject_remote_probe_metacharacters(script, "script")
-    probe = {"kind": "path_exists", "path": script}
-    return probe, f"test -e {_shlex.quote(script)}"
 
 
 # --------------------------------------------------------------------------- #
@@ -578,6 +469,9 @@ class HostDispatcher:
             fingerprint=lambda *fields: _endpoint_fingerprint(*fields),
         )
         self._mcp_service = MCPService(self.store)
+        self._remote_capability_service = RemoteCapabilityService(
+            normalize_probe=lambda spec: _normalize_remote_capability_probe(spec),
+        )
         # app tiles rendered this session
         self._app_tiles: list[dict] = []
         # background executor (exec_peek / exec_interrupt), built lazily.
@@ -942,118 +836,14 @@ class HostDispatcher:
 
     # --- identity / capabilities ------------------------------------
     def _remote_gpu_status_payload(self) -> dict:
-        """Registry-backed remote GPU state for in-kernel agents.
-
-        This intentionally does not fabricate availability. It reports what the
-        user has configured plus which services have actually been registered.
-        Reachability and service health are checked by the provisioning/fold/
-        scoring tools at run time.
-        """
-        from openai4s.compute import registry as _reg
-
-        hosts_reg = _reg.list_hosts()
-        core = ["fold", "score_mutations"]
-        hosts = []
-        all_caps: set[str] = set()
-        for alias, h in hosts_reg.items():
-            caps = h.get("capabilities") or {}
-            all_caps.update(caps.keys())
-            hosts.append(
-                {
-                    "alias": alias,
-                    "label": h.get("label") or alias,
-                    "provider": f"ssh:{alias}",
-                    "gpus": h.get("gpus"),
-                    "gpu_count": h.get("gpu_count", 0),
-                    "capabilities": [
-                        {
-                            "name": c,
-                            "engine": (m or {}).get("engine"),
-                            "script": (m or {}).get("script"),
-                            "verified": bool((m or {}).get("verified_at")),
-                            "verified_at": (m or {}).get("verified_at"),
-                        }
-                        for c, m in caps.items()
-                    ],
-                }
-            )
-        return {
-            "configured": bool(hosts),
-            "default_host": _reg.default_host(),
-            "hosts": hosts,
-            "core_capabilities": core,
-            "missing_core_capabilities": [c for c in core if c not in all_caps],
-        }
+        return self._remote_capability_service.status()
 
     def _m_remote_gpu_status(self, _spec: dict | None = None) -> dict:
         """Return configured remote GPU hosts and registered services."""
         return self._remote_gpu_status_payload()
 
     def _m_register_remote_capability(self, spec: dict) -> dict:
-        """Register a remote GPU service after verifying it exists remotely."""
-        import subprocess as _sub
-
-        from openai4s.compute import registry as _reg
-
-        alias = str(spec.get("alias") or "").strip()
-        cap = str(spec.get("capability") or spec.get("cap") or "").strip()
-        script = str(spec.get("script") or "").strip()
-        if not alias:
-            return {"error": "register_remote_capability: alias is required"}
-        if not cap:
-            return {"error": "register_remote_capability: capability is required"}
-        if not _reg.get_host(alias):
-            return {
-                "error": f"register_remote_capability: unknown remote GPU host {alias!r}"
-            }
-        try:
-            probe, remote_cmd = _normalize_remote_capability_probe(spec)
-        except ValueError as exc:
-            return {"error": f"register_remote_capability: invalid probe: {exc}"}
-        try:
-            proc = _sub.run(
-                [
-                    "ssh",
-                    "-o",
-                    "ConnectTimeout=15",
-                    "-o",
-                    "BatchMode=yes",
-                    alias,
-                    remote_cmd,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=90,
-            )
-        except _sub.TimeoutExpired:
-            return {
-                "error": f"register_remote_capability: verification timed out on {alias}"
-            }
-        except OSError as e:  # noqa: BLE001
-            return {"error": f"register_remote_capability: ssh to {alias} failed: {e}"}
-        if proc.returncode != 0:
-            tail = ((proc.stderr or proc.stdout or "")[-800:]).strip()
-            return {
-                "error": "register_remote_capability: verification failed on "
-                f"{alias} (rc={proc.returncode}). tail: {tail}"
-            }
-
-        meta = {
-            "script": script,
-            "invoke": spec.get("invoke") or "",
-            "engine": spec.get("engine") or cap,
-            "markers": spec.get("markers") or {},
-            "notes": spec.get("notes") or "",
-            "probe": probe,
-            "verification": remote_cmd,
-        }
-        _reg.set_capability(alias, cap, meta)
-        return {
-            "ok": True,
-            "alias": alias,
-            "capability": cap,
-            "status": self._remote_gpu_status_payload(),
-        }
+        return self._remote_capability_service.register(spec)
 
     def _m_get_user_email(self) -> str:
         import os
