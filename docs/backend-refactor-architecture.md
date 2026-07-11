@@ -1,5 +1,9 @@
 # Backend refactor architecture
 
+> Status: **implemented.** The migration completed through small, tested
+> commits. Legacy import paths remain as compatibility/composition facades;
+> capability behaviour now lives in focused classes and repositories.
+
 This document records the agreed target architecture for the OpenAI4S backend
 refactor. It is a compatibility-preserving reorganization, not a reduction of
 the product to CoreCoder's function-calling loop.
@@ -107,97 +111,84 @@ dispatcher, skill loader, replay recorder, or WebSocket hub. Those dependencies
 are assembled at the application boundary. The loop remains small enough that
 its state transitions and terminal conditions can be reviewed in one place.
 
-## Target package layout
+## Implemented package layout
 
-The target is intentionally compact. A directory is introduced only when it
-owns a real dependency boundary or replaces one of the current oversized
-modules.
+The finished layout is intentionally compact. A directory exists only when it
+owns a real dependency boundary. Large public modules remain as compatible
+composition facades, while the behaviour they used to contain is grouped by
+domain below.
 
 ```text
 openai4s/
-  bootstrap.py                 application composition root
-  config.py                    compatible configuration facade
-
   agent/
-    engine.py                  the only outer agent loop
-    actions.py                 normalized action types and routing rules
-    context.py                 grouped compaction and archive policy
-    events.py                  typed engine events
-    prompts.py                 prompt assembly and capability descriptions
-    delegation.py              bounded child-agent orchestration
+    engine.py                  sole outer-loop state machine
+    actions.py                 native-tool / one-cell / no-action routing
+    runtime.py                 local and CLI adapter
+    control.py                 protected native-tool execution
+    models.py · ports.py       provider-neutral values and dependency ports
 
   llm/
-    client.py                  provider-neutral streaming and retry policy
-    models.py                  normalized reply, delta, usage, tool-call types
-    providers.py               OpenAI-compatible, Anthropic, and Gemini wires
+    client.py                  provider-neutral chat orchestration
+    messages.py · models.py    normalized messages, replies, calls, usage
+    tooling.py · transport.py  wire assembly and stdlib transport
+  llm.py                       compatible public facade
 
   execution/
-    executor.py                routes code actions and native tool batches
-    runtime.py                 Python/R runtime ownership and environment switch
-    completion.py              submit_output terminal-state handling
-
-  kernel/
-    protocol.py                single frame/response protocol definition
-    manager.py                 worker lifecycle and synchronous host RPC
-    worker.py                  persistent Python worker
-    r_kernel.py                persistent R channel
-    r_worker.R
-    background.py
-    environments.py
-    guards.py
-    provenance.py
-
-  host/
-    registry.py                capability metadata and handler registration
-    dispatcher.py              routing, authorization, audit, soft-fail boundary
-    services/                  filesystem, web, LLM, delegation, artifacts,
-                               compute, skills, MCP, query, environment
-
-  sdk/
-    host.py                    compatible in-kernel facade
-    rpc.py                     host_call transport
-    namespaces/                modular host.env/skills/mcp/compute facades
-
-  session/
-    models.py                  session and message-job state
-    service.py                 submit, resume, cancel, steer, kernel lifecycle
-    artifacts.py               capture, versioning, restore, lineage integration
-    review.py                  review orchestration
-    events.py                  engine events to durable/UI events
-
-  storage/
-    database.py                connection, transaction, schema migration owner
-    repositories.py            frames, messages, executions, artifacts, agents,
-                               skills, memories, notes, and host-call logs
+    models.py                  cell/capture value types
+    watchdog.py                timeout and exact-kernel recovery policy
 
   tools/
-    base.py                    executable Tool interface + safe policy defaults
-    contexts.py                narrow workspace/environment runtime ports
-    <capability>.py            named class with schema, policy, and behaviour
-    registry.py                explicit ordered class catalogue + call protocol
-    native.py                  provider-neutral native JSON declarations
+    base.py                    executable Tool interface and safe defaults
+    contexts.py                narrow workspace/environment ports
+    <capability>.py            one named class with schema, policy, behaviour
+    registry.py                ordered class catalogue and runtime instances
+    native.py                  provider-neutral JSON declarations
 
-  security/                    classifier, permissions, egress, shell checks,
-                               biosecurity, injection screening, audit hook
-  compute/                     remote compute manager and provider registry
-  skills/                      skill loading and validation
-  mcp/                         MCP client and bundled servers
-  replay/                      recording and playback
+  host_dispatch.py             permission/audit/replay/injection routing facade
+  host/
+    files.py                   workspace boundary service
+    llm.py · completion.py     model fanout and sole completion state
+    data.py · delegation.py    query/artifact/lineage and child orchestration
+    remote_capabilities.py     verified service registration
+    remote_science.py          real fold/mutation remote execution
+    progress.py · skills.py    plan/todo and skill services
+    endpoints.py · mcp.py      managed endpoints and MCP services
+    credentials.py             in-memory credential service
+
+  sdk/
+    host.py                    compatible in-kernel host facade
+    compute.py                 host.compute namespace and job handles
+
+  kernel/
+    manager.py                 worker lifecycle and synchronous host RPC
+    supervisor.py              per-session Python/R slot ownership
+    worker.py                  persistent Python worker
+    r_kernel.py · r_worker.R   persistent analysis-only R channel
+    background.py · environments.py · guards.py · provenance.py
+
+  store.py                     schema/migration/connection + compatible facade
+  storage/
+    frames.py                  projects, frames, messages, steps, cell log
+    artifacts.py               versions, snapshots, lineage
+    metadata.py                notes, folders, endpoints, compaction, audit
+    agents.py · connectors.py · memories.py
+    annotations.py · plans.py · permissions.py · settings.py
 
   server/
-    app.py                     HTTP composition only
-    routes.py                  REST adapters
-    websocket.py               WebSocket transport and event presentation
-    daemon.py
-    webui/                     existing static frontend
+    gateway.py                 stdlib HTTP/WS composition and route adapter
+    agent_run.py               AgentEngine-to-Web event/action adapter
+    cell_run.py                one scientific cell transaction
+    artifacts.py               capture, versions, restore, mutations
+    plans.py · reviews.py      plan and evidence-review orchestration
+    skills.py · titles.py      customization and background titles
+    execution_views.py         execution-log/lineage presentation
+    daemon.py · webui/
 
-  cli/
-    main.py
-    renderer.py                engine-event presentation
+  cli/main.py                  CLI adapter
+  security/ · compute/         policy and remote-compute subsystems
 ```
 
-The exact filenames may be adjusted during extraction, but the ownership and
-dependency boundaries above are architectural constraints.
+These ownership and dependency boundaries are architectural constraints.
 
 ## Dependency rules
 
@@ -206,14 +197,15 @@ dependency boundaries above are architectural constraints.
    and host implementations.
 2. `llm` owns provider wire differences. No provider-specific response object
    crosses into the agent engine.
-3. `execution` is the only layer that maps an agent action to either a
-   persistent kernel or a native control-tool batch.
-4. `host.dispatcher` is a thin policy-aware router. Capability business logic
-   lives in `host.services`; both native tools and kernel RPC use it.
-5. `session` owns durable run lifecycle. `server` and `cli` are adapters over
-   session/engine services and cannot contain another agent loop.
-6. `storage` owns transactions and schema migrations. Repositories do not open
-   independent competing connections for one logical operation.
+3. `agent.runtime` and `server.agent_run` adapt engine actions to the local or
+   Web runtime; shared execution values/watchdog policy live in `execution`.
+4. `host_dispatch.HostDispatcher` is the policy-aware router. Capability
+   business logic lives in classes under `host/` or the corresponding `Tool`
+   class; native tools and kernel RPC cross the same envelope.
+5. Services under `server/` own durable run operations. `gateway.py` and the
+   CLI are adapters/composition roots and cannot contain another agent loop.
+6. `Store` owns the connection, schema, and migrations. Domain repositories
+   share its connection and lock; they do not open competing write connections.
 7. Kernel workers import the kernel-side `sdk` and security guards, never
    server or storage code. The host process continues to execute no shell on
    behalf of the model.
@@ -260,7 +252,17 @@ Current implementation status:
 - all native control tools are named classes whose schema, safety policy, and
   behaviour live together; HostDispatcher supplies one generic protected
   execution path and narrow runtime contexts;
-- host, kernel, storage, and gateway service extraction remains incremental.
+- `HostDispatcher` delegates workspace, LLM, completion, data/lineage,
+  delegation, progress, credentials, MCP, endpoints, remote capabilities, and
+  real remote-science work to focused services;
+- `Store` owns one connection/migration boundary and forwards domain work to
+  frame, artifact, metadata, settings, permission, plan, annotation, agent,
+  connector, and memory repositories;
+- Web session algorithms for cells, artifacts, plans, reviews, skills, titles,
+  and execution views live outside the HTTP/WebSocket adapter;
+- `sdk.host` retains its import surface while the compute namespace lives in
+  `sdk.compute`; all extractions are covered by direct contracts and the
+  existing offline suite.
 
 ### Phase 1 — Architecture and contract baseline
 
@@ -310,6 +312,13 @@ Current implementation status:
 - Run the full offline suite plus real browser tests for streaming, kernels,
   tools, approvals, artifacts, provenance, delegation, and resume.
 - Update architecture, web, configuration, security, skills, and compute docs.
+
+Phases 1–6 are complete. The remaining large facade files are deliberate:
+`gateway.py` contains the framework-free route table/composition plus demo
+payloads, `store.py` contains the SQLite schema/migrations and forwarding API,
+and `host_dispatch.py` contains the shared policy envelope and compatibility
+adapters. Domain algorithms no longer need to be added directly to those
+facades.
 
 ## Non-goals
 

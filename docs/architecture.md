@@ -125,6 +125,29 @@ Model-originated calls use `Tool.invoke()` and must never call `execute()`
 directly, so class extensibility cannot bypass the shared policy envelope.
 Runtime hot-unload is intentionally unsupported.
 
+## Backend ownership
+
+The public compatibility files are composition boundaries, not catch-all
+implementation files. New behaviour goes to the owning class below:
+
+| Boundary | Owns | Implementations |
+|---|---|---|
+| `agent/` | the single provider-neutral outer loop and action routing | `AgentEngine`, actions, ports, local/Web adapters |
+| `tools/` | JSON control-plane schema, policy, and behaviour | one named `Tool` subclass per capability; `TOOL_TYPES` is the only built-in instantiation point |
+| `host_dispatch.py` | permission, approval, audit/replay, injection screening, and RPC routing | thin `_m_*` compatibility adapters |
+| `host/` | host capability behaviour | LLM, files, completion, data/lineage, delegation, progress, skills, MCP, endpoints, credentials, remote capability/science services |
+| `sdk/` | worker-facing `host.*` API | compatible host facade plus the independent compute namespace/job handles |
+| `store.py` | one SQLite connection, schema, migrations, query guard, and public facade | forwards domain operations without duplicating SQL |
+| `storage/` | persistence behaviour and transaction boundaries | frame, artifact, metadata, settings, permission, plan, annotation, agent, connector, and memory repositories |
+| `server/` | persistent Web-session operations | cell, artifact, plan, review, skill, title, and execution-view services; `gateway.py` composes them with stdlib HTTP/WebSocket routes |
+
+Repositories share the `Store` connection and `RLock`; services use narrow
+ports or late-bound providers for replaceable session state. Compatibility
+facades keep existing imports, SDK calls, REST/WS payloads, and saved databases
+working while making each algorithm directly testable. See the
+[backend extension guide](backend-extension-guide.md) for the required path for
+new tools, host capabilities, persistence, and Web-session behaviour.
+
 ## Session kernel ownership
 
 Each Web session owns one [`KernelSupervisor`](../openai4s/kernel/supervisor.py)

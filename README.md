@@ -121,6 +121,7 @@ git clone https://github.com/PKU-YuanGroup/OpenAI4S && cd OpenAI4S
 | doc | what's inside |
 |---|---|
 | [**Architecture**](docs/architecture.md) | the Code-as-Action dual loop, the `host` API, kernel design |
+| [**Backend extension guide**](docs/backend-extension-guide.md) | where new Tool classes, host services, repositories, and session behaviour belong |
 | [**Skills**](docs/skills.md) | the 24 bundled Skills + how to write your own |
 | [**Remote compute**](docs/compute.md) | BYOC GPU jobs, `host.fold`, auto-provisioning |
 | [**Web app**](docs/webapp.md) | UI features, live Notebook, artifacts, the demo session |

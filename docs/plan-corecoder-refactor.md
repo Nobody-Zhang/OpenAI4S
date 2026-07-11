@@ -1,6 +1,10 @@
 # Plan: CoreCoder-style agents refactor — host executes only Jupyter/R instructions
 
-Status: **implemented** (branch `claude/agents-architecture-refactor-8583e4`) — offline suite green, real-R e2e verified (python cell → R cell → kernel-local bash → submit_output).
+Status: **implemented historical stage.** Its kernel/R/shell/completion
+decisions remain active. Its fenced-tool-only decision was superseded by the
+hybrid control plane: provider-native JSON tools now handle orchestration while
+Python/R Code-as-Action remains the scientific layer. See
+[`backend-refactor-architecture.md`](backend-refactor-architecture.md).
 
 ## Goal
 
