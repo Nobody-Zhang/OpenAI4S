@@ -88,13 +88,12 @@ def _prepare_message_runner(monkeypatch, tmp_path, dispatcher):
     )
     runner.store.update_frame(frame_id, name="Existing test session")
 
-    def ensure_kernel(state) -> None:
+    def ensure_runtime(state):
         state.dispatcher = dispatcher
         state.messages = [{"role": "system", "content": "sys"}]
-        state.booted = True
+        return dispatcher
 
-    monkeypatch.setattr(runner, "_ensure_kernel", ensure_kernel)
-    monkeypatch.setattr(runner, "_wire_delegation", lambda _state: None)
+    monkeypatch.setattr(runner, "_ensure_runtime", ensure_runtime)
     monkeypatch.setattr(runner, "_spawn_title_summary", lambda *args, **kwargs: None)
     return runner, hub, frame_id
 

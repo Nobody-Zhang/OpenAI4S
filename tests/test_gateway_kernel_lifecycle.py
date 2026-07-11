@@ -279,7 +279,7 @@ def test_python_bootstrap_runs_outside_supervisor_lock(monkeypatch, tmp_path):
     assert spawn_done.is_set()
 
 
-def test_environment_replacement_commits_worker_dispatcher_and_active_env_together(
+def test_environment_replacement_keeps_session_dispatcher_and_commits_active_env(
     monkeypatch, tmp_path
 ):
     from openai4s.kernel import environments as envmod
@@ -381,7 +381,9 @@ def test_environment_replacement_commits_worker_dispatcher_and_active_env_togeth
 
     assert changed["generation"] == 1
     assert st.kernel is kernels[-1] and st.kernel is not old_kernel
-    assert st.dispatcher is st.kernel.dispatcher
+    assert len(dispatchers) == 1
+    assert st.dispatcher is old_dispatcher
+    assert st.kernel.dispatcher is old_dispatcher
     assert st.dispatcher.active_r_env == "r-special"
     replacement_background = st.dispatcher.background_kernel_factory()
     assert replacement_background.python == "struct-python"

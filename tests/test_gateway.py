@@ -69,7 +69,7 @@ def test_gateway_plain_answer_is_nudged_until_structured_submit(monkeypatch, tmp
         return {"result": {"stdout": "", "stderr": "", "error": None}}
 
     monkeypatch.setattr(gateway_mod, "chat", fake_chat)
-    monkeypatch.setattr(runner, "_ensure_kernel", fake_ensure)
+    monkeypatch.setattr(runner, "_ensure_runtime", fake_ensure)
     monkeypatch.setattr(runner, "_execute_and_log", fake_exec)
     # the background title-summary chat would also land in `calls` and race the
     # count; it is orthogonal to the plain-answer path under test
@@ -114,7 +114,7 @@ def test_gateway_projects_submit_only_result_as_live_and_persisted_final_message
         st.last_model_prose = ""
         return "submitted"
 
-    monkeypatch.setattr(runner, "_ensure_kernel", fake_ensure)
+    monkeypatch.setattr(runner, "_ensure_runtime", fake_ensure)
     monkeypatch.setattr(runner, "_loop", finish_without_model_prose)
     monkeypatch.setattr(runner, "_spawn_title_summary", lambda *a, **k: None)
 
@@ -353,7 +353,7 @@ def test_explore_mode_injects_protocol_and_nudges_prose_stalls(monkeypatch, tmp_
         st.booted = True
 
     monkeypatch.setattr(gateway_mod, "chat", fake_chat)
-    monkeypatch.setattr(runner, "_ensure_kernel", fake_ensure)
+    monkeypatch.setattr(runner, "_ensure_runtime", fake_ensure)
     # silence the background title-summary chat (it would race `calls`)
     monkeypatch.setattr(runner, "_spawn_title_summary", lambda *a, **k: None)
 
@@ -429,7 +429,7 @@ def test_midtask_prose_conclusion_still_requires_structured_submit(
         return {"result": {"stdout": "x\n", "stderr": "", "error": None}}
 
     monkeypatch.setattr(gateway_mod, "chat", fake_chat)
-    monkeypatch.setattr(runner, "_ensure_kernel", fake_ensure)
+    monkeypatch.setattr(runner, "_ensure_runtime", fake_ensure)
     monkeypatch.setattr(runner, "_execute_and_log", fake_exec)
     monkeypatch.setattr(runner, "_spawn_title_summary", lambda *a, **k: None)
 
@@ -487,7 +487,7 @@ def test_batched_code_blocks_warn_only_first_ran(monkeypatch, tmp_path):
         return {"result": {"stdout": "a\n", "stderr": "", "error": None}}
 
     monkeypatch.setattr(gateway_mod, "chat", fake_chat)
-    monkeypatch.setattr(runner, "_ensure_kernel", fake_ensure)
+    monkeypatch.setattr(runner, "_ensure_runtime", fake_ensure)
     monkeypatch.setattr(runner, "_execute_and_log", fake_exec)
     monkeypatch.setattr(runner, "_spawn_title_summary", lambda *a, **k: None)
 
@@ -1687,6 +1687,11 @@ def test_live_cell_start_event_carries_canonical_kernel_id(monkeypatch, tmp_path
     fid = runner.store.new_frame(kind="turn", project_id="default", status="ready")
     st = runner._state(fid, "default")
     st.env_name = "struct"
+    st.kernels.ensure(
+        "python",
+        "struct",
+        lambda: SimpleNamespace(is_alive=lambda: True, shutdown=lambda: None),
+    )
     events = []
     monkeypatch.setattr(runner, "_safety_refusal", lambda *a, **k: "blocked")
 

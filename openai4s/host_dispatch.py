@@ -397,7 +397,7 @@ def _step_end(method: str, kind: str, result: Any, ok: bool) -> tuple[dict, str]
 
 
 class HostDispatcher:
-    """Backs the worker-side host.* SDK. One instance per session/kernel."""
+    """Backs control tools and worker host.* RPC. One instance per session."""
 
     LLM_FANOUT_CAP = 32  # parallel host.llm concurrency ceiling (openai4s)
 

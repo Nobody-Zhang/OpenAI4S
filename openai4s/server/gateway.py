@@ -11,9 +11,10 @@ and SQLite store.
   * WebSocket          GET /api/ws      (view_session/ping ; text_reset/text_chunk/
                                           frame_update/artifact_created)
 
-Each user message runs the shared AgentEngine against a per-session persistent
-kernel; prose streams as text chunks, code + output stream as tool chunks, and
-every cell's figures / written files are captured as versioned artifacts.
+Each user message runs the shared AgentEngine against a session-scoped control
+runtime; persistent Python/R kernels are acquired only for scientific Cells.
+Prose streams as text chunks, code + output stream as tool chunks, and every
+cell's figures / written files are captured as versioned artifacts.
 """
 from __future__ import annotations
 
@@ -76,6 +77,7 @@ from openai4s.server.plans import public_plan as _plan_public
 from openai4s.server.plans import short_hash as _short_hash
 from openai4s.server.plans import slugify as _slugify
 from openai4s.server.reviews import ReviewPorts, ReviewService
+from openai4s.server.session_runtime import SessionRuntime
 from openai4s.server.skills import SkillCustomizationService
 from openai4s.server.titles import SessionTitleService
 from openai4s.skills_loader import SkillLoader
@@ -389,7 +391,9 @@ class SessionState:
         # sole ownership of protocol I/O; the supervisor only coordinates
         # lifecycle and exact-worker identity across cancellation/watchdogs.
         self.kernels = KernelSupervisor()
-        self.dispatcher = None
+        # The JSON control plane belongs to the session, not to either language
+        # worker.  It is constructed lazily and survives kernel stop/restart.
+        self.runtime = SessionRuntime()
         self.messages: list[dict] = []
         self.cell_index = 0
         self.booted = False
@@ -431,6 +435,15 @@ class SessionState:
     def kernel(self) -> Kernel | None:
         """Current Python worker (compatibility view; lifecycle lives above)."""
         return self.kernels.kernel("python")
+
+    @property
+    def dispatcher(self):
+        """Compatible view of the session-scoped control-plane dispatcher."""
+        return self.runtime.dispatcher
+
+    @dispatcher.setter
+    def dispatcher(self, value) -> None:
+        self.runtime.dispatcher = value
 
     @property
     def r_kernel(self) -> Kernel | None:
@@ -916,9 +929,7 @@ class SessionRunner:
         )
         self.cells = CellExecutionService(
             CellExecutionPorts(
-                prepare_language=lambda st, language: (
-                    self._ensure_r_kernel(st) if language == "r" else None
-                ),
+                prepare_language=self._prepare_language,
                 kernel_id=lambda st, language: (
                     self._r_kernel_id(st)
                     if language == "r"
@@ -1122,22 +1133,10 @@ class SessionRunner:
         # The execution log remains the lossless physical-cell projection.
         st.cell_index = self.store.cell_count(st.root_frame_id)
 
-    def _spawn_kernel(self, st: SessionState) -> KernelLease:
-        """Ensure the Python worker matches the resolved runtime environment.
+    def _ensure_runtime(self, st: SessionState):
+        """Build the session control plane without acquiring a language worker."""
 
-        The candidate dispatcher stays local until ``KernelSupervisor`` accepts
-        its worker.  If construction fails, the old worker/dispatcher pair and
-        active environment metadata remain intact.
-        """
-        previous_env = st.env_name
-        env = self._resolve_env(st)
-        env_key = (
-            env.name,
-            str(env.interpreter or ""),
-            str(env.root) if getattr(env, "is_conda", False) else None,
-        )
-
-        def factory() -> Kernel:
+        def factory():
             disp = build_dispatcher(
                 self.cfg,
                 frame_id=st.root_frame_id,
@@ -1146,35 +1145,65 @@ class SessionRunner:
             # Project every visible host.* call into persisted UI activity.
             disp.on_step = self._make_step_sink(st)
             disp.on_plan = self._make_plan_sink(st)
-            # Preserve the lazy R-channel target across Python replacements.
-            disp.active_r_env = getattr(st.dispatcher, "active_r_env", None)
-            self._wire_delegation(st, disp)
+            disp.on_env_switch = self._make_env_switch_sink(st)
+
+            # A selected environment is meaningful before its worker exists:
+            # env_list should report the persisted pin, but no process starts.
+            try:
+                from openai4s.kernel import environments as envmod
+
+                selected = envmod.get_environment(self._selected_env_name(st))
+                if selected is not None and selected.interpreter is not None:
+                    disp.active_env_bin = selected.bin_dir
+            except Exception:  # noqa: BLE001 — runtime creation must stay usable
+                pass
+
             try:
                 from openai4s.permissions import broker
 
-                _rid = st.root_frame_id
+                rid = st.root_frame_id
                 broker().register_channel(
-                    _rid,
-                    self.hub.emitter(_rid),
+                    rid,
+                    self.hub.emitter(rid),
                     cancel_event=st.cancel,
-                    watching=lambda r=_rid: self.hub.has_subscriber(r),
+                    watching=lambda r=rid: self.hub.has_subscriber(r),
                     store=self.store,
                 )
             except Exception:  # noqa: BLE001
                 pass
-            disp.active_env_bin = env.bin_dir
-            disp.on_env_switch = self._make_env_switch_sink(st)
-            kernel_options = {
-                "cwd": str(st.workspace),
-                "mode": "repl",
-                "python": env.interpreter,
-                "env_root": str(env.root) if env.is_conda else None,
-                "env_name": env.name,
-            }
-            disp.background_kernel_factory = lambda: Kernel(
-                dispatcher=disp,
-                **kernel_options,
-            )
+            return disp
+
+        dispatcher = st.runtime.ensure(factory)
+        # Refresh per-turn model/delegation wiring without replacing the stable
+        # dispatcher (and without starting Python).
+        self._wire_delegation(st)
+        return dispatcher
+
+    def _spawn_kernel(self, st: SessionState) -> KernelLease:
+        """Ensure Python matches the selected environment, build-first.
+
+        The session dispatcher is deliberately not part of worker replacement.
+        A failed candidate leaves the old worker, dispatcher, and active runtime
+        metadata intact.
+        """
+        disp = self._ensure_runtime(st)
+        previous_env = st.env_name
+        env = self._resolve_env(st)
+        env_key = (
+            env.name,
+            str(env.interpreter or ""),
+            str(env.root) if getattr(env, "is_conda", False) else None,
+        )
+
+        kernel_options = {
+            "cwd": str(st.workspace),
+            "mode": "repl",
+            "python": env.interpreter,
+            "env_root": str(env.root) if env.is_conda else None,
+            "env_name": env.name,
+        }
+
+        def factory() -> Kernel:
             return Kernel(dispatcher=disp, **kernel_options)
 
         previous_lease = st.kernels.lease("python")
@@ -1183,7 +1212,13 @@ class SessionRunner:
         except BaseException:
             st.env_name = previous_env
             raise
-        st.dispatcher = lease.kernel.dispatcher
+        # Publish environment-dependent dispatcher hooks only after the worker
+        # replacement has committed.  This preserves build-first semantics.
+        disp.active_env_bin = env.bin_dir
+        disp.background_kernel_factory = lambda: Kernel(
+            dispatcher=disp,
+            **kernel_options,
+        )
         if previous_lease is None or previous_lease.kernel is not lease.kernel:
             # Run outside the supervisor lock so cancellation can interrupt a
             # slow sidecar.  The caller's turn_lock still prevents execution
@@ -1193,10 +1228,10 @@ class SessionRunner:
         return lease
 
     def _wire_delegation(self, st: SessionState, dispatcher=None) -> None:
-        """Enable host.delegate inside web-session kernels.
+        """Enable delegation on the Web session's stable dispatcher.
 
         The standalone Agent wires this in its __post_init__, but the web UI uses
-        a persistent SessionRunner kernel. Without this hook `host.delegate(...)`
+        a persistent SessionRuntime. Without this hook `host.delegate(...)`
         exists in the SDK yet fails at runtime with "no sub-agent runner wired".
         Rewire per turn so delegated specialists inherit the currently selected
         model from the composer dropdown.
@@ -1257,6 +1292,19 @@ class SessionRunner:
         self._persist_env(st.root_frame_id, name)
         return env
 
+    def _selected_env_name(self, st: SessionState) -> str:
+        """Environment visible to the session, with or without a live worker."""
+        from openai4s.kernel import environments as envmod
+
+        if st.kernels.alive("python") and st.env_name:
+            return st.env_name
+        selected = st.desired_env or self._persisted_env(st.root_frame_id)
+        if selected:
+            environment = envmod.get_environment(selected)
+            if environment is not None and environment.interpreter is not None:
+                return selected
+        return st.env_name or envmod.default_env_name()
+
     def _persisted_env(self, root_frame_id: str) -> "str | None":
         """The runtime env this session last selected (frames.runtime_env), or None."""
         try:
@@ -1288,8 +1336,23 @@ class SessionRunner:
     def _ensure_kernel(self, st: SessionState) -> None:
         if st.kernels.alive("python"):
             return
+        self._ensure_runtime(st)
         self._seed_messages(st)
         self._spawn_kernel(st)
+
+    def _prepare_language(self, st: SessionState, language: str) -> str | None:
+        """Acquire the requested execution plane at the Cell boundary.
+
+        ``CellExecutionService`` calls this only after allocating the durable
+        execution attempt, so a spawn failure remains recoverable and auditable.
+        """
+        self._ensure_runtime(st)
+        if language == "r":
+            return self._ensure_r_kernel(st)
+        if language == "python":
+            self._ensure_kernel(st)
+            return None
+        return f"unsupported kernel language: {language}"
 
     def _make_step_sink(self, st: SessionState):
         """Return the dispatcher's on_step callback: persist each semantic step
@@ -1534,7 +1597,7 @@ class SessionRunner:
         cached on the Environment)."""
         from openai4s.kernel import environments as envmod
 
-        name = st.env_name if st and st.env_name else envmod.default_env_name()
+        name = self._selected_env_name(st) if st else envmod.default_env_name()
         env = envmod.get_environment(name)
         return {
             "name": name,
@@ -1583,7 +1646,8 @@ class SessionRunner:
         model sees a missing R as an error observation and can fall back to
         python — this never raises.
         """
-        want = getattr(st.dispatcher, "active_r_env", None)
+        dispatcher = self._ensure_runtime(st)
+        want = getattr(dispatcher, "active_r_env", None)
         from openai4s.kernel.environments import get_environment
         from openai4s.kernel.r_kernel import spawn_r_kernel
 
@@ -1667,7 +1731,7 @@ class SessionRunner:
         from openai4s.kernel import environments as envmod
 
         st = self._sessions.get(root_frame_id) if root_frame_id else None
-        current = st.env_name if st and st.env_name else envmod.default_env_name()
+        current = self._selected_env_name(st) if st else envmod.default_env_name()
         return {
             "environments": envmod.list_environments(with_packages=True),
             "current": current,
@@ -1678,11 +1742,12 @@ class SessionRunner:
     def set_env(
         self, root_frame_id: str, env_name: str, project_id: str = "default"
     ) -> dict:
-        """Switch this session's kernel to a prebuilt environment (restarts the
-        kernel into it — conversation + notebook history + workspace files are
-        kept, but in-memory variables are cleared, same as a restart). Rejects an
-        unknown or R-only env (this selector drives the PYTHON notebook kernel;
-        R-only envs serve the ```r channel instead)."""
+        """Select a prebuilt Python environment for this session.
+
+        A live worker is replaced build-first.  Before the first worker (or
+        after Stop), only the selection is persisted; selection never allocates
+        compute by itself.
+        """
         from openai4s.kernel import environments as envmod
 
         env = envmod.get_environment(env_name)
@@ -1701,18 +1766,18 @@ class SessionRunner:
         emit = self.hub.emitter(root_frame_id)
         with st.execution_barrier():
             st.pending_env = None
-            already = (
-                st.env_name == env_name
-                and st.kernels.alive("python")
-            )
+            alive = st.kernels.alive("python")
+            already = alive and st.env_name == env_name
             st.desired_env = env_name
             self._persist_env(root_frame_id, env_name)
-            if not already:
-                self._seed_messages(st)
+            if alive and not already:
                 lease = self._spawn_kernel(st)
             else:
                 lease = st.kernels.lease("python")
+                if not alive and st.dispatcher is not None:
+                    st.dispatcher.active_env_bin = env.bin_dir
             gen = lease.generation if lease is not None else 0
+            lifecycle = st.kernels.status("python")["state"]
             emit(
                 {
                     "type": "kernel_status",
@@ -1724,7 +1789,7 @@ class SessionRunner:
             )
         return {
             "ok": True,
-            "state": "running",
+            "state": lifecycle,
             "env": env_name,
             "generation": gen,
             "language": env.language,
@@ -1753,8 +1818,22 @@ class SessionRunner:
             # here beyond not treating it as a python switch.
             return
         st.desired_env = target
+        self._persist_env(st.root_frame_id, target)
+        if not st.kernels.alive("python"):
+            if st.dispatcher is not None:
+                st.dispatcher.active_env_bin = env.bin_dir
+            status = st.kernels.status("python")
+            emit(
+                {
+                    "type": "kernel_status",
+                    "frame_id": st.root_frame_id,
+                    "status": "env_changed",
+                    "generation": status["generation"],
+                    "env": self._env_summary(st),
+                }
+            )
+            return
         if target == st.env_name:
-            self._persist_env(st.root_frame_id, target)
             return
         lease = self._spawn_kernel(st)
         emit(
@@ -2162,8 +2241,11 @@ class SessionRunner:
         st.explore = bool(explore) and not st.plan
         emit = self.hub.emitter(root_frame_id)
         with st.execution_barrier():
-            self._ensure_kernel(st)
-            self._wire_delegation(st)
+            # Tool-only and plan turns need the control plane and provider
+            # history, not a scientific worker.  A CodeCell acquires its kernel
+            # later through CellExecutionService.prepare_language.
+            self._ensure_runtime(st)
+            self._seed_messages(st)
             self.store.update_frame(root_frame_id, status="processing")
             emit(
                 {
@@ -2821,7 +2903,8 @@ class SessionRunner:
         st = self._state(root_frame_id, project_id)
         emit = self.hub.emitter(root_frame_id)
         with st.execution_barrier():
-            self._ensure_kernel(st)
+            # CellExecutionService allocates the durable attempt before its
+            # prepare_language hook lazily starts Python.
             info = self._execute_and_log(st, code, "user", emit, stream=False)
             r = info["result"]
             emit(
