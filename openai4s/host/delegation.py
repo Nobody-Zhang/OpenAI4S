@@ -93,6 +93,11 @@ class DelegationService:
             system_prompt = (
                 agent.get("system_prompt") if agent else None
             ) or builtin_prompt
+            if agent:
+                # Profiles may grow richer than the current SQLite form. Keep
+                # every supported per-agent execution override on the delegate
+                # envelope, while an explicit call-site value always wins.
+                spec = _with_profile_overrides(spec, agent)
             if system_prompt:
                 request = spec.get("request")
                 persona = (
@@ -140,6 +145,26 @@ class DelegationService:
             if function
             else {"total": 0, "running": 0, "done": 0, "failed": 0}
         )
+
+
+def _with_profile_overrides(spec: dict, profile: dict) -> dict:
+    merged = dict(spec)
+    for source, target in (
+        ("model", "model"),
+        ("provider", "provider"),
+        ("steps", "steps"),
+        ("max_steps", "max_steps"),
+        ("max_turns", "max_turns"),
+        ("permissions", "permissions"),
+        ("capabilities", "capabilities"),
+        ("skill_names", "skill_names"),
+        ("skills", "skill_names"),
+        ("connectors", "connectors"),
+        ("unrestricted", "unrestricted"),
+    ):
+        if target not in merged and profile.get(source) is not None:
+            merged[target] = profile[source]
+    return merged
 
 
 __all__ = ["BUILTIN_SPECIALIST_PROMPTS", "DelegationService"]

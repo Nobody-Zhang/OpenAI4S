@@ -8,7 +8,9 @@ scientific execution.  Only ``host.submit_output(...)`` completes a task.
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass, field
+from typing import Any, Callable, Mapping, Sequence
 
 from openai4s.agent.engine import AgentEngine
 from openai4s.agent.runtime import (
@@ -113,6 +115,46 @@ Turn = TranscriptTurn
 _format_observation = format_observation
 
 
+class _CancellationAwareModel:
+    """Prevent a cancelled local Agent from executing a late model reply.
+
+    ``urllib`` cannot reliably abort a response already in flight.  Checking on
+    both sides of the blocking call still guarantees that cancellation starts
+    no *new* request and that a late reply cannot dispatch tools, code, or a
+    structured completion.  The engine observes cancellation immediately after
+    the resulting no-op outcome and exits with ``stop_reason=cancelled``.
+    """
+
+    def __init__(self, delegate: Any, cancelled: Callable[[], bool]) -> None:
+        self._delegate = delegate
+        self._cancelled = cancelled
+
+    def complete(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        on_delta: Callable[[str], None],
+    ) -> Mapping[str, Any]:
+        if self._is_cancelled():
+            return _cancelled_model_reply()
+        reply = self._delegate.complete(messages, on_delta)
+        return _cancelled_model_reply() if self._is_cancelled() else reply
+
+    def _is_cancelled(self) -> bool:
+        try:
+            return bool(self._cancelled())
+        except Exception:  # noqa: BLE001 - cancellation telemetry cannot crash a run
+            return False
+
+
+def _cancelled_model_reply() -> dict[str, Any]:
+    return {
+        "content": "",
+        "tool_calls": [],
+        "assistant_message": {"role": "assistant", "content": ""},
+        "finish_reason": "cancelled",
+    }
+
+
 @dataclass
 class Agent:
     cfg: Config = field(default_factory=get_config)
@@ -123,11 +165,20 @@ class Agent:
     allow_delegate: bool = True
     frame_id: str | None = None  # this agent's frame in the store
     delegate_depth: int = 0  # 0 = root; children carry depth+1
+    # Optional run-control seams used by delegated Agents. Standalone callers
+    # leave both unset and retain the exact historical behavior.
+    cancellation: object | None = field(default=None, repr=False)
+    context_policy: object | None = field(default=None, repr=False)
     _recorder: object | None = field(default=None, repr=False)
     # persistent R kernel for ```r cells — spawned lazily on first use,
     # retargeted when host.env.use() picks an R-only env, shut down with the run
     _r_kernel: object | None = field(default=None, repr=False)
     _r_kernel_env: str | None = field(default=None, repr=False)
+    _foreground_kernel: object | None = field(default=None, init=False, repr=False)
+    _foreground_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
+    _delegation_runner: object | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.max_turns is None:
@@ -150,22 +201,28 @@ class Agent:
         # our depth/frame so children nest correctly and steering
         # is scoped to our direct children.
         if self.allow_delegate:
-            from openai4s.agent.delegation import DelegationRunner
+            from openai4s.agent.delegation import MAX_DEPTH, DelegationRunner
 
-            runner = DelegationRunner(
-                self.cfg,
-                depth=self.delegate_depth,
-                parent_frame_id=self.frame_id,
-                store=self.dispatcher.store,
-            )
-            self.dispatcher._delegate_fn = runner
-            self.dispatcher.steer_fns = {
-                "children": runner.children,
-                "collect": runner.collect,
-                "stop_child": runner.stop_child,
-                "send_message": runner.send_message,
-                "delegation_stats": runner.delegation_stats,
-            }
+            # Defense in depth: depth-MAX_DEPTH Agents are leaves even when an
+            # embedder accidentally passes allow_delegate=True.
+            if self.delegate_depth < MAX_DEPTH:
+                runner = DelegationRunner(
+                    self.cfg,
+                    depth=self.delegate_depth,
+                    parent_frame_id=self.frame_id,
+                    store=self.dispatcher.store,
+                )
+                self._delegation_runner = runner
+                self.dispatcher._delegate_fn = runner
+                self.dispatcher.steer_fns = {
+                    "children": runner.children,
+                    "collect": runner.collect,
+                    "stop_child": runner.stop_child,
+                    "send_message": runner.send_message,
+                    "delegation_stats": runner.delegation_stats,
+                }
+            else:
+                self.allow_delegate = False
         # replay: only the ROOT agent records a tape (children replay as
         # part of the parent's flow, not independently).
         if is_root and self.cfg.record_tape:
@@ -248,6 +305,9 @@ class Agent:
         # An Agent can be reused.  A previous submission must never make the
         # next task appear complete before its own scientific cell submits.
         self.dispatcher.last_output = None
+        if self._cancelled():
+            self._close_run()
+            return self._finish([], None, "cancelled")
         messages: list[dict] = [
             {"role": "system", "content": self._system_prompt()},
             {"role": "user", "content": task},
@@ -261,31 +321,48 @@ class Agent:
         )
         try:
             with Kernel(dispatcher=self.dispatcher, cwd=run_cwd) as kernel:
-                if self._skill_loader is not None:
-                    boot = self._skill_loader.bootstrap_code()
-                    if boot.strip():
-                        kernel.execute(boot, origin="agent")
-                engine = AgentEngine(
-                    ChatModel(
+                with self._foreground_lock:
+                    self._foreground_kernel = kernel
+                try:
+                    if self._skill_loader is not None and not self._cancelled():
+                        boot = self._skill_loader.bootstrap_code()
+                        if boot.strip():
+                            kernel.execute(boot, origin="agent")
+                    model: Any = ChatModel(
                         self.cfg.llm,
                         chat,
                         tools=control_tool_specs(),
-                    ),
-                    LocalActionExecutor(
-                        kernel,
-                        self.dispatcher,
-                        self._pre_exec_gate,
-                        self._execute_r,
-                        log=self._log,
-                    ),
-                    context_policy=CompactionPolicy(self.cfg, log=self._log),
-                    event_sink=TranscriptEventSink(transcript, log=self._log),
-                    completion=CompletionSignal(
-                        lambda: self.dispatcher.last_output
-                    ),
-                    max_turns=self.max_turns,
-                )
-                result = engine.run(messages)
+                    )
+                    if self.cancellation is not None:
+                        model = _CancellationAwareModel(
+                            model,
+                            lambda: bool(self.cancellation.cancelled()),
+                        )
+                    engine = AgentEngine(
+                        model,
+                        LocalActionExecutor(
+                            kernel,
+                            self.dispatcher,
+                            self._pre_exec_gate,
+                            self._execute_r,
+                            log=self._log,
+                        ),
+                        context_policy=(
+                            self.context_policy
+                            or CompactionPolicy(self.cfg, log=self._log)
+                        ),
+                        event_sink=TranscriptEventSink(transcript, log=self._log),
+                        cancellation=self.cancellation,
+                        completion=CompletionSignal(
+                            lambda: self.dispatcher.last_output
+                        ),
+                        max_turns=self.max_turns,
+                    )
+                    result = engine.run(messages)
+                finally:
+                    with self._foreground_lock:
+                        if self._foreground_kernel is kernel:
+                            self._foreground_kernel = None
         finally:
             self._close_run()
 
@@ -317,8 +394,15 @@ class Agent:
                 k = spawn_r_kernel(env=get_environment(want_env))
             except Exception as e:  # noqa: BLE001 — soft-fail into the observation
                 return {"error": f"R kernel unavailable: {e}"}
-            self._r_kernel = k
-            self._r_kernel_env = want_env
+            with self._foreground_lock:
+                self._r_kernel = k
+                self._r_kernel_env = want_env
+        if self.cancellation is not None:
+            try:
+                if self.cancellation.cancelled():
+                    return {"error": "Interrupted", "interrupted": True}
+            except Exception:  # noqa: BLE001 - cancellation probe is best effort
+                pass
         try:
             return k.execute(code, origin="agent")
         except Exception as e:  # noqa: BLE001 — dead worker: drop it, soft-fail
@@ -326,14 +410,46 @@ class Agent:
             return {"error": f"R kernel failed: {e}"}
 
     def _shutdown_r_kernel(self) -> None:
-        k = self._r_kernel
-        self._r_kernel = None
-        self._r_kernel_env = None
+        with self._foreground_lock:
+            k = self._r_kernel
+            self._r_kernel = None
+            self._r_kernel_env = None
         if k is not None:
             try:
                 k.shutdown()
             except Exception:  # noqa: BLE001
                 pass
+
+    def interrupt_foreground(self) -> bool:
+        """Interrupt only this Agent's current Python/R worker(s).
+
+        This is the narrow exact-owner seam used by ``stop_child``.  It never
+        reaches a process-global kernel registry, and it snapshots references
+        under a lock before making the potentially blocking signal calls.
+        """
+
+        with self._foreground_lock:
+            workers = [self._foreground_kernel, self._r_kernel]
+        delivered = False
+        seen: set[int] = set()
+        for worker in workers:
+            if worker is None or id(worker) in seen:
+                continue
+            seen.add(id(worker))
+            try:
+                worker.interrupt()
+                delivered = True
+            except Exception:  # noqa: BLE001 - interruption is best effort
+                continue
+        return delivered
+
+    def _cancelled(self) -> bool:
+        if self.cancellation is None:
+            return False
+        try:
+            return bool(self.cancellation.cancelled())
+        except Exception:  # noqa: BLE001 - cancellation probe is best effort
+            return False
 
     def _finish(
         self, transcript: list[Turn], final_reply: str | None, reason: str
@@ -349,6 +465,11 @@ class Agent:
     def _close_run(self) -> None:
         """Release run-scoped runtimes and persist the optional replay tape."""
         self._shutdown_r_kernel()
+        if self._delegation_runner is not None and self._cancelled():
+            try:
+                self._delegation_runner.cancel_all("parent agent cancelled")
+            except Exception:  # noqa: BLE001 - cancellation cleanup is best effort
+                pass
         if self._recorder is not None:
             try:
                 self._recorder.flush()  # type: ignore[attr-defined]

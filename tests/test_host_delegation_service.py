@@ -45,6 +45,50 @@ def test_delegate_injects_profile_into_string_without_mutating_input():
     assert submitted[0]["context"] is original["context"]
 
 
+def test_delegate_profile_overrides_fill_defaults_without_overwriting_call_site():
+    submitted = []
+    store = FakeStore(
+        {
+            "SCOUT": {
+                "system_prompt": "Scout carefully.",
+                "model": "profile-model",
+                "steps": 6,
+                "permissions": {"write_file": "deny"},
+                "capabilities": ["web", "read_file"],
+                "skill_names": ["literature-review"],
+                "connectors": ["crossref"],
+                "unrestricted": False,
+            }
+        }
+    )
+    service = DelegationService(
+        delegate=lambda spec: submitted.append(spec) or "ok",
+        steering={},
+        store=store,
+    )
+
+    original = {
+        "name": "SCOUT",
+        "request": "Find sources.",
+        "model": "call-site-model",
+    }
+    assert service.delegate(original) == "ok"
+
+    sent = submitted[0]
+    assert sent["model"] == "call-site-model"
+    assert sent["steps"] == 6
+    assert sent["permissions"] == {"write_file": "deny"}
+    assert sent["capabilities"] == ["web", "read_file"]
+    assert sent["skill_names"] == ["literature-review"]
+    assert sent["connectors"] == ["crossref"]
+    assert sent["unrestricted"] is False
+    assert original == {
+        "name": "SCOUT",
+        "request": "Find sources.",
+        "model": "call-site-model",
+    }
+
+
 def test_delegate_injects_nested_request_and_uses_builtin_on_store_failure():
     submitted = []
     store = FakeStore(error=RuntimeError("database unavailable"))
