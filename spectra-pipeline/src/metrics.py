@@ -1,4 +1,8 @@
-"""Spectral similarity metrics and evaluation-vs-ground-truth metrics."""
+"""Spectral similarity metrics used for matching and reconstruction quality.
+
+Ground-truth evaluation metrics (precision/recall/F1, fraction MAE) live in
+``src/evaluate.py`` — they are only used once, after the blind loop.
+"""
 from __future__ import annotations
 
 import numpy as np
@@ -30,23 +34,3 @@ def sid(a: np.ndarray, b: np.ndarray) -> float:
     q = np.clip(b, eps, None); q = q / q.sum()
     return float(np.sum(p * np.log(p / q) + q * np.log(q / p)))
 
-
-# ---------------------------------------------------------------------------
-# Evaluation vs ground truth (only used to score/validate, not inside blind fit)
-# ---------------------------------------------------------------------------
-def component_prf(true_names, pred_names):
-    """Precision / recall / F1 on the set of identified components."""
-    t, p = set(true_names), set(pred_names)
-    tp = len(t & p)
-    precision = tp / len(p) if p else 0.0
-    recall = tp / len(t) if t else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
-    return {"precision": precision, "recall": recall, "f1": f1}
-
-
-def fraction_mae(true_map: dict, pred_map: dict) -> float:
-    """Mean absolute error of fractions over the union of components."""
-    keys = set(true_map) | set(pred_map)
-    if not keys:
-        return 0.0
-    return float(np.mean([abs(true_map.get(k, 0.0) - pred_map.get(k, 0.0)) for k in keys]))
