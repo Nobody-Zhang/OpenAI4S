@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any
 
 from openai4s.storage.annotations import AnnotationRepository
+from openai4s.storage.connectors import ConnectorRepository
 from openai4s.storage.memories import MemoryRepository
 from openai4s.storage.permissions import (
     DEFAULT_PERMISSION_RULES as _DEFAULT_PERMISSION_RULES,
@@ -427,6 +428,11 @@ class Store:
             clock_ms=lambda: _now_ms(),
             get_setting=self.get_setting,
             set_setting=self.set_setting,
+        )
+        self._connectors = ConnectorRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
         )
 
     # --- migration (add columns missing from a pre-existing DB) -----------
@@ -2423,29 +2429,10 @@ class Store:
 
     # --- connectors (MCP servers) ---------------------------------------
     def list_connectors(self) -> list[dict]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT connector_id,name,description,command,args,env,enabled,"
-                "created_at,updated_at FROM connectors ORDER BY name"
-            ).fetchall()
-        out = []
-        for r in rows:
-            d = dict(r)
-            d["enabled"] = bool(d["enabled"])
-            for k in ("command", "args", "env"):
-                if d.get(k):
-                    try:
-                        d[k] = json.loads(d[k])
-                    except (ValueError, TypeError):
-                        pass
-            out.append(d)
-        return out
+        return self._connectors.list()
 
     def get_connector(self, connector_id: str) -> dict | None:
-        for c in self.list_connectors():
-            if c["connector_id"] == connector_id:
-                return c
-        return None
+        return self._connectors.get(connector_id)
 
     def upsert_connector(
         self,
@@ -2458,43 +2445,21 @@ class Store:
         env=None,
         enabled: bool = True,
     ) -> dict:
-        now = _now_ms()
-        exists = self.get_connector(connector_id) is not None
-        cmd = json.dumps(command)
-        a = json.dumps(args or [])
-        e = json.dumps(env or {})
-        if exists:
-            self._exec(
-                "UPDATE connectors SET name=?,description=?,command=?,args=?,"
-                "env=?,enabled=?,updated_at=? WHERE connector_id=?",
-                (name, description, cmd, a, e, 1 if enabled else 0, now, connector_id),
-            )
-        else:
-            self._exec(
-                "INSERT INTO connectors(connector_id,name,description,command,"
-                "args,env,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                (
-                    connector_id,
-                    name,
-                    description,
-                    cmd,
-                    a,
-                    e,
-                    1 if enabled else 0,
-                    now,
-                    now,
-                ),
-            )
-        return self.get_connector(connector_id) or {"connector_id": connector_id}
-
-    def set_connector_enabled(self, connector_id: str, enabled: bool) -> None:
-        self._exec(
-            "UPDATE connectors SET enabled=?,updated_at=? " "WHERE connector_id=?",
-            (1 if enabled else 0, _now_ms(), connector_id),
+        return self._connectors.upsert(
+            connector_id=connector_id,
+            name=name,
+            command=command,
+            description=description,
+            args=args,
+            env=env,
+            enabled=enabled,
         )
 
+    def set_connector_enabled(self, connector_id: str, enabled: bool) -> None:
+        self._connectors.set_enabled(connector_id, enabled)
+
     def delete_connector(self, connector_id: str) -> None:
-        self._exec("DELETE FROM connectors WHERE connector_id=?", (connector_id,))
+        self._connectors.delete(connector_id)
 
     # --- compaction ------------------------------------------------------
     def archive_compaction(
