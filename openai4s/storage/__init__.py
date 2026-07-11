@@ -18,7 +18,9 @@ from openai4s.storage.metadata import (
 )
 from openai4s.storage.permissions import PermissionRuleRepository
 from openai4s.storage.plans import PlanRepository
+from openai4s.storage.recovery import RecoveryJournalRepository
 from openai4s.storage.settings import SettingsRepository
+from openai4s.storage.snapshots import SessionSnapshotRepository, WorkspaceCAS
 
 __all__ = [
     "ActionLedgerRepository",
@@ -37,5 +39,8 @@ __all__ = [
     "NotesRepository",
     "PermissionRuleRepository",
     "PlanRepository",
+    "RecoveryJournalRepository",
+    "SessionSnapshotRepository",
     "SettingsRepository",
+    "WorkspaceCAS",
 ]

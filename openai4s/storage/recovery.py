@@ -124,6 +124,7 @@ class RecoveryJournalRepository:
         root_frame_id: str | None = None,
         branch_id: str | None = None,
         limit: int = 1000,
+        newest: bool = False,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -138,11 +139,16 @@ class RecoveryJournalRepository:
         sql = "SELECT * FROM recovery_journal"
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY created_at,sequence,entry_id LIMIT ?"
+        sql += (
+            " ORDER BY created_at DESC,sequence DESC,entry_id DESC LIMIT ?"
+            if newest
+            else " ORDER BY created_at,sequence,entry_id LIMIT ?"
+        )
         params.append(max(1, min(int(limit), 10_000)))
         with self._lock:
             rows = self._connection.execute(sql, params).fetchall()
-        return [self._decode(row) for row in rows]
+        decoded = [self._decode(row) for row in rows]
+        return list(reversed(decoded)) if newest else decoded
 
     @staticmethod
     def _text(name: str, value: str) -> str:

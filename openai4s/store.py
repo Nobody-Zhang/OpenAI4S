@@ -65,7 +65,9 @@ from openai4s.storage.permissions import (
 from openai4s.storage.permissions import PermissionRuleRepository
 from openai4s.storage.permissions import perm_match as _perm_match
 from openai4s.storage.plans import PlanRepository
+from openai4s.storage.recovery import RecoveryJournalRepository
 from openai4s.storage.settings import SettingsRepository
+from openai4s.storage.snapshots import SessionSnapshotRepository
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS frames (
@@ -434,6 +436,10 @@ QUERY_DENYLIST = frozenset(
         "capability_states",
         "capability_events",
         "capability_manifests",
+        "session_branches",
+        "session_checkpoints",
+        "snapshot_operations",
+        "recovery_journal",
     }
 )
 
@@ -478,6 +484,16 @@ class Store:
             clock_ms=lambda: _now_ms(),
         )
         self._kernel_generations = KernelGenerationRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
+        self._session_snapshots = SessionSnapshotRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
+        self._recovery_journal = RecoveryJournalRepository(
             self._conn,
             self._lock,
             clock_ms=lambda: _now_ms(),
@@ -1172,6 +1188,82 @@ class Store:
             branch_id=branch_id,
         )
 
+    # --- immutable session checkpoints / branches ----------------------
+    def ensure_session_branch(self, **fields: Any) -> dict:
+        return self._session_snapshots.ensure_branch(**fields)
+
+    def create_session_checkpoint(self, **fields: Any) -> dict:
+        return self._session_snapshots.create_checkpoint(**fields)
+
+    def fork_session_branch(self, **fields: Any) -> dict:
+        return self._session_snapshots.fork_branch(**fields)
+
+    def get_session_checkpoint(self, checkpoint_id: str) -> dict | None:
+        return self._session_snapshots.get_checkpoint(checkpoint_id)
+
+    def list_session_checkpoints(
+        self,
+        root_frame_id: str,
+        *,
+        branch_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        return self._session_snapshots.list_checkpoints(
+            root_frame_id,
+            branch_id=branch_id,
+            limit=limit,
+        )
+
+    def get_session_branch(self, branch_id: str) -> dict | None:
+        return self._session_snapshots.get_branch(branch_id)
+
+    def list_session_branches(self, root_frame_id: str) -> list[dict]:
+        return self._session_snapshots.list_branches(root_frame_id)
+
+    def record_snapshot_operation(self, **fields: Any) -> dict:
+        return self._session_snapshots.record_operation(**fields)
+
+    def get_snapshot_operation(self, operation_id: str) -> dict | None:
+        return self._session_snapshots.get_operation(operation_id)
+
+    def list_snapshot_operations(
+        self,
+        root_frame_id: str,
+        *,
+        branch_id: str | None = None,
+        kind: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        return self._session_snapshots.list_operations(
+            root_frame_id,
+            branch_id=branch_id,
+            kind=kind,
+            status=status,
+            limit=limit,
+        )
+
+    # --- append-only Kernel recovery journal ---------------------------
+    def append_recovery_event(self, **fields: Any) -> dict:
+        return self._recovery_journal.append(**fields)
+
+    def list_recovery_events(
+        self,
+        *,
+        recovery_id: str | None = None,
+        root_frame_id: str | None = None,
+        branch_id: str | None = None,
+        limit: int = 1000,
+        newest: bool = False,
+    ) -> list[dict]:
+        return self._recovery_journal.list(
+            recovery_id=recovery_id,
+            root_frame_id=root_frame_id,
+            branch_id=branch_id,
+            limit=limit,
+            newest=newest,
+        )
+
     def delete_frame(self, frame_id: str) -> None:
         self._frames.delete_frame(frame_id)
 
@@ -1729,6 +1821,19 @@ class Store:
             project_id=project_id,
             session_id=session_id,
         ).snapshot(kind, names)
+
+    def list_explicit_capability_states(
+        self,
+        kind: str | None = None,
+        *,
+        scope: str | None = None,
+        scope_id: str | None = None,
+    ) -> list[dict]:
+        return self._capability_repository.explicit_states(
+            kind,
+            scope=scope,
+            scope_id=scope_id,
+        )
 
     def list_agents(
         self,

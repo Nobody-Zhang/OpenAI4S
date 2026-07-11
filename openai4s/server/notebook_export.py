@@ -80,11 +80,12 @@ class NotebookExportService:
     def bundle(self, root_frame_id: str) -> bytes:
         """Return a stable ZIP with separate Python and R notebooks."""
 
+        stem = self._safe_stem(root_frame_id)
         documents = {
-            f"{root_frame_id}.python.ipynb": self._encode(
+            f"{stem}.python.ipynb": self._encode(
                 self.notebook(root_frame_id, "python")
             ),
-            f"{root_frame_id}.r.ipynb": self._encode(
+            f"{stem}.r.ipynb": self._encode(
                 self.notebook(root_frame_id, "r")
             ),
         }
@@ -111,6 +112,30 @@ class NotebookExportService:
                 info.external_attr = 0o600 << 16
                 archive.writestr(info, data)
         return output.getvalue()
+
+    def export(
+        self, root_frame_id: str, *, language: str | None = None
+    ) -> dict[str, Any]:
+        """Return immutable bytes plus the exact HTTP descriptor Gateway needs."""
+
+        stem = self._safe_stem(root_frame_id)
+        if language is None or str(language).lower() == "bundle":
+            data = self.bundle(root_frame_id)
+            filename = f"{stem}.notebooks.zip"
+            content_type = "application/zip"
+        else:
+            normalized = str(language).lower()
+            data = self._encode(self.notebook(root_frame_id, normalized))
+            filename = f"{stem}.{normalized}.ipynb"
+            content_type = "application/x-ipynb+json"
+        return {
+            "filename": filename,
+            "content_type": content_type,
+            "data": data,
+            "size_bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "immutable": True,
+        }
 
     @classmethod
     def _cell(cls, cell: Mapping[str, Any], *, revision: int) -> dict[str, Any]:
@@ -198,6 +223,17 @@ class NotebookExportService:
         return (
             json.dumps(value, ensure_ascii=False, sort_keys=True, indent=1) + "\n"
         ).encode("utf-8")
+
+    @staticmethod
+    def _safe_stem(value: str) -> str:
+        stem = "".join(
+            character
+            for character in str(value or "")
+            if character.isalnum() or character in "-_"
+        )
+        if not stem:
+            raise ValueError("root_frame_id must contain a safe filename character")
+        return stem[:120]
 
 
 __all__ = ["CellStore", "NotebookExportService"]

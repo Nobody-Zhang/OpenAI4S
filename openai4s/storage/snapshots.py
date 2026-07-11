@@ -540,6 +540,8 @@ class SessionSnapshotRepository:
         checkpoint_id = self._text(
             "checkpoint_id", checkpoint_id or f"cp-{uuid.uuid4().hex[:16]}"
         )
+        if workspace_tree_id is not None:
+            self._sha256("workspace_tree_id", workspace_tree_id)
         self.ensure_branch(root_frame_id=root_frame_id, branch_id=branch_id)
         now = self._clock_ms()
         with self._lock:
@@ -556,6 +558,10 @@ class SessionSnapshotRepository:
                 )
             if parent_checkpoint_id is None:
                 parent_checkpoint_id = current_head
+            elif parent_checkpoint_id != current_head:
+                raise ValueError(
+                    "parent checkpoint must be the branch's current head"
+                )
             try:
                 self._connection.execute(
                     "INSERT INTO session_checkpoints("
@@ -617,22 +623,26 @@ class SessionSnapshotRepository:
         )
         now = self._clock_ms()
         with self._lock:
-            self._connection.execute(
-                "INSERT INTO session_branches("
-                "branch_id,root_frame_id,parent_branch_id,base_checkpoint_id,"
-                "head_checkpoint_id,name,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?)",
-                (
-                    branch_id,
-                    root_frame_id,
-                    checkpoint["branch_id"],
-                    from_checkpoint_id,
-                    from_checkpoint_id,
-                    name,
-                    now,
-                    now,
-                ),
-            )
+            try:
+                self._connection.execute(
+                    "INSERT INTO session_branches("
+                    "branch_id,root_frame_id,parent_branch_id,base_checkpoint_id,"
+                    "head_checkpoint_id,name,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        branch_id,
+                        root_frame_id,
+                        checkpoint["branch_id"],
+                        from_checkpoint_id,
+                        from_checkpoint_id,
+                        name,
+                        now,
+                        now,
+                    ),
+                )
+            except Exception:
+                self._connection.rollback()
+                raise
             self._connection.commit()
         result = self.get_branch(branch_id)
         if result is None:
@@ -701,6 +711,25 @@ class SessionSnapshotRepository:
         )
         now = self._clock_ms()
         with self._lock:
+            branch = self._connection.execute(
+                "SELECT root_frame_id FROM session_branches WHERE branch_id=?",
+                (branch_id,),
+            ).fetchone()
+            if branch is None or branch["root_frame_id"] != root_frame_id:
+                raise ValueError("snapshot operation branch/session mismatch")
+            for checkpoint_id in (source_checkpoint_id, target_checkpoint_id):
+                if checkpoint_id is None:
+                    continue
+                checkpoint = self._connection.execute(
+                    "SELECT root_frame_id FROM session_checkpoints "
+                    "WHERE checkpoint_id=?",
+                    (checkpoint_id,),
+                ).fetchone()
+                if (
+                    checkpoint is None
+                    or checkpoint["root_frame_id"] != root_frame_id
+                ):
+                    raise ValueError("snapshot operation checkpoint mismatch")
             self._connection.execute(
                 "INSERT INTO snapshot_operations("
                 "operation_id,root_frame_id,branch_id,kind,source_checkpoint_id,"
@@ -729,6 +758,44 @@ class SessionSnapshotRepository:
         result["preview"] = self._load(result["preview"], {})
         return result
 
+    def get_operation(self, operation_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM snapshot_operations WHERE operation_id=?",
+                (operation_id,),
+            ).fetchone()
+        return self._decode_operation(row) if row else None
+
+    def list_operations(
+        self,
+        root_frame_id: str,
+        *,
+        branch_id: str | None = None,
+        kind: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        root_frame_id = self._text("root_frame_id", root_frame_id)
+        clauses = ["root_frame_id=?"]
+        params: list[Any] = [root_frame_id]
+        for column, value in (
+            ("branch_id", branch_id),
+            ("kind", kind),
+            ("status", status),
+        ):
+            if value is not None:
+                clauses.append(f"{column}=?")
+                params.append(self._text(column, value))
+        params.append(max(1, min(int(limit), 1000)))
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM snapshot_operations WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY created_at DESC,operation_id DESC LIMIT ?",
+                tuple(params),
+            ).fetchall()
+        return [self._decode_operation(row) for row in rows]
+
     @staticmethod
     def _text(name: str, value: str) -> str:
         if not isinstance(value, str) or not value.strip():
@@ -741,6 +808,16 @@ class SessionSnapshotRepository:
             return None
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError("checkpoint cursors must be non-negative integers")
+        return value
+
+    @staticmethod
+    def _sha256(name: str, value: str) -> str:
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError(f"{name} must be a lowercase SHA-256 digest")
         return value
 
     @staticmethod
@@ -767,6 +844,12 @@ class SessionSnapshotRepository:
             ("metadata", {}),
         ):
             result[key] = cls._load(result.get(key), default)
+        return result
+
+    @classmethod
+    def _decode_operation(cls, row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        result["preview"] = cls._load(result.get("preview"), {})
         return result
 
 

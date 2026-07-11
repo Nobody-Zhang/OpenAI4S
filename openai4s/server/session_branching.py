@@ -101,12 +101,24 @@ class SessionBranchingService:
         name: str | None = None,
     ) -> dict[str, Any]:
         source = self._checkpoint(root_frame_id, from_checkpoint_id)
+        branch_id = branch_id or f"br-{uuid.uuid4().hex[:16]}"
+        materialized = self._materialize_fork_workspace(
+            root_frame_id,
+            source_branch_id=str(source["branch_id"]),
+            branch_id=branch_id,
+            tree_id=source.get("workspace_tree_id"),
+        )
         created = self.repository.fork_branch(
             root_frame_id=root_frame_id,
             from_checkpoint_id=source["checkpoint_id"],
-            branch_id=branch_id or f"br-{uuid.uuid4().hex[:16]}",
+            branch_id=branch_id,
             name=name,
         )
+        created = {
+            **created,
+            "workspace_tree_id": source.get("workspace_tree_id"),
+            **materialized,
+        }
         self._emit(
             {
                 "type": "branch_created",
@@ -116,6 +128,37 @@ class SessionBranchingService:
             }
         )
         return created
+
+    def _materialize_fork_workspace(
+        self,
+        root_frame_id: str,
+        *,
+        source_branch_id: str,
+        branch_id: str,
+        tree_id: str | None,
+    ) -> dict[str, Any]:
+        source = Path(self._workspace(root_frame_id, source_branch_id)).resolve()
+        destination = Path(self._workspace(root_frame_id, branch_id)).resolve()
+        if destination == source:
+            return {
+                "workspace_isolated": False,
+                "workspace_materialized": False,
+            }
+        if destination.exists() and any(destination.iterdir()):
+            raise RuntimeError("fork workspace already exists and is not empty")
+        destination.mkdir(parents=True, exist_ok=True)
+        if not tree_id:
+            return {
+                "workspace_isolated": True,
+                "workspace_materialized": False,
+            }
+        restored = self.cas.restore(tree_id, destination)
+        if not restored.get("applied"):
+            raise RuntimeError("fork workspace could not be materialized safely")
+        return {
+            "workspace_isolated": True,
+            "workspace_materialized": True,
+        }
 
     def preview_revert(
         self,
@@ -205,7 +248,18 @@ class SessionBranchingService:
                 ),
                 finished=True,
             )
-            return {"ok": False, "operation": operation, "preview": preview}
+            result = {"ok": False, "operation": operation, "preview": preview}
+            self._emit(
+                {
+                    "type": "branch_revert_conflict",
+                    "root_frame_id": root_frame_id,
+                    "branch_id": branch_id,
+                    "operation_id": operation_id,
+                    "target_checkpoint_id": target_checkpoint_id,
+                    "reason": operation.get("error"),
+                }
+            )
+            return result
 
         current_id = preview["current_checkpoint_id"]
         # Capturing at operation time catches an edit that raced the preview.
@@ -242,7 +296,18 @@ class SessionBranchingService:
                 error="workspace changed while preparing revert",
                 finished=True,
             )
-            return {"ok": False, "operation": operation, "preview": preview}
+            result = {"ok": False, "operation": operation, "preview": preview}
+            self._emit(
+                {
+                    "type": "branch_revert_conflict",
+                    "root_frame_id": root_frame_id,
+                    "branch_id": branch_id,
+                    "operation_id": operation_id,
+                    "target_checkpoint_id": target_checkpoint_id,
+                    "reason": operation.get("error"),
+                }
+            )
+            return result
         applied = self.cas.restore(
             target["workspace_tree_id"],
             workspace,
@@ -264,7 +329,18 @@ class SessionBranchingService:
                 error="workspace changed while applying revert",
                 finished=True,
             )
-            return {"ok": False, "operation": operation, "preview": preview}
+            result = {"ok": False, "operation": operation, "preview": preview}
+            self._emit(
+                {
+                    "type": "branch_revert_conflict",
+                    "root_frame_id": root_frame_id,
+                    "branch_id": branch_id,
+                    "operation_id": operation_id,
+                    "target_checkpoint_id": target_checkpoint_id,
+                    "reason": operation.get("error"),
+                }
+            )
+            return result
 
         reverted = self.repository.create_checkpoint(
             root_frame_id=root_frame_id,
@@ -352,6 +428,11 @@ class SessionBranchingService:
         metadata.update(dict(request.metadata or {}))
         if tree.get("skipped"):
             metadata["workspace_skipped"] = tree["skipped"]
+        recovery_recipe = self._checkpoint_recipe(
+            state.get("recovery_recipe"),
+            tree_id=tree["tree_id"],
+            artifact_versions=state.get("artifact_versions") or [],
+        )
         checkpoint = self.repository.create_checkpoint(
             root_frame_id=request.root_frame_id,
             branch_id=request.branch_id,
@@ -365,7 +446,7 @@ class SessionBranchingService:
             generation_refs=state.get("generation_refs") or {},
             capability_state=state.get("capability_state") or {},
             permission_state=state.get("permission_state") or {},
-            recovery_recipe=state.get("recovery_recipe") or {},
+            recovery_recipe=recovery_recipe,
             metadata=metadata,
             expected_head=request.expected_head,
         )
@@ -379,6 +460,48 @@ class SessionBranchingService:
             }
         )
         return checkpoint
+
+    @staticmethod
+    def _checkpoint_recipe(
+        value: Any,
+        *,
+        tree_id: str,
+        artifact_versions: list[Any],
+    ) -> dict[str, Any]:
+        """Bind hydration inputs to this exact immutable checkpoint.
+
+        Existing replay steps are retained but never upgraded to replay-safe;
+        the recovery orchestrator still applies its own fail-closed classifier.
+        """
+
+        recipe = dict(value) if isinstance(value, Mapping) else {}
+        original_steps = [
+            dict(step)
+            for step in (recipe.get("steps") or ())
+            if isinstance(step, Mapping)
+            and step.get("kind") not in {"hydrate_workspace", "hydrate_artifact"}
+        ]
+        hydration = [
+            {
+                "kind": "hydrate_workspace",
+                "payload": {"tree_id": tree_id},
+                "replay_policy": "never",
+            }
+        ]
+        hydration.extend(
+            {
+                "kind": "hydrate_artifact",
+                "payload": {"version_id": str(version_id)},
+                "replay_policy": "never",
+            }
+            for version_id in artifact_versions
+        )
+        recipe["version"] = 1
+        recipe["steps"] = hydration + original_steps
+        recipe.setdefault("required_symbols", {})
+        recipe.setdefault("artifact_hashes", {})
+        recipe.setdefault("environment_requirements", {})
+        return recipe
 
     def _branch(self, root_frame_id: str, branch_id: str) -> dict[str, Any]:
         branch = self.repository.get_branch(branch_id)
