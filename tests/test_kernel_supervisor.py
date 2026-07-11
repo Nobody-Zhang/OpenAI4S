@@ -1,6 +1,7 @@
 """Lifecycle contracts for the protocol-neutral kernel supervisor."""
 
 import threading
+import uuid
 
 import pytest
 
@@ -114,6 +115,50 @@ def test_reused_slot_refreshes_factory_for_a_later_start():
 
     assert started.kernel is refreshed[0]
     assert len(original) == len(refreshed) == 1
+
+
+def test_verified_candidate_publish_is_exact_and_installs_restart_factory():
+    supervisor = KernelSupervisor()
+    original: list[FakeKernel] = []
+    future: list[FakeKernel] = []
+    current = supervisor.ensure("python", "base", _factory(original, "old"))
+    candidate = FakeKernel("verified")
+
+    published = supervisor.publish_candidate(
+        "python",
+        "science",
+        candidate,
+        factory=_factory(future, "recovered"),
+        generation_id=str(uuid.uuid4()),
+        expected=current,
+    )
+
+    assert published.kernel is candidate
+    assert current.kernel.shutdown_calls == 1
+    supervisor.stop("python")
+    restarted = supervisor.restart("python")
+    assert restarted.kernel is future[0]
+
+
+def test_candidate_publish_rejects_a_stale_expected_lease_without_replacement():
+    supervisor = KernelSupervisor()
+    created: list[FakeKernel] = []
+    stale = supervisor.ensure("python", "base", _factory(created, "old"))
+    current = supervisor.ensure("python", "new", _factory(created, "new"))
+    candidate = FakeKernel("candidate")
+
+    with pytest.raises(RuntimeError, match="changed before recovery publish"):
+        supervisor.publish_candidate(
+            "python",
+            "science",
+            candidate,
+            factory=lambda: FakeKernel("future"),
+            generation_id=str(uuid.uuid4()),
+            expected=stale,
+        )
+
+    assert supervisor.lease("python") == current
+    assert candidate.live is True
 
 
 def test_restart_stop_and_start_keep_a_monotonic_session_generation():

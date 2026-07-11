@@ -81,6 +81,14 @@ from openai4s.server.plans import normalize_plan as _normalize_plan
 from openai4s.server.plans import public_plan as _plan_public
 from openai4s.server.plans import short_hash as _short_hash
 from openai4s.server.plans import slugify as _slugify
+from openai4s.server.recovery_control import RecoveryActionError
+from openai4s.server.recovery_runtime import (
+    RecoveryRuntimePorts,
+    SessionRecoveryRuntime,
+    bootstrap_python_generation,
+    bootstrap_r_generation,
+    python_runtime_spec,
+)
 from openai4s.server.reviews import ReviewPorts, ReviewService
 from openai4s.server.session_domain import SessionDomainService
 from openai4s.server.session_recovery import PROCESS_INSTANCE_ID, SessionRecoveryService
@@ -1368,6 +1376,107 @@ class SessionRunner:
             )
             return result
 
+    def execute_recovery_action(
+        self,
+        root_frame_id: str,
+        project_id: str,
+        action_id: str,
+        *,
+        branch_id: str | None = None,
+        confirmed: bool = False,
+    ) -> dict:
+        """Run one enabled recovery mutation under an exact FIFO ticket."""
+
+        st = self._state(root_frame_id, project_id)
+        branch_id = branch_id or root_frame_id
+        if branch_id != root_frame_id:
+            # Branch workspaces exist, but the live SessionState/Supervisor is
+            # still rooted at the canonical branch.  Publishing a candidate
+            # against that other workspace would falsely claim a branch switch.
+            raise RecoveryActionError(
+                "live recovery for a non-current branch is unavailable"
+            )
+        owner_id = f"{action_id}-{uuid.uuid4().hex[:12]}"
+        emit = self.hub.emitter(root_frame_id)
+        with self._session_execution(
+            st,
+            owner="recovery",
+            owner_id=owner_id,
+            reason=f"kernel recovery: {action_id}",
+        ) as execution:
+            runtime = self._recovery_runtime(st, emit)
+            fresh = (
+                runtime.fresh_manifests()
+                if action_id == "restart_fresh"
+                else ()
+            )
+            # Re-check enabled/confirmation after FIFO admission, before
+            # recovery_scope changes any live generation state.
+            plan = self.session_domain.recovery.prepare_action(
+                root_frame_id,
+                action_id,
+                branch_id=branch_id,
+                confirmed=confirmed,
+                fresh_manifests=fresh,
+            )
+            with self.recovery.recovery_scope(st):
+                result = runtime.run(plan)
+                self.executions.mark_finalizing(
+                    execution, reason="publishing recovery state"
+                )
+                emit(runtime.kernel_status_event(result, plan.recovery_id))
+            result.update(
+                {
+                    "execution_id": execution.execution_id,
+                    "owner": execution.owner.as_dict(),
+                }
+            )
+            return result
+
+    def _recovery_runtime(self, st: SessionState, emit) -> SessionRecoveryRuntime:
+        from openai4s.kernel import environments as envmod
+
+        def python_runtime():
+            environment = envmod.get_environment(self._selected_env_name(st))
+            if environment is None or environment.interpreter is None:
+                environment = envmod.get_environment("base")
+            if environment is None or environment.interpreter is None:
+                raise RecoveryActionError("no Python runtime is available")
+            return python_runtime_spec(environment)
+
+        def python_published(name, factory, bin_dir) -> None:
+            st.env_name = st.desired_env = name
+            st.booted = True
+            dispatcher = self._ensure_runtime(st)
+            dispatcher.active_env_bin = bin_dir
+            dispatcher.background_kernel_factory = factory
+            self._persist_env(st.root_frame_id, name)
+
+        return SessionRecoveryRuntime(
+            RecoveryRuntimePorts(
+                root_frame_id=st.root_frame_id,
+                workspace=st.workspace,
+                kernels=st.kernels,
+                control=self.session_domain.recovery,
+                cas=self.session_domain.cas,
+                checkpoint=self.store.get_session_checkpoint,
+                artifact_version=self.store.version_meta,
+                dispatcher=lambda: self._ensure_runtime(st),
+                python_runtime=python_runtime,
+                bootstrap_code=lambda: _maybe_call(
+                    getattr(self._skills_for(st), "bootstrap_code", "")
+                ),
+                python_published=python_published,
+                r_published=lambda key: setattr(st, "r_env_name", key),
+                bind_candidate=lambda candidate, interrupt: (
+                    self.executions.bind_lease(candidate, interrupt)
+                ),
+                unbind_candidate=self.executions.unbind_lease,
+                cancelled=st.cancel.is_set,
+                event_sink=emit,
+            )
+        )
+
     def _state(self, root_frame_id: str, project_id: str) -> SessionState:
         scope = self.store.resolve_frame_scope(
             root_frame_id,
@@ -2071,40 +2180,17 @@ class SessionRunner:
 
         target = kernel if kernel is not None else st.kernel
         boot = _maybe_call(getattr(self._skills_for(st), "bootstrap_code", ""))
-        metadata = {
-            "status": "skipped" if not (boot and boot.strip()) else "bootstrapping",
-            "bootstrap_code_sha256": (
-                hashlib.sha256(boot.encode("utf-8")).hexdigest() if boot else None
-            ),
-            # The current loader only adds its helper path; it does not eagerly
-            # import sidecars. Recording [] is the truthful manifest.
-            "loaded_sidecars": [],
-            "project_init_hooks": [],
-            "working_directory": str(st.workspace),
-            "interpreter": getattr(target, "python", None),
-            "environment_name": getattr(target, "env_name", None),
-            "environment_root": getattr(target, "env_root", None),
-        }
-        try:
-            if target is not None and boot and boot.strip():
-                result = target.execute(boot, origin="system")
-                if result.get("error"):
-                    metadata["status"] = "failed"
-                    metadata["error"] = str(result["error"])[:500]
-                else:
-                    metadata["status"] = "active"
-        except Exception as exc:  # noqa: BLE001 — preserve compatible soft failure
-            metadata["status"] = "failed"
-            metadata["error"] = str(exc)[:500]
-        if target is not None:
-            lifecycle_state = (
-                "active"
-                if metadata["status"] in {"active", "skipped"}
-                else "bootstrapping"
-            )
-            st.kernels.record_bootstrap_if_current(
-                "python", target, metadata, state=lifecycle_state
-            )
+        if target is None:
+            return {"status": "failed", "error": "Python kernel is unavailable"}
+        metadata = bootstrap_python_generation(target, st.workspace, boot)
+        lifecycle_state = (
+            "active"
+            if metadata["status"] in {"active", "skipped"}
+            else "bootstrapping"
+        )
+        st.kernels.record_bootstrap_if_current(
+            "python", target, metadata, state=lifecycle_state
+        )
         return metadata
 
     def restart_kernel(self, root_frame_id: str, project_id: str) -> dict:
@@ -2331,6 +2417,7 @@ class SessionRunner:
         from openai4s.kernel.r_kernel import spawn_r_kernel
 
         try:
+            previous = st.kernels.lease("r")
             lease = st.kernels.ensure(
                 "r",
                 want,
@@ -2338,6 +2425,8 @@ class SessionRunner:
                     cwd=str(st.workspace), env=get_environment(want)
                 ),
             )
+            if previous is None or previous.kernel is not lease.kernel:
+                bootstrap_r_generation(st.kernels, st.workspace, lease)
         except Exception as e:  # noqa: BLE001 — soft-fail into the observation
             return f"R kernel unavailable: {e}"
         st.r_env_name = lease.key
@@ -5261,7 +5350,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
             workbench = re.fullmatch(
                 r"/frames/([^/]+)/(?:"
                 r"action-timeline|execution-queue|context|security|"
-                r"recovery(?:/actions)?|"
+                r"recovery(?:/actions(?:/(?:restore|retry|restart_fresh))?)?|"
                 r"branches(?:/(?:checkpoints|fork|revert-preview|revert))?|"
                 r"checkpoints|revert/(?:preview|apply|undo|operations)|"
                 r"notebook/export|execution)",
@@ -5351,6 +5440,29 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                         branch_id=(q.get("branch_id") or [None])[0],
                     )
                 )
+                return
+            m = re.fullmatch(
+                r"/frames/([^/]+)/recovery/actions/"
+                r"(restore|retry|restart_fresh)",
+                sub,
+            )
+            if m and method == "POST":
+                fid, action_id = m.groups()
+                frame = store.get_frame(fid)
+                if frame is None:
+                    raise GatewayError(404, "session not found")
+                body = self._body()
+                try:
+                    result = runner.execute_recovery_action(
+                        fid,
+                        frame.get("project_id") or "default",
+                        action_id,
+                        branch_id=body.get("branch_id"),
+                        confirmed=body.get("confirm") is True,
+                    )
+                except RecoveryActionError as error:
+                    raise GatewayError(409, str(error)) from error
+                self._json(result, 200 if result.get("ok") else 409)
                 return
             m = re.fullmatch(r"/frames/([^/]+)/branches", sub)
             if m and method == "GET":

@@ -253,6 +253,13 @@ class RecoveryRecipe:
     required_symbols: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     artifact_hashes: Mapping[str, str] = field(default_factory=dict)
     environment_requirements: Mapping[str, Any] = field(default_factory=dict)
+    namespace_coverage: str = "empty"
+
+    def __post_init__(self) -> None:
+        if self.namespace_coverage not in {"empty", "verified", "unverified"}:
+            raise ValueError(
+                f"unknown namespace coverage: {self.namespace_coverage!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -274,6 +281,10 @@ class Candidate(Protocol):
 
 
 JournalSink = Callable[[dict[str, Any]], Any]
+
+
+class RecoveryCancelled(RuntimeError):
+    """Raised internally when the exact recovery ticket is cancelled."""
 
 
 def replay_safety_error(
@@ -372,6 +383,7 @@ class KernelRecoveryOrchestrator:
         inspect_environment: Callable[[Candidate], Mapping[str, Any]],
         publish: Callable[[Candidate], Any],
         journal: JournalSink | None = None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> None:
         self._build = build_candidate
         self._bootstrap = bootstrap_candidate
@@ -383,6 +395,7 @@ class KernelRecoveryOrchestrator:
         self._environment = inspect_environment
         self._publish = publish
         self._journal = journal or (lambda _event: None)
+        self._cancelled = cancelled or (lambda: False)
 
     def restore(
         self,
@@ -401,6 +414,11 @@ class KernelRecoveryOrchestrator:
         replayed: list[str] = []
         skipped: list[str] = []
         issues: list[dict[str, Any]] = []
+        published = False
+
+        def check_cancelled() -> None:
+            if self._cancelled():
+                raise RecoveryCancelled("recovery execution was cancelled")
 
         def record(phase: str, status: str, detail: Any = None) -> None:
             event = {
@@ -417,9 +435,11 @@ class KernelRecoveryOrchestrator:
 
         record("restore", "started", {"manifest_id": manifest.manifest_id})
         try:
+            check_cancelled()
             candidate = self._build(manifest)
             candidate_id = str(candidate.generation_id)
             record("build", "completed")
+            check_cancelled()
             self._bootstrap(candidate, manifest)
             record(
                 "bootstrap",
@@ -433,6 +453,7 @@ class KernelRecoveryOrchestrator:
             )
 
             for step in recipe.steps:
+                check_cancelled()
                 if step.kind == "hydrate_workspace":
                     self._hydrate_workspace(candidate, step.payload)
                     record(step.kind, "completed", {"step_id": step.step_id})
@@ -496,6 +517,7 @@ class KernelRecoveryOrchestrator:
                 replayed.append(step.step_id)
                 record("replay", "completed", {"step_id": step.step_id})
 
+            check_cancelled()
             issues.extend(self._validate(candidate, manifest, recipe))
             if issues:
                 record("validate", "partial", {"issues": issues})
@@ -512,7 +534,9 @@ class KernelRecoveryOrchestrator:
                 )
 
             record("validate", "completed")
+            check_cancelled()
             self._publish(candidate)
+            published = True
             record("publish", "completed")
             return RecoveryResult(
                 recovery_id,
@@ -524,21 +548,44 @@ class KernelRecoveryOrchestrator:
                 tuple(replayed),
                 tuple(skipped),
             )
+        except RecoveryCancelled as error:
+            record("restore", "cancelled", {"error": str(error)})
+            if candidate is not None and not published:
+                self._shutdown(candidate)
+            return RecoveryResult(
+                recovery_id,
+                "cancelled",
+                source_generation_id,
+                candidate_id,
+                manifest.manifest_id,
+                ({"type": "recovery_cancelled", "error": str(error)},),
+                tuple(replayed),
+                tuple(skipped),
+            )
         except Exception as error:  # noqa: BLE001 — failure is durable state
             record(
                 "restore",
                 "failed",
                 {"error": str(error), "error_type": type(error).__name__},
             )
-            if candidate is not None:
+            if candidate is not None and not published:
                 self._shutdown(candidate)
             return RecoveryResult(
                 recovery_id,
-                "failed",
+                "active" if published else "failed",
                 source_generation_id,
                 candidate_id,
                 manifest.manifest_id,
-                ({"type": "recovery_failed", "error": str(error)},),
+                (
+                    {
+                        "type": (
+                            "publish_journal_failed"
+                            if published
+                            else "recovery_failed"
+                        ),
+                        "error": str(error),
+                    },
+                ),
                 tuple(replayed),
                 tuple(skipped),
             )
@@ -550,6 +597,16 @@ class KernelRecoveryOrchestrator:
         recipe: RecoveryRecipe,
     ) -> list[dict[str, Any]]:
         issues: list[dict[str, Any]] = []
+        if recipe.namespace_coverage == "unverified":
+            issues.append(
+                {
+                    "type": "namespace_unverified",
+                    "reason": (
+                        "checkpoint contains prior Cells without a verified "
+                        "namespace recovery recipe"
+                    ),
+                }
+            )
         for language, required in recipe.required_symbols.items():
             observed = {str(item) for item in self._symbols(candidate, language)}
             missing = sorted(set(required) - observed)
@@ -588,6 +645,35 @@ class KernelRecoveryOrchestrator:
                     "observed": environment.get("interpreter"),
                 }
             )
+        observed_runtime = environment.get("runtime_version") or environment.get(
+            "python_version"
+        )
+        if (
+            manifest.runtime_version
+            and manifest.runtime_version not in {"?", "unknown"}
+            and observed_runtime != manifest.runtime_version
+        ):
+            issues.append(
+                {
+                    "type": "environment_mismatch",
+                    "key": "runtime_version",
+                    "expected": manifest.runtime_version,
+                    "observed": observed_runtime,
+                }
+            )
+        for key, expected in (
+            ("sdk_version", manifest.sdk_version),
+            ("provenance_version", manifest.provenance_version),
+        ):
+            if expected is not None and environment.get(key) != expected:
+                issues.append(
+                    {
+                        "type": "environment_mismatch",
+                        "key": key,
+                        "expected": expected,
+                        "observed": environment.get(key),
+                    }
+                )
         return issues
 
     @staticmethod
@@ -625,6 +711,7 @@ __all__ = [
     "REPLAY_NEVER",
     "REPLAY_SAFE",
     "RecoveryRecipe",
+    "RecoveryCancelled",
     "RecoveryResult",
     "RecoveryStep",
     "SidecarManifest",

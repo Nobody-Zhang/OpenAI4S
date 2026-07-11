@@ -228,6 +228,7 @@ def test_session_domain_composes_checkpoint_branch_timeline_export_and_renderer(
         for step in first["recovery_recipe"]["steps"]
     )
     assert first["generation_refs"]["python"]["bootstrap"]["version"] == 1
+    assert first["recovery_recipe"]["namespace_coverage"] == "unverified"
     active_restore = next(
         item for item in service.recovery_actions(root)["actions"]
         if item["id"] == "restore"
@@ -372,7 +373,8 @@ def test_recovery_pipeline_factory_persists_every_phase(tmp_path):
         inspect_symbols=lambda _candidate, _language: (),
         artifact_digest=lambda _candidate, _name: None,
         inspect_environment=lambda _candidate: {
-            "interpreter": "/env/bin/python"
+            "interpreter": "/env/bin/python",
+            "runtime_version": "3.12",
         },
         publish=lambda candidate: published.append(candidate.generation_id),
     )

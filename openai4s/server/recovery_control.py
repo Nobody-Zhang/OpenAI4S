@@ -12,15 +12,38 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import uuid
 from collections import defaultdict
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
-from openai4s.kernel.recovery import KernelRecoveryOrchestrator
+from openai4s.kernel.recovery import (
+    BootstrapManifest,
+    KernelRecoveryOrchestrator,
+    RecoveryRecipe,
+    RecoveryStep,
+)
 
 _STATUSES = frozenset(
     {"started", "completed", "skipped", "partial", "failed", "cancelled"}
 )
+
+
+class RecoveryActionError(RuntimeError):
+    """A requested mutation is unavailable under the current durable state."""
+
+
+@dataclass(frozen=True)
+class RecoveryActionPlan:
+    action_id: str
+    recovery_id: str
+    root_frame_id: str
+    branch_id: str
+    checkpoint_id: str | None
+    manifests: tuple[BootstrapManifest, ...]
+    source_generation_ids: Mapping[str, str | None]
+    recipe: RecoveryRecipe
 
 
 class RecoveryStore(Protocol):
@@ -45,12 +68,14 @@ class RecoveryControlService:
         store: RecoveryStore,
         *,
         workspace_tree_exists: Callable[[str], bool] | None = None,
+        event_sink: Callable[[dict[str, Any]], None] | None = None,
         payload_chars: int = 20_000,
     ) -> None:
         if payload_chars < 256:
             raise ValueError("payload_chars must be at least 256")
         self.store = store
         self._workspace_tree_exists = workspace_tree_exists or (lambda _tree_id: False)
+        self._event_sink = event_sink or (lambda _event: None)
         self.payload_chars = payload_chars
 
     def record(self, event: Mapping[str, Any]) -> dict:
@@ -66,7 +91,7 @@ class RecoveryControlService:
             raise ValueError(f"invalid recovery phase: {phase!r}")
         if status not in _STATUSES:
             raise ValueError(f"unknown recovery status: {status!r}")
-        return self.store.append_recovery_event(
+        stored = self.store.append_recovery_event(
             recovery_id=str(event["recovery_id"]),
             root_frame_id=str(event["root_frame_id"]),
             branch_id=(
@@ -88,6 +113,26 @@ class RecoveryControlService:
             # not persist credential-shaped fields merely to redact them later.
             detail=_redact(event.get("detail") or {}),
         )
+        try:
+            self._event_sink(
+                {
+                    "type": "recovery_log",
+                    "root_frame_id": str(event["root_frame_id"]),
+                    "branch_id": (
+                        str(event["branch_id"])
+                        if event.get("branch_id")
+                        else str(event["root_frame_id"])
+                    ),
+                    "recovery_id": str(event["recovery_id"]),
+                    "phase": phase,
+                    "status": status,
+                    "message": f"{phase}: {status}",
+                    "at": stored.get("created_at"),
+                }
+            )
+        except Exception:  # noqa: BLE001 - durable journal already committed
+            pass
+        return stored
 
     def pipeline(self, **ports: Any) -> KernelRecoveryOrchestrator:
         """Build a recovery pipeline whose every phase is durably journaled."""
@@ -240,6 +285,120 @@ class RecoveryControlService:
             "actions": actions,
         }
 
+    def prepare_action(
+        self,
+        root_frame_id: str,
+        action_id: str,
+        *,
+        branch_id: str | None = None,
+        confirmed: bool = False,
+        fresh_manifests: tuple[BootstrapManifest, ...] = (),
+    ) -> RecoveryActionPlan:
+        """Re-check policy and freeze the exact inputs for one mutation.
+
+        Callers invoke this only *after* acquiring their recovery execution
+        ticket.  That closes the queue-time TOCTOU window between the read-only
+        actions projection and the actual mutation.
+        """
+
+        root_frame_id = _required("root_frame_id", root_frame_id)
+        action_id = _required("action_id", action_id).lower()
+        branch_id = branch_id or root_frame_id
+        projection = self.actions(root_frame_id, branch_id=branch_id)
+        action = next(
+            (item for item in projection["actions"] if item["id"] == action_id),
+            None,
+        )
+        if action is None:
+            raise RecoveryActionError(f"unknown recovery action: {action_id}")
+        if not action.get("enabled"):
+            raise RecoveryActionError(
+                str(action.get("reason") or "recovery action is disabled")
+            )
+        if action.get("requires_confirmation") and not confirmed:
+            raise RecoveryActionError(
+                f"{action_id} requires explicit confirmation"
+            )
+
+        checkpoint_id = projection.get("checkpoint_id")
+        if action_id == "restart_fresh":
+            if not fresh_manifests:
+                raise RecoveryActionError("fresh restart has no resolvable runtime")
+            manifests = tuple(fresh_manifests)
+            recipe = RecoveryRecipe()
+            sources = {
+                manifest.language: (
+                    (
+                        self.store.latest_kernel_generation(
+                            root_frame_id,
+                            manifest.language,
+                            branch_id=branch_id,
+                        )
+                        or {}
+                    ).get("generation_id")
+                )
+                for manifest in manifests
+            }
+            checkpoint_id = None
+        elif action_id in {"restore", "retry"}:
+            checkpoint = (
+                self.store.get_session_checkpoint(str(checkpoint_id))
+                if checkpoint_id
+                else None
+            )
+            restorable, reason = _restorable(checkpoint)
+            if not restorable or checkpoint is None:
+                raise RecoveryActionError(reason or "checkpoint is not restorable")
+            refs = checkpoint.get("generation_refs") or {}
+            parsed: list[BootstrapManifest] = []
+            sources: dict[str, str | None] = {}
+            for language in sorted(
+                refs,
+                key=lambda item: (item != "python", item != "r", str(item)),
+            ):
+                ref = refs[language]
+                raw = (
+                    ref.get("bootstrap_manifest") or ref.get("bootstrap")
+                    if isinstance(ref, Mapping)
+                    else None
+                )
+                try:
+                    manifest = BootstrapManifest.from_record(raw or {})
+                except (TypeError, ValueError) as error:
+                    raise RecoveryActionError(
+                        f"invalid {language} bootstrap manifest: {error}"
+                    ) from error
+                if manifest.language != str(language):
+                    raise RecoveryActionError(
+                        f"bootstrap language mismatch for {language}"
+                    )
+                parsed.append(manifest)
+                sources[manifest.language] = (
+                    str(ref["generation_id"])
+                    if isinstance(ref, Mapping) and ref.get("generation_id")
+                    else None
+                )
+            if not parsed:
+                raise RecoveryActionError("checkpoint has no runtime manifests")
+            manifests = tuple(parsed)
+            recipe = _parse_recipe(
+                checkpoint.get("recovery_recipe"),
+                cell_cursor=int(checkpoint.get("cell_cursor") or 0),
+            )
+        else:
+            raise RecoveryActionError(f"action {action_id} is read-only")
+
+        return RecoveryActionPlan(
+            action_id=action_id,
+            recovery_id=f"recovery-{uuid.uuid4().hex[:16]}",
+            root_frame_id=root_frame_id,
+            branch_id=branch_id,
+            checkpoint_id=(str(checkpoint_id) if checkpoint_id else None),
+            manifests=manifests,
+            source_generation_ids=sources,
+            recipe=recipe,
+        )
+
     def _attempt(self, rows: list[dict]) -> dict[str, Any]:
         rows.sort(
             key=lambda item: (
@@ -276,7 +435,7 @@ def _journal_state(rows: list[dict]) -> str:
     latest = rows[-1]
     phase = str(latest.get("phase") or "")
     status = str(latest.get("status") or "")
-    if phase == "publish" and status == "completed":
+    if phase in {"publish", "session"} and status == "completed":
         return "active"
     if status == "partial":
         return "partial"
@@ -344,10 +503,83 @@ def _restorable(checkpoint: Mapping[str, Any] | None) -> tuple[bool, str | None]
         )
         if not isinstance(manifest, Mapping) or int(manifest.get("version") or 0) != 1:
             return False, f"checkpoint lacks a verifiable {language} bootstrap manifest"
+        try:
+            parsed = BootstrapManifest.from_record(manifest)
+        except (TypeError, ValueError):
+            return False, f"checkpoint has an invalid {language} bootstrap manifest"
+        if parsed.language != str(language):
+            return False, f"checkpoint has a mismatched {language} bootstrap manifest"
     recipe = checkpoint.get("recovery_recipe")
-    if not isinstance(recipe, Mapping):
-        return False, "checkpoint has no recovery recipe"
+    if not isinstance(recipe, Mapping) or int(recipe.get("version") or 0) != 1:
+        return False, "checkpoint has no supported recovery recipe"
     return True, None
+
+
+def _parse_recipe(value: Any, *, cell_cursor: int = 0) -> RecoveryRecipe:
+    if not isinstance(value, Mapping) or int(value.get("version") or 0) != 1:
+        raise RecoveryActionError("checkpoint has an unsupported recovery recipe")
+    steps: list[RecoveryStep] = []
+    for index, raw in enumerate(value.get("steps") or ()):
+        if not isinstance(raw, Mapping):
+            raise RecoveryActionError(f"invalid recovery step at index {index}")
+        payload = raw.get("payload")
+        if not isinstance(payload, Mapping):
+            raise RecoveryActionError(
+                f"recovery step {index} payload must be an object"
+            )
+        identity = raw.get("step_id")
+        if not identity:
+            digest = hashlib.sha256(
+                json.dumps(
+                    raw,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=repr,
+                ).encode("utf-8")
+            ).hexdigest()[:12]
+            identity = f"rs-{index}-{digest}"
+        try:
+            steps.append(
+                RecoveryStep(
+                    kind=str(raw.get("kind") or ""),
+                    payload=dict(payload),
+                    replay_policy=str(raw.get("replay_policy") or "never"),
+                    step_id=str(identity),
+                )
+            )
+        except (TypeError, ValueError) as error:
+            raise RecoveryActionError(
+                f"invalid recovery step at index {index}: {error}"
+            ) from error
+
+    required_raw = value.get("required_symbols") or {}
+    artifacts_raw = value.get("artifact_hashes") or {}
+    environment_raw = value.get("environment_requirements") or {}
+    if not all(
+        isinstance(item, Mapping)
+        for item in (required_raw, artifacts_raw, environment_raw)
+    ):
+        raise RecoveryActionError("invalid recovery validation requirements")
+    coverage = str(value.get("namespace_coverage") or "").lower()
+    if not coverage:
+        coverage = "unverified" if cell_cursor > 0 else "empty"
+    try:
+        return RecoveryRecipe(
+            steps=tuple(steps),
+            required_symbols={
+                str(language): tuple(str(name) for name in (names or ()))
+                for language, names in required_raw.items()
+                if isinstance(names, (list, tuple))
+            },
+            artifact_hashes={
+                str(name): str(digest) for name, digest in artifacts_raw.items()
+            },
+            environment_requirements=dict(environment_raw),
+            namespace_coverage=coverage,
+        )
+    except ValueError as error:
+        raise RecoveryActionError(str(error)) from error
 
 
 def _action(
@@ -416,4 +648,9 @@ def _required(name: str, value: str) -> str:
     return value.strip()
 
 
-__all__ = ["RecoveryControlService", "RecoveryStore"]
+__all__ = [
+    "RecoveryActionError",
+    "RecoveryActionPlan",
+    "RecoveryControlService",
+    "RecoveryStore",
+]

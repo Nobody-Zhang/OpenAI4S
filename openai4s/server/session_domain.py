@@ -141,6 +141,7 @@ class SessionDomainService:
         self.recovery = RecoveryControlService(
             store,
             workspace_tree_exists=self._workspace_tree_exists,
+            event_sink=self._event_sink,
         )
         self.timeline = ActionTimelineService(store)
         self.notebooks = NotebookExportService(store)
@@ -370,6 +371,8 @@ class SessionDomainService:
             include_events=False,
         )
         artifacts = self.store.list_artifacts({"root_frame_id": root_frame_id})
+        cell_cursor = self.store.cell_count(root_frame_id)
+        workspace = Path(self._workspace(root_frame_id, branch_id)).resolve()
         generations = self.store.list_kernel_generations(
             root_frame_id,
             branch_id=branch_id,
@@ -424,13 +427,29 @@ class SessionDomainService:
             for item in artifacts
             if item.get("latest_version_id")
         )
-        artifact_hashes = {
-            str(item.get("filename") or item.get("artifact_id")): str(
-                item.get("checksum") or ""
+        artifact_hashes = {}
+        for item in artifacts:
+            if not item.get("checksum"):
+                continue
+            name = str(item.get("filename") or item.get("artifact_id"))
+            version = (
+                self.store.version_meta(str(item["latest_version_id"]))
+                if item.get("latest_version_id")
+                else None
             )
-            for item in artifacts
-            if item.get("checksum")
-        }
+            recorded_path = item.get("path") or (version or {}).get("path")
+            if recorded_path:
+                try:
+                    name = (
+                        Path(recorded_path)
+                        .expanduser()
+                        .resolve()
+                        .relative_to(workspace)
+                        .as_posix()
+                    )
+                except (OSError, ValueError):
+                    pass
+            artifact_hashes[name] = str(item.get("checksum") or "")
         return {
             "action_cursor": max(
                 (
@@ -441,7 +460,7 @@ class SessionDomainService:
                 default=None,
             ),
             "message_cursor": self.store.message_count(root_frame_id),
-            "cell_cursor": self.store.cell_count(root_frame_id),
+            "cell_cursor": cell_cursor,
             "artifact_versions": artifact_versions,
             "environment_pins": {
                 "python": frame.get("runtime_env"),
@@ -464,6 +483,13 @@ class SessionDomainService:
                 "required_symbols": {},
                 "artifact_hashes": artifact_hashes,
                 "environment_requirements": {},
+                # A non-empty Notebook does not prove its in-memory objects can
+                # be reconstructed. Runtime code may replace this with
+                # ``verified`` only after adding explicit safe replay/symbol
+                # validation coverage.
+                "namespace_coverage": (
+                    "unverified" if cell_cursor > 0 else "empty"
+                ),
             },
             "metadata": {
                 "project_id": project_id,

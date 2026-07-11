@@ -27,6 +27,8 @@ class _Candidate:
         self.environment = {
             "interpreter": "/env/bin/python",
             "python_version": "3.12",
+            "sdk_version": "sdk-1",
+            "provenance_version": "prov-1",
         }
 
     def shutdown(self):
@@ -200,6 +202,23 @@ def test_non_replayable_step_yields_partial_and_preserves_old_generation():
     assert executed == []
     assert candidate.shutdown_calls == 1
     assert old["alive"] is True
+
+
+def test_prior_cells_without_namespace_coverage_cannot_be_declared_active():
+    candidate = _Candidate()
+    published = []
+    result = _orchestrator(candidate, [], published, []).restore(
+        root_frame_id="root",
+        branch_id=None,
+        manifest=_manifest(),
+        recipe=RecoveryRecipe(namespace_coverage="unverified"),
+        source_generation_id="old",
+    )
+
+    assert result.status == "partial"
+    assert result.issues[0]["type"] == "namespace_unverified"
+    assert published == []
+    assert candidate.shutdown_calls == 1
 
 
 def test_validation_failure_is_partial_and_bootstrap_failure_is_failed():

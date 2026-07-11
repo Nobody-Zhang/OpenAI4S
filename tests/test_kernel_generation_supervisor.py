@@ -124,6 +124,40 @@ def test_r_generation_records_actual_rscript_instead_of_manager_python(tmp_path)
     assert row["environment"]["interpreter"] == "/opt/r/bin/Rscript"
 
 
+def test_recovery_candidate_generation_is_created_only_when_published(tmp_path):
+    store = Store(tmp_path / "recover-publish.db")
+    supervisor = KernelSupervisor(
+        root_frame_id="root-recover",
+        generations=store,
+        owner_instance_id="daemon-a",
+        clock_ms=lambda: 1000,
+    )
+    old = _Kernel("base")
+    current = supervisor.ensure("python", "base", lambda: old)
+    candidate = _Kernel("science")
+    candidate_id = str(uuid.uuid4())
+
+    assert store.get_kernel_generation(candidate_id) is None
+    published = supervisor.publish_candidate(
+        "python",
+        "science",
+        candidate,
+        factory=lambda: _Kernel("science"),
+        generation_id=candidate_id,
+        expected=current,
+        recovered_from_generation_id=current.generation_id,
+        bootstrap={"version": 1, "language": "python"},
+    )
+
+    assert published.generation_id == candidate_id
+    row = store.get_kernel_generation(candidate_id)
+    assert row["recovered_from_generation_id"] == current.generation_id
+    assert row["bootstrap"] == {"version": 1, "language": "python"}
+    assert store.get_kernel_generation(current.generation_id)["ended_reason"] == (
+        "recovery_replaced"
+    )
+
+
 def test_exact_bootstrap_failure_is_terminal_and_shuts_down_candidate(tmp_path):
     store = Store(tmp_path / "bootstrap-failed.db")
     supervisor = KernelSupervisor(

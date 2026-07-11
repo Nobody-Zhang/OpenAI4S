@@ -409,6 +409,89 @@ class KernelSupervisor:
                     pass
             return True
 
+    def publish_candidate(
+        self,
+        language: str,
+        key: Hashable | None,
+        kernel: Any,
+        *,
+        factory: KernelFactory,
+        generation_id: str,
+        expected: KernelLease | None,
+        recovered_from_generation_id: str | None = None,
+        bootstrap: dict[str, Any] | None = None,
+    ) -> KernelLease:
+        """Atomically adopt one already-live, already-validated worker.
+
+        Recovery builds and exercises ``kernel`` outside this supervisor.  The
+        exact lease observed before that work is supplied as ``expected``;
+        publishing fails if another lifecycle operation changed the slot in
+        the meantime.  Persistence is allocated before the in-memory pointer
+        changes, so a failed generation insert also leaves the current worker
+        untouched.
+
+        ``expected=None`` is deliberately strict: it means the slot must have
+        no current worker, not "replace whatever happens to be there".
+        """
+
+        if not generation_id:
+            raise ValueError("generation_id must be non-empty")
+        if not callable(factory):
+            raise TypeError("recovery candidate factory must be callable")
+        if not self._alive(kernel):
+            raise RuntimeError(f"{language} recovery candidate is not alive")
+        with self._lock:
+            slot = self._slot(language)
+            if kernel is slot.kernel:
+                raise ValueError("recovery candidate is already published")
+            if expected is None:
+                if slot.kernel is not None:
+                    raise RuntimeError(
+                        f"{language} kernel changed before recovery publish"
+                    )
+            elif not self._matches(slot, expected):
+                raise RuntimeError(
+                    f"{language} kernel changed before recovery publish"
+                )
+
+            old = slot.kernel
+            old_generation_id = slot.generation_id
+            old_was_alive = old is not None and self._alive(old)
+            identity = self._begin_generation(
+                language,
+                kernel,
+                key,
+                parent_generation_id=old_generation_id,
+                generation_id=generation_id,
+                recovered_from_generation_id=recovered_from_generation_id,
+                bootstrap=bootstrap,
+                state="active",
+            )
+            slot.kernel = kernel
+            slot.key = key
+            slot.factory = factory
+            slot.generation += 1
+            slot.generation_id = identity["generation_id"]
+            slot.persistent_ordinal = identity.get("ordinal")
+            slot.started_at = identity["started_at"]
+            slot.last_activity_at = identity["last_activity_at"]
+            slot.ended_reason = None
+            slot.manual_stop = False
+            if old_generation_id is not None:
+                self._finish_generation(
+                    old_generation_id,
+                    state="released" if old_was_alive else "crashed",
+                    reason=(
+                        "recovery_replaced"
+                        if old_was_alive
+                        else "recovery_replaced_dead_worker"
+                    ),
+                )
+            lease = self._lease(language, slot)
+        if old is not None:
+            self._shutdown(old)
+        return lease
+
     def _slot(self, language: str) -> _Slot:
         if not language:
             raise ValueError("language must be non-empty")
@@ -437,9 +520,13 @@ class KernelSupervisor:
         key: Hashable | None,
         *,
         parent_generation_id: str | None,
+        generation_id: str | None = None,
+        recovered_from_generation_id: str | None = None,
+        bootstrap: dict[str, Any] | None = None,
+        state: str | None = None,
     ) -> dict[str, Any]:
         now = self._clock_ms()
-        generation_id = str(uuid.uuid4())
+        generation_id = generation_id or str(uuid.uuid4())
         environment = self._environment_metadata(kernel, key)
         if self._generations is None or self._root_frame_id is None:
             return {
@@ -455,13 +542,21 @@ class KernelSupervisor:
             generation_id=generation_id,
             parent_generation_id=parent_generation_id,
             environment=environment,
-            bootstrap={
-                "status": "pending" if language == "python" else "not_applicable",
-                "loaded_sidecars": [],
-            },
+            bootstrap=(
+                dict(bootstrap)
+                if bootstrap is not None
+                else {
+                    "status": (
+                        "pending" if language == "python" else "not_applicable"
+                    ),
+                    "loaded_sidecars": [],
+                }
+            ),
             worker_pid=self._pid(kernel),
             owner_instance_id=self._owner_instance_id,
-            state="bootstrapping" if language == "python" else "active",
+            state=state
+            or ("bootstrapping" if language == "python" else "active"),
+            recovered_from_generation_id=recovered_from_generation_id,
             started_at=now,
         )
 

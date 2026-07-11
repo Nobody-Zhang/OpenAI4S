@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import platform
 
 import pytest
 
@@ -199,3 +200,116 @@ def test_fork_from_cell_route_fails_closed_until_supported(tmp_path):
     else:
         raise AssertionError("fork-from-cell must not claim success")
     runner.close()
+
+
+def test_real_runner_checkpoint_can_restore_through_mutation_route(tmp_path):
+    runner, handler, frame_id = _setup(tmp_path)
+    workspace = runner.workspace_for(frame_id)
+    (workspace / "analysis.txt").write_text("checkpoint bytes\n", "utf-8")
+    nested = workspace / "results" / "out.csv"
+    nested.parent.mkdir()
+    nested.write_text("score\n0.93\n", "utf-8")
+    nested_artifact = runner.store.save_artifact(
+        path=str(nested),
+        filename="display-name.csv",
+        content_type="text/csv",
+        size_bytes=nested.stat().st_size,
+        checksum=hashlib.sha256(nested.read_bytes()).hexdigest(),
+        frame_id=frame_id,
+        root_frame_id=frame_id,
+        project_id="project-domain",
+    )
+    try:
+        started = runner.start_kernel(frame_id, "project-domain")
+        assert started["state"] == "running"
+        generation = runner.store.get_kernel_generation(
+            started["generation_id"]
+        )
+        assert generation["bootstrap"]["version"] == 1
+        assert generation["bootstrap"]["runtime_version"] == platform.python_version()
+
+        code, checkpoint = _call(
+            handler,
+            "POST",
+            f"/frames/{frame_id}/checkpoints",
+            body={"reason": "recovery-test"},
+        )
+        assert code == 200
+        assert checkpoint["generation_refs"]["python"]["bootstrap"]["version"] == 1
+        assert checkpoint["recovery_recipe"]["artifact_hashes"] == {
+            "results/out.csv": nested_artifact["checksum"]
+        }
+
+        runner.stop_kernel(frame_id, "project-domain")
+        code, actions = _call(
+            handler, "GET", f"/frames/{frame_id}/recovery/actions"
+        )
+        assert code == 200
+        restore = next(item for item in actions["actions"] if item["id"] == "restore")
+        assert restore["enabled"] is True
+
+        code, restored = _call(
+            handler,
+            "POST",
+            f"/frames/{frame_id}/recovery/actions/restore",
+        )
+        assert code == 200
+        assert restored["ok"] is True
+        assert restored["status"] == "active"
+        assert restored["owner"]["kind"] == "recovery"
+        state = runner._sessions[frame_id]
+        assert state.kernels.alive("python")
+        latest = runner.store.latest_kernel_generation(frame_id, "python")
+        assert latest["recovered_from_generation_id"] == started["generation_id"]
+        assert latest["bootstrap"]["version"] == 1
+        assert nested.read_text("utf-8") == "score\n0.93\n"
+        assert runner.session_domain.recovery_status(frame_id)["state"] == "active"
+        assert any(event.get("type") == "recovery_state" for event in runner.hub.events)
+    finally:
+        runner.close()
+
+
+def test_failed_fresh_recovery_keeps_exact_current_generation(
+    monkeypatch, tmp_path
+):
+    runner, handler, frame_id = _setup(tmp_path)
+    try:
+        runner.start_kernel(frame_id, "project-domain")
+        state = runner._sessions[frame_id]
+        before = state.kernels.lease("python")
+
+        with pytest.raises(gateway_mod.GatewayError) as confirmation:
+            _call(
+                handler,
+                "POST",
+                f"/frames/{frame_id}/recovery/actions/restart_fresh",
+            )
+        assert confirmation.value.code == 409
+        assert "confirmation" in confirmation.value.message
+
+        def fail_bootstrap(_runtime, _candidate, _manifest):
+            raise RuntimeError("candidate dependency missing")
+
+        monkeypatch.setattr(
+            gateway_mod.SessionRecoveryRuntime,
+            "_bootstrap_candidate",
+            fail_bootstrap,
+        )
+        code, failed = _call(
+            handler,
+            "POST",
+            f"/frames/{frame_id}/recovery/actions/restart_fresh",
+            body={"confirm": True},
+        )
+
+        assert code == 409
+        assert failed["status"] == "failed"
+        current = state.kernels.lease("python")
+        assert current == before
+        assert current.kernel.is_alive()
+        assert runner.store.latest_kernel_generation(
+            frame_id, "python"
+        )["generation_id"] == before.generation_id
+        assert runner.session_domain.recovery_status(frame_id)["state"] == "failed"
+    finally:
+        runner.close()

@@ -419,6 +419,11 @@ def test_r_slot_is_lazy_reused_and_soft_fails_without_touching_python(
 
     monkeypatch.setattr(envmod, "get_environment", get_environment)
     monkeypatch.setattr(r_kernel_mod, "spawn_r_kernel", spawn_r_kernel)
+    monkeypatch.setattr(
+        gateway_mod,
+        "bootstrap_r_generation",
+        lambda _kernels, _workspace, _lease: {},
+    )
 
     assert runner._ensure_r_kernel(st) is None
     first_r = st.r_kernel
