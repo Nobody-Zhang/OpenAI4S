@@ -365,7 +365,7 @@ def test_notebook_live_input_appends_cells_and_keeps_history_read_only() -> None
     execute = _extract_js_function(APP_JS, "executeNotebookCode")
     cell = _extract_js_function(APP_JS, "cellNode")
     identity = _extract_js_function(APP_JS, "nbEventCellId")
-    start = _extract_js_function(APP_JS, "nbCellStart")
+    _extract_js_function(APP_JS, "nbCellStart")
     chunk = _extract_js_function(APP_JS, "nbCellChunk")
     finished = _extract_js_function(APP_JS, "nbCellFinished")
 
@@ -404,12 +404,16 @@ def test_execution_interrupts_send_the_exact_cached_identity() -> None:
 
 
 def test_branch_context_and_security_controls_fail_closed_when_absent() -> None:
+    sanitizer = _extract_js_function(APP_JS, "sanitizeBranches")
     branches = _extract_js_function(APP_JS, "renderBranchPanel")
     context = _extract_js_function(APP_JS, "renderContextPanel")
     security = _extract_js_function(APP_JS, "renderSecurityPanel")
     button = _extract_js_function(APP_JS, "disabledWorkbenchButton")
 
     assert "branchCapability" in branches
+    assert "value.enabled === true" in sanitizer
+    assert "fork_from_cell" in sanitizer
+    assert 'branchCapability("fork_from_cell")' in APP_JS
     assert "revert_preview" in branches
     assert "button.disabled = !enabled" in button
     assert "nb.action.unavailable" in button

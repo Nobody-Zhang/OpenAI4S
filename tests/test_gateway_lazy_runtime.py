@@ -197,6 +197,60 @@ def test_session_runtime_reuses_delegation_tree_and_scoped_capabilities(tmp_path
     runner.close()
 
 
+def test_tool_only_structured_finalize_completes_without_kernel(monkeypatch, tmp_path):
+    runner = gateway_mod.SessionRunner(
+        _cfg(tmp_path, max_turns=1), _Hub(), start_idle_sweeper=False
+    )
+    frame_id = _frame(runner)
+    exposed: list[set[str]] = []
+    arguments = {
+        "summary": "The session metadata is ready.",
+        "findings": ["No scientific kernel was required."],
+        "completion_bullets": ["Reported session metadata"],
+    }
+
+    def fake_chat(messages, cfg, **kwargs):
+        del messages, cfg
+        exposed.append({spec.name for spec in kwargs["tools"]})
+        call = {
+            "id": "final-web",
+            "wire_id": "final-web",
+            "name": "finalize_response",
+            "ordinal": 0,
+            "raw_arguments": json.dumps(arguments),
+            "arguments": arguments,
+            "parse_error": None,
+            "provider_meta": {},
+        }
+        return {
+            "content": "",
+            "tool_calls": [call],
+            "assistant_message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [call],
+            },
+            "usage": {},
+        }
+
+    monkeypatch.setattr(gateway_mod, "chat", fake_chat)
+    monkeypatch.setattr(runner, "_spawn_title_summary", lambda *args: None)
+    result = runner.run_message(frame_id, "default", "Describe the session")
+    state = runner._state(frame_id, "default")
+
+    assert result["status"] == "completed"
+    assert "finalize_response" in exposed[0]
+    assert state.kernel is None
+    assert state.last_engine_completion["output"]["summary"] == arguments["summary"]
+    assistant = [
+        item
+        for item in runner.store.list_messages(frame_id)
+        if item.get("role") == "assistant"
+    ]
+    assert any(arguments["summary"] in item["content"] for item in assistant)
+    runner.close()
+
+
 def test_first_code_spawns_once_and_stop_does_not_break_tool_only_runtime(
     monkeypatch, tmp_path
 ):

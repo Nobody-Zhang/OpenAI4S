@@ -1680,13 +1680,14 @@ async function scopedExecutionRequest(frameId, endpoint, reason) {
 }
 function sanitizeRecovery(payload) {
   const source = payload && (payload.recovery || payload.payload || payload) || {};
+  const generations = source.generations || {}, current = source.current || {};
   return {
     status: publicText(source.status || source.state, 48), progress: Number.isFinite(+source.progress) ? Math.max(0, Math.min(1, +source.progress)) : null,
     state_revision: source.state_revision, branch_id: publicText(source.branch_id, 96),
-    python_generation_id: publicText(source.python_generation_id || (source.generations || {}).python, 96),
-    r_generation_id: publicText(source.r_generation_id || (source.generations || {}).r, 96),
-    message: publicText(source.message || source.reason || source.error, 240),
-    log: (source.log || source.events || (/recovery_log/.test(String(source.type || "")) ? [source] : [])).slice(-50).map(item => ({
+    python_generation_id: publicText(source.python_generation_id || (generations.python || {}).generation_id || generations.python, 96),
+    r_generation_id: publicText(source.r_generation_id || (generations.r || {}).generation_id || generations.r, 96),
+    message: publicText(source.message || source.reason || source.error || current.phase, 240),
+    log: (source.log || source.events || current.events || (/recovery_log/.test(String(source.type || "")) ? [source] : [])).slice(-50).map(item => ({
       status: publicText(item.status || item.state || item.type, 48), message: publicText(item.message || item.reason || item.error, 240), at: item.at || item.created_at
     }))
   };
@@ -1694,6 +1695,7 @@ function sanitizeRecovery(payload) {
 function sanitizeBranches(payload) {
   const source = payload && (payload.branch || payload.payload || payload) || {};
   const capabilities = source.capabilities || source.actions || {};
+  const capabilityEnabled = value => value === true || !!(value && typeof value === "object" && value.enabled === true);
   const checkpoints = items => (items || []).slice(0, 100).map(cp => ({
     checkpoint_id: publicText(cp.checkpoint_id || cp.id, 96), parent_checkpoint_id: publicText(cp.parent_checkpoint_id, 96),
     reason: publicText(cp.reason, 80), created_at: cp.created_at, message_cursor: cp.message_cursor,
@@ -1703,9 +1705,10 @@ function sanitizeBranches(payload) {
   return {
     branch_id: publicText(source.branch_id || source.current_branch_id, 96),
     capabilities: {
-      checkpoint: !!capabilities.checkpoint, fork: !!capabilities.fork,
-      revert_preview: !!(capabilities.revert_preview || capabilities.preview_revert),
-      revert: !!capabilities.revert, promote: !!(capabilities.promote || capabilities.promote_artifact)
+      checkpoint: capabilityEnabled(capabilities.checkpoint), fork: capabilityEnabled(capabilities.fork),
+      fork_from_cell: capabilityEnabled(capabilities.fork && capabilities.fork.fork_from_cell),
+      revert_preview: capabilityEnabled(capabilities.revert_preview || capabilities.preview_revert),
+      revert: capabilityEnabled(capabilities.revert), promote: capabilityEnabled(capabilities.promote || capabilities.promote_artifact)
     },
     branches: (source.branches || []).slice(0, 100).map(branch => ({
       branch_id: publicText(branch.branch_id || branch.id, 96), name: publicText(branch.name, 120),
@@ -1772,10 +1775,11 @@ async function loadWorkbenchState(id, force = false) {
   const request = S._workbenchReq = (S._workbenchReq || 0) + 1;
   S._workbenchLoading = id;
   const base = `/frames/${id}`;
-  const [timeline, execution, branches, context, security] = await Promise.all([
+  const [timeline, execution, branches, context, security, recovery] = await Promise.all([
     optionalApi([base + "/action-timeline"]),
     optionalApi([base + "/execution-queue", base + "/execution"]),
-    optionalApi([base + "/branches"]), optionalApi([base + "/context"]), optionalApi([base + "/security"])
+    optionalApi([base + "/branches"]), optionalApi([base + "/context"]), optionalApi([base + "/security"]),
+    optionalApi([base + "/recovery"])
   ]);
   if (request !== S._workbenchReq || id !== S.currentId) return;
   S._workbenchLoading = null;
@@ -1784,6 +1788,7 @@ async function loadWorkbenchState(id, force = false) {
   if (branches) S.branchState = sanitizeBranches(branches);
   if (context) S.contextState = sanitizeContext(context);
   if (security) S.securityState = sanitizeSecurity(security);
+  if (recovery) S.recoveryState = sanitizeRecovery(recovery);
   if (S.activeTab === "timeline") renderActionTimeline();
   if (S.activeTab === "notebook") renderNotebook();
 }
@@ -2018,7 +2023,7 @@ function onEvent(m) {
     else S.recoveryState = next;
     if (S.activeTab === "timeline") renderActionTimeline(); if (S.activeTab === "notebook") renderNotebook();
   } }
-  else if (["branch", "branch_state", "checkpoint", "branch_created", "branch_reverted"].includes(m.type)) { if (mine(fid)) {
+  else if (["branch", "branch_state", "checkpoint", "checkpoint_created", "branch_created", "branch_reverted", "branch_revert_conflict"].includes(m.type)) { if (mine(fid)) {
     if (m.branches || (m.payload && m.payload.branches)) S.branchState = sanitizeBranches(m);
     else scheduleWorkbenchRefresh(80);
     if (S.activeTab === "timeline") renderActionTimeline(); if (S.activeTab === "notebook") renderNotebook();
@@ -4641,7 +4646,7 @@ async function copyNotebookCell(source) {
   }
 }
 async function forkNotebookCell(cell) {
-  if (!S.currentId || !branchCapability("fork")) return;
+  if (!S.currentId || !branchCapability("fork_from_cell")) return;
   try {
     await api(`/frames/${S.currentId}/branches/fork`, { method: "POST", body: JSON.stringify({ from_cell_id: nbCellKey(cell), branch_id: (S.branchState || {}).branch_id }) });
     await loadWorkbenchState(S.currentId, true);
@@ -4697,7 +4702,7 @@ function cellNode(e) {
   actions.appendChild(notebookCellButton(t("nb.action.copy"), "copy", true, () => copyNotebookCell(e.source || "")));
   const replEnabled = !!(_kc.st && _kc.st.repl_enabled), appendable = replEnabled && !e.live && !!String(e.source || "").trim();
   actions.appendChild(notebookCellButton(t("nb.action.rerun"), "refresh", appendable, () => executeNotebookCode(e.source || "", e.language || "python")));
-  actions.appendChild(notebookCellButton(t("nb.action.fork"), "provenance", branchCapability("fork"), () => forkNotebookCell(e)));
+  actions.appendChild(notebookCellButton(t("nb.action.fork"), "provenance", branchCapability("fork_from_cell"), () => forkNotebookCell(e)));
   actions.appendChild(notebookCellButton(t("nb.action.promote"), "star", branchCapability("promote"), () => promoteNotebookCell(e)));
   c.appendChild(actions);
   return c;

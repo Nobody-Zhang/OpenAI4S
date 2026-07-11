@@ -41,6 +41,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from openai4s.agent.engine import AgentEngine
+from openai4s.agent.finalize import with_finalize_response
 from openai4s.agent.ledger import (
     RuntimeActionLedger,
     new_turn_id,
@@ -81,10 +82,12 @@ from openai4s.server.plans import public_plan as _plan_public
 from openai4s.server.plans import short_hash as _short_hash
 from openai4s.server.plans import slugify as _slugify
 from openai4s.server.reviews import ReviewPorts, ReviewService
+from openai4s.server.session_domain import SessionDomainService
 from openai4s.server.session_recovery import PROCESS_INSTANCE_ID, SessionRecoveryService
 from openai4s.server.session_runtime import SessionRuntime
 from openai4s.server.skills import SkillCustomizationService
 from openai4s.server.titles import SessionTitleService
+from openai4s.server.workbench_state import SessionWorkbenchStateService
 from openai4s.skills_loader import SkillLoader
 from openai4s.store import Store, get_store
 from openai4s.tools import control_tool_specs, get_tool
@@ -438,6 +441,7 @@ class SessionState:
         # turn only ends via host.submit_output (prose-only replies are nudged).
         self.explore: bool = False
         self.last_model_prose: str = ""
+        self.last_engine_completion = None
         # Set only around one AgentEngine CodeCell dispatch so the compatible
         # ``_execute_and_log`` call shape need not expose ledger internals.
         self.active_action_group_id: str | None = None
@@ -960,6 +964,24 @@ class SessionRunner:
             guess_content_type=_guess_ctype,
             checksum=_sha256,
         )
+        self.session_domain = SessionDomainService(
+            self.store,
+            data_dir=self.cfg.data_dir,
+            workspace=self.workspace_for_branch,
+            event_sink=lambda event: self.hub.emitter(event["root_frame_id"])(
+                event
+            ),
+        )
+        self.workbench = SessionWorkbenchStateService(
+            self.store,
+            state_for=self._existing_state,
+            history_for=lambda root_frame_id: restore_action_history(
+                self.store, root_frame_id
+            ),
+            llm_config_for=lambda state: self._llm_cfg(state),
+            pending_for=self._pending_permissions,
+            context_window_fallback=self.cfg.context_window_tokens,
+        )
         self.plans = PlanService(
             store=self.store,
             emitter_for=lambda root_frame_id: self.hub.emitter(root_frame_id),
@@ -1041,6 +1063,30 @@ class SessionRunner:
         ws = self._ws_root / root_frame_id
         ws.mkdir(parents=True, exist_ok=True)
         return ws
+
+    def workspace_for_branch(self, root_frame_id: str, branch_id: str) -> Path:
+        """Return an isolated writable directory for a checkpoint branch."""
+
+        if branch_id == root_frame_id:
+            return self.workspace_for(root_frame_id)
+        root_key = hashlib.sha256(root_frame_id.encode("utf-8")).hexdigest()[:24]
+        branch_key = hashlib.sha256(branch_id.encode("utf-8")).hexdigest()[:24]
+        workspace = self._ws_root / ".branches" / root_key / branch_key
+        workspace.mkdir(parents=True, exist_ok=True)
+        return workspace
+
+    def _existing_state(self, root_frame_id: str) -> SessionState | None:
+        with self._lock:
+            return self._sessions.get(root_frame_id)
+
+    @staticmethod
+    def _pending_permissions(root_frame_id: str) -> list[dict]:
+        try:
+            from openai4s.permissions import broker
+
+            return list(broker().pending_events(root_frame_id))
+        except Exception:  # noqa: BLE001 - status fails closed to no payload
+            return []
 
     def _session_snapshot(self) -> list[SessionState]:
         with self._lock:
@@ -1276,6 +1322,47 @@ class SessionRunner:
             result = dict(result)
             result["artifact"] = _artifact_json(result["artifact"])
         return result
+
+    def mutate_session_domain(
+        self,
+        root_frame_id: str,
+        project_id: str,
+        *,
+        operation: str,
+        mutate,
+        invalidate_kernel: bool = False,
+    ) -> dict:
+        """Serialize one checkpoint/branch mutation with scientific writers."""
+
+        st = self._state(root_frame_id, project_id)
+        with self._session_execution(
+            st,
+            owner="lifecycle",
+            owner_id=f"{operation}-{uuid.uuid4().hex[:12]}",
+            reason=operation.replace("_", " "),
+        ) as execution:
+            result = mutate()
+            if invalidate_kernel and result.get("ok"):
+                st.kernels.stop(
+                    "python", manual=False, reason="branch_revert_requires_recovery"
+                )
+                st.kernels.stop(
+                    "r", manual=False, reason="branch_revert_requires_recovery"
+                )
+                self.hub.emitter(root_frame_id)(
+                    {
+                        "type": "kernel_status",
+                        "frame_id": root_frame_id,
+                        "status": "ended",
+                        "state": "ended",
+                        "ended_reason": "branch_revert_requires_recovery",
+                        "requires_kernel_recovery": True,
+                    }
+                )
+            self.executions.mark_finalizing(
+                execution, reason=f"persisting {operation.replace('_', ' ')}"
+            )
+            return result
 
     def _state(self, root_frame_id: str, project_id: str) -> SessionState:
         scope = self.store.resolve_frame_scope(
@@ -2971,6 +3058,7 @@ class SessionRunner:
             loop_reason: str | None = None
             try:
                 st.dispatcher.last_output = None
+                st.last_engine_completion = None
                 st.active_action_ledger = action_ledger
                 try:
                     # Keep the historical three-argument composition seam so
@@ -2980,7 +3068,10 @@ class SessionRunner:
                     st.active_action_ledger = None
                 action_ledger.append_terminal(
                     loop_reason or "unknown",
-                    completion=getattr(st.dispatcher, "last_output", None),
+                    completion=(
+                        st.last_engine_completion
+                        or getattr(st.dispatcher, "last_output", None)
+                    ),
                 )
                 if loop_reason == "max_turns":
                     status = "failed"
@@ -3033,7 +3124,8 @@ class SessionRunner:
                     str(block.get("text") or "") for block in assistant_visible
                 ).strip()
                 final_text = completion_message(
-                    getattr(st.dispatcher, "last_output", None),
+                    st.last_engine_completion
+                    or getattr(st.dispatcher, "last_output", None),
                     produced_artifacts,
                     previous_text=prior_text,
                     language=response_language(user_text),
@@ -3234,11 +3326,25 @@ class SessionRunner:
             except Exception:  # noqa: BLE001 — plan capture must not break a turn
                 traceback.print_exc()
 
+        tool_catalog = None
+        if not st.plan:
+            catalog_factory = getattr(st.dispatcher, "tool_catalog", None)
+            if callable(catalog_factory):
+                tool_catalog = catalog_factory()
+        model_tools = ()
+        if not st.plan:
+            model_tools = (
+                (lambda messages: with_finalize_response(
+                    tool_catalog.specs_for(messages)
+                ))
+                if tool_catalog is not None
+                else with_finalize_response(control_tool_specs())
+            )
         engine = AgentEngine(
             ChatModel(
                 llm_cfg,
                 chat,
-                tools=() if st.plan else control_tool_specs(),
+                tools=model_tools,
                 stream=True,
             ),
             WebActionExecutor(
@@ -3257,6 +3363,7 @@ class SessionRunner:
                 plan_mode=st.plan,
                 finalize_plan=finalize_plan,
                 cancelled=st.cancel.is_set,
+                tool_catalog=tool_catalog,
             ),
             context_policy=CompactionPolicy(self.cfg),
             event_sink=events,
@@ -3268,6 +3375,7 @@ class SessionRunner:
         )
         state = RunState(st.messages, max_turns=max_turns)
         result = engine.run(state)
+        st.last_engine_completion = result.completion
         st.last_model_prose = events.model_prose
         return result.stop_reason
 
@@ -5071,6 +5179,206 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
             if m and method == "GET":
                 self._json(self._exec_log(m.group(1)))
                 return
+            # ---- scientific session workbench projections -------------
+            m = re.fullmatch(r"/frames/([^/]+)/action-timeline", sub)
+            if m and method == "GET":
+                after = (q.get("after_ordinal") or [None])[0]
+                self._json(
+                    runner.session_domain.action_timeline(
+                        m.group(1),
+                        branch_id=(q.get("branch_id") or [None])[0],
+                        after_ordinal=(int(after) if after not in (None, "") else None),
+                    )
+                )
+                return
+            m = re.fullmatch(r"/frames/([^/]+)/execution-queue", sub)
+            if m and method == "GET":
+                self._json(runner.executions.snapshot(m.group(1)))
+                return
+            m = re.fullmatch(r"/frames/([^/]+)/context", sub)
+            if m and method == "GET":
+                self._json(runner.workbench.context(m.group(1)))
+                return
+            m = re.fullmatch(r"/frames/([^/]+)/security", sub)
+            if m and method == "GET":
+                self._json(runner.workbench.security(m.group(1)))
+                return
+            m = re.fullmatch(r"/frames/([^/]+)/recovery", sub)
+            if m and method == "GET":
+                self._json(
+                    runner.session_domain.recovery_status(
+                        m.group(1),
+                        branch_id=(q.get("branch_id") or [None])[0],
+                    )
+                )
+                return
+            m = re.fullmatch(r"/frames/([^/]+)/recovery/actions", sub)
+            if m and method == "GET":
+                self._json(
+                    runner.session_domain.recovery_actions(
+                        m.group(1),
+                        branch_id=(q.get("branch_id") or [None])[0],
+                    )
+                )
+                return
+            m = re.fullmatch(r"/frames/([^/]+)/branches", sub)
+            if m and method == "GET":
+                self._json(runner.session_domain.branches(m.group(1)))
+                return
+            m = re.fullmatch(
+                r"/frames/([^/]+)/(?:checkpoints|branches/checkpoints)", sub
+            )
+            if m and method == "GET":
+                self._json(
+                    runner.session_domain.checkpoints(
+                        m.group(1),
+                        branch_id=(q.get("branch_id") or [None])[0],
+                    )
+                )
+                return
+            if m and method == "POST":
+                fid = m.group(1)
+                frame = store.get_frame(fid)
+                if frame is None:
+                    raise GatewayError(404, "session not found")
+                body = self._body()
+                self._json(
+                    runner.mutate_session_domain(
+                        fid,
+                        frame.get("project_id") or "default",
+                        operation="create_checkpoint",
+                        mutate=lambda: runner.session_domain.create_checkpoint(
+                            fid,
+                            branch_id=body.get("branch_id"),
+                            reason=body.get("reason") or "manual",
+                            expected_head=body.get("expected_head"),
+                        ),
+                    )
+                )
+                return
+            m = re.fullmatch(r"/frames/([^/]+)/branches/fork", sub)
+            if m and method == "POST":
+                fid = m.group(1)
+                frame = store.get_frame(fid)
+                if frame is None:
+                    raise GatewayError(404, "session not found")
+                body = self._body()
+                if body.get("from_cell_id") and not body.get("from_checkpoint_id"):
+                    raise GatewayError(
+                        409,
+                        "fork-from-cell is unavailable; create a checkpoint first",
+                    )
+                source = body.get("from_checkpoint_id")
+                if not source:
+                    raise GatewayError(400, "from_checkpoint_id is required")
+                self._json(
+                    runner.mutate_session_domain(
+                        fid,
+                        frame.get("project_id") or "default",
+                        operation="fork_branch",
+                        mutate=lambda: runner.session_domain.fork_branch(
+                            fid,
+                            from_checkpoint_id=source,
+                            branch_id=body.get("branch_id"),
+                            name=body.get("name"),
+                        ),
+                    )
+                )
+                return
+            m = re.fullmatch(
+                r"/frames/([^/]+)/(?:revert/preview|branches/revert-preview)", sub
+            )
+            if m and method == "POST":
+                body = self._body()
+                target = body.get("target_checkpoint_id")
+                if not target:
+                    raise GatewayError(400, "target_checkpoint_id is required")
+                self._json(
+                    {
+                        "preview": runner.session_domain.revert_preview(
+                            m.group(1),
+                            target_checkpoint_id=target,
+                            branch_id=body.get("branch_id"),
+                        )
+                    }
+                )
+                return
+            m = re.fullmatch(
+                r"/frames/([^/]+)/(?:revert/apply|branches/revert)", sub
+            )
+            if m and method == "POST":
+                fid = m.group(1)
+                frame = store.get_frame(fid)
+                if frame is None:
+                    raise GatewayError(404, "session not found")
+                body = self._body()
+                target = body.get("target_checkpoint_id")
+                if not target:
+                    raise GatewayError(400, "target_checkpoint_id is required")
+                result = runner.mutate_session_domain(
+                    fid,
+                    frame.get("project_id") or "default",
+                    operation="revert_session",
+                    mutate=lambda: runner.session_domain.revert_apply(
+                        fid,
+                        target_checkpoint_id=target,
+                        branch_id=body.get("branch_id"),
+                    ),
+                    invalidate_kernel=True,
+                )
+                self._json(result, 200 if result.get("ok") else 409)
+                return
+            m = re.fullmatch(r"/frames/([^/]+)/revert/undo", sub)
+            if m and method == "POST":
+                fid = m.group(1)
+                frame = store.get_frame(fid)
+                if frame is None:
+                    raise GatewayError(404, "session not found")
+                body = self._body()
+                revert_checkpoint = body.get("revert_checkpoint_id")
+                if not revert_checkpoint:
+                    raise GatewayError(400, "revert_checkpoint_id is required")
+                result = runner.mutate_session_domain(
+                    fid,
+                    frame.get("project_id") or "default",
+                    operation="undo_revert",
+                    mutate=lambda: runner.session_domain.revert_undo(
+                        fid,
+                        revert_checkpoint_id=revert_checkpoint,
+                        branch_id=body.get("branch_id"),
+                    ),
+                    invalidate_kernel=True,
+                )
+                self._json(result, 200 if result.get("ok") else 409)
+                return
+            m = re.fullmatch(r"/frames/([^/]+)/revert/operations", sub)
+            if m and method == "GET":
+                self._json(
+                    {
+                        "operations": runner.session_domain.revert_operations(
+                            m.group(1),
+                            branch_id=(q.get("branch_id") or [None])[0],
+                        )
+                    }
+                )
+                return
+            m = re.fullmatch(r"/frames/([^/]+)/notebook/export", sub)
+            if m and method == "GET":
+                exported = runner.session_domain.notebook_export(
+                    m.group(1), language=(q.get("language") or [None])[0]
+                )
+                self._send(
+                    200,
+                    exported["data"],
+                    exported["content_type"],
+                    {
+                        "Content-Disposition": (
+                            f'attachment; filename="{exported["filename"]}"'
+                        ),
+                        "X-Content-SHA256": exported["sha256"],
+                    },
+                )
+                return
             m = re.fullmatch(r"/frames/([^/]+)/execution", sub)
             if m and method == "GET":
                 self._json(runner.executions.snapshot(m.group(1)))
@@ -5228,6 +5536,19 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 return
 
             # ---- artifacts ----
+            if sub == "/renderers" and method == "GET":
+                self._json({"renderers": runner.session_domain.renderer_catalog()})
+                return
+            m = re.fullmatch(r"/artifacts/([^/]+)/renderer", sub)
+            if m and method == "GET":
+                self._json(
+                    runner.session_domain.artifact_renderer(
+                        m.group(1),
+                        version_id=(q.get("version") or [None])[0],
+                        root_frame_id=(q.get("root_frame_id") or [None])[0],
+                    )
+                )
+                return
             m = re.fullmatch(r"/artifacts/([^/]+)/lineage", sub)
             if m and method == "GET":
                 self._json(self._lineage(m.group(1)))
