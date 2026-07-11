@@ -66,6 +66,10 @@ from openai4s.server.agent_run import WebActionExecutor, WebEventSink
 from openai4s.server.artifacts import ArtifactManager, ArtifactOperationError
 from openai4s.server.cell_run import CellExecutionPorts, CellExecutionService
 from openai4s.server.completions import completion_message, response_language
+from openai4s.server.execution_coordinator import (
+    ExecutionCancelled,
+    WebExecutionCoordinator,
+)
 from openai4s.server.execution_views import ExecutionViewService
 
 # Keep the former gateway helper names as compatibility aliases; plan behavior
@@ -321,6 +325,9 @@ class WSHub:
             "step_update",
             "plan_ready",
             "plan_progress",
+            "execution_state",
+            "execution_queue",
+            "execution_owner",
         ):
             buf["events"].append(obj)
             if len(buf["events"]) > self._BUFFER_CAP:
@@ -419,6 +426,10 @@ class SessionState:
         self.stop_finished = threading.Event()
         self.stop_finished.set()
         self.stop_lock = threading.Lock()
+        # Admission intent is shorter-lived than ``turn_lock``.  It closes the
+        # tiny race between a lifecycle Stop reserving FIFO ownership and a new
+        # message/REPL ticket being submitted.
+        self.admission_lock = threading.Lock()
         self.cancel = threading.Event()
         # Per-session model override (from the composer dropdown) + plan flag.
         self.model: str | None = None
@@ -498,6 +509,8 @@ class MessageJob:
         self.started_at = time.time()
         self.finished_at: float | None = None
         self.thread: threading.Thread | None = None
+        self.execution_id: str | None = None
+        self.execution_owner: dict[str, str] | None = None
 
     def finish(self, result: dict | None = None, error: str | None = None) -> None:
         self.result = result
@@ -890,6 +903,13 @@ class SessionRunner:
         self._jobs: dict[str, MessageJob] = {}
         self._lock = threading.Lock()
         self._closed = False
+        self.executions = WebExecutionCoordinator(
+            lambda root_frame_id, event: self.hub.emitter(root_frame_id)(event),
+            clock=self._clock,
+        )
+        # Compatibility spelling used by recovery/runtime probes.
+        self.coordinator = self.executions
+        self._turn_local = threading.local()
         self.reviews = ReviewService(
             store=lambda: self.store,
             lock=self._lock,
@@ -1035,10 +1055,23 @@ class SessionRunner:
             return False
         try:
             snapshot = coordinator.snapshot(root_frame_id)
+            owner = snapshot.get("owner")
+            current = self.executions.current(root_frame_id)
+            owns_only_recovery_ticket = bool(
+                current
+                and current.owner.kind == "recovery"
+                and owner
+                and owner.get("execution_id") == current.execution_id
+                and not snapshot.get("queued_count")
+                and not snapshot.get("queue")
+            )
             return bool(
-                snapshot.get("owner")
-                or snapshot.get("queued_count")
-                or snapshot.get("queue")
+                not owns_only_recovery_ticket
+                and (
+                    owner
+                    or snapshot.get("queued_count")
+                    or snapshot.get("queue")
+                )
             )
         except Exception:  # noqa: BLE001 — unknown coordinator state is occupied
             return True
@@ -1103,42 +1136,56 @@ class SessionRunner:
 
         emit = self.hub.emitter(st.root_frame_id)
         with st.stop_lock:
-            st.stop_finished.clear()
-            st.stop_requested.set()
+            ticket = self.executions.submit(
+                st.root_frame_id,
+                owner="recovery",
+                owner_id=f"idle-{uuid.uuid4().hex[:12]}",
+                branch_id=st.root_frame_id,
+                resource_keys=("workspace", "kernel:python", "kernel:r"),
+                metadata={"reason": reason},
+            )
             try:
-                # The sweeper must never wait behind a turn while holding its
-                # stop intent: a raced active/queued turn is simply retried by
-                # a later sweep, which keeps shutdown and thread stop bounded.
-                if not st.turn_lock.acquire(blocking=False):
-                    return False
-                try:
-                    # Admission is now closed. Recheck every external blocker so
-                    # the first sweep's optimistic snapshot cannot win a race.
-                    if self.recovery.blocked(st) or not self.recovery.idle_expired(st):
+                with self.executions.admitted(
+                    ticket, cancel_event=st.cancel, timeout=0.0
+                ):
+                    # A pre-coordinator compatibility holder may still own the
+                    # old lock. Never let the sweeper wait for it.
+                    if not st.turn_lock.acquire(blocking=False):
                         return False
-                    stopped = st.kernels.stop(
-                        "python", manual=False, reason=reason
+                    try:
+                        # Admission is now closed. Recheck every external blocker
+                        # so an optimistic sweeper snapshot cannot win a race.
+                        if self.recovery.blocked(
+                            st
+                        ) or not self.recovery.idle_expired(st):
+                            return False
+                        stopped = st.kernels.stop(
+                            "python", manual=False, reason=reason
+                        )
+                        stopped += st.kernels.stop(
+                            "r", manual=False, reason=reason
+                        )
+                    finally:
+                        st.turn_lock.release()
+                    if not stopped:
+                        return False
+                    status = st.kernels.status("python")
+                    self.executions.mark_finalizing(
+                        ticket, reason="publishing idle kernel release"
                     )
-                    stopped += st.kernels.stop("r", manual=False, reason=reason)
-                finally:
-                    st.turn_lock.release()
-                if not stopped:
-                    return False
-                status = st.kernels.status("python")
-                emit(
-                    {
-                        "type": "kernel_status",
-                        "frame_id": st.root_frame_id,
-                        "status": "ended",
-                        "state": "ended",
-                        "generation_id": status.get("generation_id"),
-                        "ended_reason": reason,
-                    }
-                )
-                return True
-            finally:
-                st.stop_requested.clear()
-                st.stop_finished.set()
+                    emit(
+                        {
+                            "type": "kernel_status",
+                            "frame_id": st.root_frame_id,
+                            "status": "ended",
+                            "state": "ended",
+                            "generation_id": status.get("generation_id"),
+                            "ended_reason": reason,
+                        }
+                    )
+                    return True
+            except (ExecutionCancelled, TimeoutError):
+                return False
 
     def drop_session(self, root_frame_id: str, *, reason: str = "session_closed") -> bool:
         """Cancel and fully detach one in-memory session before deletion/close."""
@@ -1152,6 +1199,7 @@ class SessionRunner:
             st.stop_requested.set()
             try:
                 self.cancel(root_frame_id)
+                self.executions.close_session(root_frame_id, reason=reason)
                 self._interrupt_background(st)
                 with st.turn_lock:
                     st.kernels.stop("python", manual=False, reason=reason)
@@ -1179,6 +1227,7 @@ class SessionRunner:
         recovery = getattr(self, "recovery", None)
         if recovery is not None:
             recovery.stop()
+        self.executions.close(reason="daemon_shutdown")
         for st in self._session_snapshot():
             self.drop_session(st.root_frame_id, reason="daemon_shutdown")
         with self._lock:
@@ -1240,6 +1289,90 @@ class SessionRunner:
                 )
                 self._sessions[root_frame_id] = st
             return st
+
+    def _queue_execution(
+        self,
+        st: SessionState,
+        *,
+        owner: str,
+        owner_id: str,
+        language: str | None = None,
+        reason: str,
+    ):
+        """Submit after any already-reserved Stop, without holding a long lock."""
+
+        while True:
+            st.stop_finished.wait()
+            with st.admission_lock:
+                if st.stop_requested.is_set():
+                    continue
+                return self.executions.submit(
+                    st.root_frame_id,
+                    owner=owner,
+                    owner_id=owner_id,
+                    branch_id=st.root_frame_id,
+                    language=language,
+                    resource_keys=("workspace", f"kernel:{language or 'control'}"),
+                    metadata={"reason": reason},
+                )
+
+    @contextmanager
+    def _session_execution(
+        self,
+        st: SessionState,
+        *,
+        owner: str,
+        owner_id: str,
+        language: str | None = None,
+        reason: str,
+        ticket=None,
+    ):
+        """Combine FIFO ownership with the compatible turn-lock barrier.
+
+        Admission always happens before ``turn_lock``.  No path may hold the
+        old lock while waiting for a FIFO ticket, which prevents a two-lock
+        cycle during the incremental migration.
+        """
+
+        current = self.executions.current(st.root_frame_id)
+        owns_admission = current is None
+        ticket = current or ticket
+        if ticket is None:
+            ticket = self._queue_execution(
+                st,
+                owner=owner,
+                owner_id=owner_id,
+                language=language,
+                reason=reason,
+            )
+
+        @contextmanager
+        def turn_barrier():
+            held = getattr(self._turn_local, "sessions", None)
+            if held is None:
+                held = self._turn_local.sessions = []
+            if st.root_frame_id in held:
+                yield
+                return
+            with st.execution_barrier():
+                # An exact cancel may arrive after admission but before a
+                # legacy holder releases turn_lock.  execution_barrier clears
+                # the old Event on entry, so restore the ticket-owned signal.
+                if ticket.cancellation.is_set():
+                    st.cancel.set()
+                held.append(st.root_frame_id)
+                try:
+                    yield
+                finally:
+                    held.pop()
+
+        if owns_admission:
+            with self.executions.admitted(ticket, cancel_event=st.cancel):
+                with turn_barrier():
+                    yield ticket
+            return
+        with turn_barrier():
+            yield ticket
 
     def _seed_messages(self, st: SessionState) -> None:
         """Build the system prompt (+ project context + skills + memory) once,
@@ -1659,13 +1792,59 @@ class SessionRunner:
 
         return sink
 
-    def cancel(self, root_frame_id: str) -> None:
+    def cancel(
+        self,
+        root_frame_id: str,
+        execution_id: str | None = None,
+        *,
+        owner: dict | str | None = None,
+        owner_id: str | None = None,
+        reason: str = "cancelled by user",
+    ) -> dict:
+        """Cancel a scoped ticket; legacy callers resolve the exact owner first."""
+
+        owner_kind = owner.get("kind") if isinstance(owner, dict) else owner
+        owner_id = (
+            (owner.get("id") if isinstance(owner, dict) else owner_id) or owner_id
+        )
+        if execution_id:
+            if not owner_kind or not owner_id:
+                return {
+                    "ok": False,
+                    "frame_id": root_frame_id,
+                    "execution_id": execution_id,
+                    "reason": "exact cancellation requires owner.kind and owner.id",
+                }
+            result = self.executions.cancel(
+                root_frame_id,
+                execution_id=execution_id,
+                owner=str(owner_kind),
+                owner_id=str(owner_id),
+                reason=reason,
+            )
+        else:
+            result = self.executions.cancel_current(root_frame_id, reason=reason)
+        # A queued cancellation must not release the active Agent's approval or
+        # reviewer.  Those session-global compatibility paths are touched only
+        # after the coordinator proved the exact running owner.
+        if not result.get("ok"):
+            # Manual evidence review predates scientific execution tickets and
+            # has its own exact root-scoped operation signal. Preserve that
+            # independent cancellation channel without touching any queued or
+            # running scientific owner.
+            with self._lock:
+                if root_frame_id in self.reviews.operations:
+                    self.reviews.cancel_locked(root_frame_id)
+                    return {
+                        "ok": True,
+                        "frame_id": root_frame_id,
+                        "scope": "review",
+                    }
+            return result
+        if result.get("scope") != "running":
+            return result
         with self._lock:
             self.reviews.cancel_locked(root_frame_id)
-            st = self._sessions.get(root_frame_id)
-        if st is None:
-            return
-        st.cancel.set()
         # Release any pending permission prompt for this conversation (deny).
         try:
             from openai4s.permissions import broker
@@ -1673,15 +1852,31 @@ class SessionRunner:
             broker().cancel_root(root_frame_id)
         except Exception:  # noqa: BLE001
             pass
-        # A running ```r cell blocks the same turn thread as Python.  Interrupt
-        # both exact supervisor slots without waiting on the execution barrier.
-        st.kernels.interrupt()
+        return result
 
-    def interrupt_kernel(self, root_frame_id: str) -> dict:
-        """Best-effort user interrupt for both persistent execution channels."""
-        st = self._sessions.get(root_frame_id)
-        interrupted = st.kernels.interrupt() if st is not None else 0
-        return {"ok": True, "interrupted": interrupted, "frame_id": root_frame_id}
+    def interrupt_kernel(
+        self,
+        root_frame_id: str,
+        execution_id: str | None = None,
+        *,
+        owner: dict | str | None = None,
+        owner_id: str | None = None,
+    ) -> dict:
+        """Interrupt only the frozen lease owned by an exact execution ticket."""
+
+        if not execution_id:
+            return {
+                "ok": False,
+                "frame_id": root_frame_id,
+                "reason": "execution_id is required for kernel interrupt",
+            }
+        return self.cancel(
+            root_frame_id,
+            execution_id,
+            owner=owner,
+            owner_id=owner_id,
+            reason="kernel interrupt requested by user",
+        )
 
     def _run_bootstrap(self, st: SessionState, kernel: Kernel | None = None) -> dict:
         """Run and persist the bootstrap facts observed for one generation."""
@@ -1734,7 +1929,12 @@ class SessionRunner:
         """
         st = self._state(root_frame_id, project_id)
         emit = self.hub.emitter(root_frame_id)
-        with st.execution_barrier():
+        with self._session_execution(
+            st,
+            owner="lifecycle",
+            owner_id=f"restart-{uuid.uuid4().hex[:12]}",
+            reason="kernel restart",
+        ) as execution:
             self.recovery.touch(st)
             # the R kernel restarts with the session: drop it here and let the
             # next ```r cell respawn it fresh (same lazy path as first use)
@@ -1761,6 +1961,9 @@ class SessionRunner:
                     "python", after_restart=lambda kernel: self._run_bootstrap(st, kernel)
                 )
             gen = lease.generation if lease is not None else 0
+            self.executions.mark_finalizing(
+                execution, reason="publishing restarted kernel state"
+            )
             emit(
                 {
                     "type": "kernel_status",
@@ -1961,30 +2164,57 @@ class SessionRunner:
             return {"ok": True, "state": "none", "frame_id": root_frame_id}
         emit = self.hub.emitter(root_frame_id)
         with st.stop_lock:
-            st.stop_finished.clear()
-            st.stop_requested.set()
             try:
-                self.cancel(root_frame_id)
-                # Wait for the single protocol reader to leave before detaching
-                # and shutting down its worker. New turns observe stop_requested
-                # and yield this barrier instead of clearing cancellation.
-                with st.turn_lock:
-                    st.kernels.stop(
-                        "python", manual=True, reason="manual_stop"
+                # Reserve Stop intent and its FIFO ticket atomically with respect
+                # to new message/REPL/lifecycle admission.  The outer finally
+                # also reopens admission if coordinator submission itself fails.
+                with st.admission_lock:
+                    st.stop_finished.clear()
+                    st.stop_requested.set()
+                    cancel_result = self.cancel(root_frame_id)
+                    ticket = self.executions.submit(
+                        root_frame_id,
+                        owner="lifecycle",
+                        owner_id=f"stop-{uuid.uuid4().hex[:12]}",
+                        branch_id=root_frame_id,
+                        resource_keys=("workspace", "kernel:python", "kernel:r"),
+                        metadata={"reason": "manual kernel stop"},
                     )
-                    st.kernels.stop("r", manual=True, reason="manual_stop")
-                stopped_status = st.kernels.status("python")
-                # Publish the stopped state before waking a queued start; its
-                # later "started" event must be the final visible lifecycle.
-                emit(
-                    {
-                        "type": "kernel_status",
-                        "frame_id": root_frame_id,
-                        "status": "stopped",
-                        "generation_id": stopped_status.get("generation_id"),
-                        "ended_reason": "manual_stop",
-                    }
-                )
+                # A pre-coordinator legacy holder has no execution id to cancel.
+                # Freeze its leases and use ABA-safe exact interrupts rather
+                # than the old broad supervisor interrupt.
+                if not (cancel_result or {}).get("ok"):
+                    for language in ("python", "r"):
+                        lease = st.kernels.lease(language)
+                        if lease is not None:
+                            st.kernels.interrupt_if_current(lease)
+                with self.executions.admitted(ticket, cancel_event=st.cancel):
+                    # Wait for the single protocol reader to leave before
+                    # detaching and shutting down its exact worker slots.
+                    with st.turn_lock:
+                        st.kernels.stop(
+                            "python", manual=True, reason="manual_stop"
+                        )
+                        st.kernels.stop("r", manual=True, reason="manual_stop")
+                    stopped_status = st.kernels.status("python")
+                    self.executions.mark_finalizing(
+                        ticket, reason="publishing stopped kernel state"
+                    )
+                    # Publish before waking a queued start; its later "started"
+                    # event must remain the final visible lifecycle state.
+                    emit(
+                        {
+                            "type": "kernel_status",
+                            "frame_id": root_frame_id,
+                            "status": "stopped",
+                            "generation_id": stopped_status.get("generation_id"),
+                            "ended_reason": "manual_stop",
+                        }
+                    )
+                # Preserve the compatible stopped marker until a new admitted
+                # execution clears it; do this after the lifecycle ticket exits
+                # so Stop itself is not projected as cancelled.
+                st.cancel.set()
             finally:
                 st.stop_requested.clear()
                 st.stop_finished.set()
@@ -1995,10 +2225,18 @@ class SessionRunner:
         the user can resume. Idempotent when already running."""
         st = self._state(root_frame_id, project_id)
         emit = self.hub.emitter(root_frame_id)
-        with st.execution_barrier():
+        with self._session_execution(
+            st,
+            owner="lifecycle",
+            owner_id=f"start-{uuid.uuid4().hex[:12]}",
+            reason="kernel start",
+        ) as execution:
             self._ensure_kernel(st)
             lease = st.kernels.lease("python")
             gen = lease.generation if lease is not None else 0
+            self.executions.mark_finalizing(
+                execution, reason="publishing started kernel state"
+            )
             emit(
                 {
                     "type": "kernel_status",
@@ -2059,7 +2297,12 @@ class SessionRunner:
             }
         st = self._state(root_frame_id, project_id)
         emit = self.hub.emitter(root_frame_id)
-        with st.execution_barrier():
+        with self._session_execution(
+            st,
+            owner="lifecycle",
+            owner_id=f"env-{uuid.uuid4().hex[:12]}",
+            reason="kernel environment change",
+        ) as execution:
             st.pending_env = None
             alive = st.kernels.alive("python")
             already = alive and st.env_name == env_name
@@ -2073,6 +2316,9 @@ class SessionRunner:
                     st.dispatcher.active_env_bin = env.bin_dir
             gen = lease.generation if lease is not None else 0
             lifecycle = st.kernels.status("python")["state"]
+            self.executions.mark_finalizing(
+                execution, reason="publishing environment state"
+            )
             emit(
                 {
                     "type": "kernel_status",
@@ -2161,6 +2407,15 @@ class SessionRunner:
         compatibility, but the work is no longer tied to the client socket.
         """
         job = MessageJob(f"job-{uuid.uuid4().hex[:12]}", root_frame_id)
+        st = self._state(root_frame_id, project_id)
+        ticket = self._queue_execution(
+            st,
+            owner="agent",
+            owner_id=job.job_id,
+            reason="user message",
+        )
+        job.execution_id = ticket.execution_id
+        job.execution_owner = ticket.owner.as_dict()
         with self._lock:
             # prune finished jobs so _jobs (and is_running scans) stay bounded,
             # keeping the most recent finished one per frame for wait_result races
@@ -2175,11 +2430,31 @@ class SessionRunner:
 
         def _target() -> None:
             try:
-                result = self.run_message(
-                    root_frame_id, project_id, user_text, model, plan, annos, explore
-                )
+                with self.executions.admitted(ticket, cancel_event=st.cancel):
+                    result = self.run_message(
+                        root_frame_id,
+                        project_id,
+                        user_text,
+                        model,
+                        plan,
+                        annos,
+                        explore,
+                    )
                 result.setdefault("job_id", job.job_id)
+                result.setdefault("execution_id", ticket.execution_id)
+                result.setdefault("owner", ticket.owner.as_dict())
                 job.finish(result=result)
+            except ExecutionCancelled as e:
+                job.finish(
+                    result={
+                        "status": "cancelled",
+                        "frame_id": root_frame_id,
+                        "job_id": job.job_id,
+                        "execution_id": ticket.execution_id,
+                        "owner": ticket.owner.as_dict(),
+                        "reason": str(e),
+                    }
+                )
             except Exception as e:  # noqa: BLE001
                 traceback.print_exc()
                 emit = self.hub.emitter(root_frame_id)
@@ -2544,7 +2819,12 @@ class SessionRunner:
         # plan mode wins: a plan turn never executes, so explore is meaningless
         st.explore = bool(explore) and not st.plan
         emit = self.hub.emitter(root_frame_id)
-        with st.execution_barrier():
+        with self._session_execution(
+            st,
+            owner="agent",
+            owner_id=f"direct-{uuid.uuid4().hex[:12]}",
+            reason="user message",
+        ) as execution:
             self.recovery.touch(st)
             # Tool-only and plan turns need the control plane and provider
             # history, not a scientific worker.  A CodeCell acquires its kernel
@@ -2763,13 +3043,27 @@ class SessionRunner:
             self.store.update_frame(
                 root_frame_id, status=("done" if status == "completed" else status)
             )
-            emit({"type": "frame_update", "frame_id": root_frame_id, "status": status})
+            self.executions.mark_finalizing(
+                execution,
+                reason=(
+                    "persisting completion"
+                    if status == "completed"
+                    else f"persisting {status} result"
+                ),
+            )
             self.recovery.touch(st)
-            return {
+            response = {
                 "status": status,
                 "frame_id": root_frame_id,
+                "execution_id": execution.execution_id,
+                "owner": execution.owner.as_dict(),
                 "error": err_text if status == "failed" else None,
             }
+        # For direct (non-MessageJob) calls the coordinator completes while the
+        # context exits. Keep the historical terminal frame event last; queued
+        # MessageJobs still complete their outer ticket immediately afterward.
+        emit({"type": "frame_update", "frame_id": root_frame_id, "status": status})
+        return response
 
     def _resolve_mentions(self, st: SessionState, text: str) -> str:
         """If the user @-referenced artifacts by filename, append their content so
@@ -2941,6 +3235,7 @@ class SessionRunner:
             else None
         )
         self.recovery.touch(st, language, state="busy")
+        self.executions.bind_lease(lease, st.kernels.interrupt_if_current)
         try:
             return execute_with_watchdog(
                 st.kernels,
@@ -2958,6 +3253,7 @@ class SessionRunner:
                 thread_name=f"os-cell-{st.root_frame_id}",
             )
         finally:
+            self.executions.unbind_lease(lease)
             # A watchdog may have replaced the captured lease. Touch whichever
             # exact generation is current rather than mutating a stale record.
             self.recovery.touch(st, language, state="active")
@@ -3222,23 +3518,51 @@ class SessionRunner:
         t.start()
         return job
 
-    def run_repl(self, root_frame_id: str, project_id: str, code: str) -> dict:
+    def run_repl(
+        self,
+        root_frame_id: str,
+        project_id: str,
+        code: str,
+        language: str = "python",
+    ) -> dict:
         """Execute code directly in the session kernel (notebook REPL, no LLM)."""
         st = self._state(root_frame_id, project_id)
         emit = self.hub.emitter(root_frame_id)
-        with st.execution_barrier():
+        execution_id = f"repl-{uuid.uuid4().hex}"
+        with self._session_execution(
+            st,
+            owner="user_repl",
+            owner_id=execution_id,
+            language=language,
+            reason="user notebook cell",
+        ) as execution:
             # CellExecutionService allocates the durable attempt before its
             # prepare_language hook lazily starts Python.
-            info = self._execute_and_log(st, code, "user", emit, stream=False)
+            info = self._execute_and_log(
+                st,
+                code,
+                "user",
+                emit,
+                stream=False,
+                language=language,
+            )
             r = info["result"]
+            self.executions.mark_finalizing(execution, reason="persisting notebook cell")
             emit(
                 {"type": "frame_update", "frame_id": root_frame_id, "status": "success"}
             )
             return {
+                "status": "cancelled" if execution.cancellation.is_set() else "completed",
+                "execution_id": execution.execution_id,
+                "owner": execution.owner.as_dict(),
                 "cell": {
                     "cell_index": info["idx"],
-                    "kernel_id": self._kernel_id(st),
-                    "language": self._kernel_language(st),
+                    "kernel_id": (
+                        self._r_kernel_id(st)
+                        if language == "r"
+                        else self._kernel_id(st)
+                    ),
+                    "language": language,
                     "source": code,
                     "stdout": r.get("stdout") or "",
                     "stderr": r.get("stderr") or "",
@@ -4450,8 +4774,27 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                     explore=bool(b.get("explore")),
                 )
                 if b.get("wait", True) is False:
+                    snapshot = runner.executions.snapshot(fid)
+                    queued = next(
+                        (
+                            item
+                            for item in snapshot.get("queue", [])
+                            if item.get("execution_id") == job.execution_id
+                        ),
+                        snapshot.get("owner")
+                        if (snapshot.get("owner") or {}).get("execution_id")
+                        == job.execution_id
+                        else None,
+                    )
                     self._json(
-                        {"status": "accepted", "frame_id": fid, "job_id": job.job_id},
+                        {
+                            "status": "accepted",
+                            "frame_id": fid,
+                            "job_id": job.job_id,
+                            "execution_id": job.execution_id,
+                            "owner": job.execution_owner,
+                            "queue_position": (queued or {}).get("queue_position"),
+                        },
                         202,
                     )
                 else:
@@ -4459,8 +4802,16 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 return
             m = re.fullmatch(r"/frames/([^/]+)/cancel", sub)
             if m and method == "POST":
-                runner.cancel(m.group(1))
-                self._json({"ok": True})
+                b = self._body()
+                self._json(
+                    runner.cancel(
+                        m.group(1),
+                        b.get("execution_id"),
+                        owner=b.get("owner") or b.get("owner_kind"),
+                        owner_id=b.get("owner_id"),
+                        reason=b.get("reason") or "cancelled by user",
+                    )
+                )
                 return
             # ---- permission gate: answer a pending tool-call approval ----
             m = re.fullmatch(r"/frames/([^/]+)/decision", sub)
@@ -4647,6 +4998,10 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
             if m and method == "GET":
                 self._json(self._exec_log(m.group(1)))
                 return
+            m = re.fullmatch(r"/frames/([^/]+)/execution", sub)
+            if m and method == "GET":
+                self._json(runner.executions.snapshot(m.group(1)))
+                return
             m = re.fullmatch(r"/frames/([^/]+)/kernel/execute", sub)
             if m and method == "POST":
                 if not runner.cfg.notebook_repl:
@@ -4660,8 +5015,24 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 fid = m.group(1)
                 f = store.get_frame(fid) or {}
                 pid = f.get("project_id") or "default"
-                code = self._body().get("code") or ""
-                self._json(runner.run_repl(fid, pid, code))
+                body = self._body()
+                code = body.get("code") or ""
+                language = str(body.get("language") or "python").lower()
+                if language not in {"python", "r"}:
+                    self._json({"error": "language must be python or r"}, 400)
+                    return
+                try:
+                    if "language" in body:
+                        result = runner.run_repl(fid, pid, code, language=language)
+                    else:
+                        result = runner.run_repl(fid, pid, code)
+                except ExecutionCancelled as error:
+                    result = {
+                        "status": "cancelled",
+                        "frame_id": fid,
+                        "reason": str(error),
+                    }
+                self._json(result)
                 return
             m = re.fullmatch(r"/frames/([^/]+)/kernel/restart", sub)
             if m and method == "POST":
@@ -4702,7 +5073,15 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                         403,
                     )
                     return
-                self._json(runner.interrupt_kernel(m.group(1)))
+                body = self._body()
+                kwargs = {}
+                if body.get("execution_id"):
+                    kwargs = {
+                        "execution_id": body.get("execution_id"),
+                        "owner": body.get("owner") or body.get("owner_kind"),
+                        "owner_id": body.get("owner_id"),
+                    }
+                self._json(runner.interrupt_kernel(m.group(1), **kwargs))
                 return
             m = re.fullmatch(r"/frames/([^/]+)/kernel/start", sub)
             if m and method == "POST":
@@ -5586,6 +5965,35 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                                     conn.send_json(ev)
                             except Exception:  # noqa: BLE001
                                 pass
+                            snapshot = runner.executions.snapshot(rid)
+                            conn.send_json(
+                                {
+                                    "type": "execution_queue",
+                                    "frame_id": rid,
+                                    **snapshot,
+                                }
+                            )
+                    elif t in {"cancel_execution", "cancel"}:
+                        rid = msg.get("root_frame_id") or msg.get("frame_id")
+                        if not rid:
+                            conn.send_json(
+                                {
+                                    "type": "execution_cancel_result",
+                                    "ok": False,
+                                    "reason": "root_frame_id is required",
+                                }
+                            )
+                            continue
+                        result = runner.cancel(
+                            rid,
+                            msg.get("execution_id"),
+                            owner=msg.get("owner") or msg.get("owner_kind"),
+                            owner_id=msg.get("owner_id"),
+                            reason=msg.get("reason") or "cancelled over websocket",
+                        )
+                        conn.send_json(
+                            {"type": "execution_cancel_result", **result}
+                        )
                     elif t == "unview_session":
                         rid = msg.get("root_frame_id") or msg.get("frame_id")
                         conn.subs.discard(rid)
