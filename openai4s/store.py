@@ -41,6 +41,15 @@ from openai4s.storage.agents import AgentProfileRepository
 from openai4s.storage.annotations import AnnotationRepository
 from openai4s.storage.connectors import ConnectorRepository
 from openai4s.storage.memories import MemoryRepository
+from openai4s.storage.metadata import (
+    DERIVABLE_HOST_CALLS,
+    SECRET_ARG_HOST_CALLS,
+    CompactionRepository,
+    EndpointRepository,
+    FolderRepository,
+    HostCallRepository,
+    NotesRepository,
+)
 from openai4s.storage.permissions import (
     DEFAULT_PERMISSION_RULES as _DEFAULT_PERMISSION_RULES,
 )
@@ -330,17 +339,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_perm ON permission_rules(scope, scope_id, t
 CREATE INDEX IF NOT EXISTS ix_perm_scope ON permission_rules(scope, scope_id);
 """
 
-# host.* methods that must NEVER be persisted to host_call_log (credential
-# reads: the value is already returned to the caller, logging it only duplicates
-# the secret at rest).
-DERIVABLE_HOST_CALLS = frozenset({"credentials_get", "credentials_list"})
-
-# host.* methods whose ARGS carry a raw secret value. The method name is still
-# logged for audit, but the args preview is redacted before it reaches
-# host_call_log (and such calls are excluded from the replay tape) so a plaintext
-# credential can never be serialized into SQLite or an exported notebook.
-SECRET_ARG_HOST_CALLS = frozenset({"credentials_set"})
-
 # Tables host.query must refuse to read. These hold secrets or
 # internal audit/memory state that is not part of the agent-visible data model:
 #   settings          -> LLM API key + model profiles (which embed API keys)
@@ -442,6 +440,31 @@ class Store:
             clock_ms=lambda: _now_ms(),
         )
         self._agents = AgentProfileRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
+        self._notes = NotesRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
+        self._folders = FolderRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
+        self._endpoints = EndpointRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
+        self._compactions = CompactionRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
+        self._host_calls = HostCallRepository(
             self._conn,
             self._lock,
             clock_ms=lambda: _now_ms(),
@@ -1991,42 +2014,17 @@ class Store:
     def add_note(
         self, *, project_id: str, content: str, title: str | None = None
     ) -> dict:
-        now = _now_ms()
-        nid = f"note_{uuid.uuid4().hex[:12]}"
-        self._exec(
-            "INSERT INTO notes(note_id,project_id,title,body,created_at) "
-            "VALUES(?,?,?,?,?)",
-            (nid, project_id, title, content, now),
+        return self._notes.add(
+            project_id=project_id,
+            content=content,
+            title=title,
         )
-        return {
-            "note_id": nid,
-            "project_id": project_id,
-            "content": content,
-            "created_at": now,
-            "updated_at": now,
-        }
 
     def list_notes(self, project_id: str) -> list[dict]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT note_id,project_id,title,body,created_at FROM notes "
-                "WHERE project_id=? ORDER BY created_at DESC",
-                (project_id,),
-            ).fetchall()
-        return [
-            {
-                "note_id": r["note_id"],
-                "project_id": r["project_id"],
-                "content": r["body"],
-                "title": r["title"],
-                "created_at": r["created_at"],
-                "updated_at": r["created_at"],
-            }
-            for r in rows
-        ]
+        return self._notes.list(project_id)
 
     def delete_note(self, note_id: str) -> None:
-        self._exec("DELETE FROM notes WHERE note_id=?", (note_id,))
+        self._notes.delete(note_id)
 
     # --- settings (KV) ---------------------------------------------------
     def get_setting(self, key: str, default: str | None = None) -> str | None:
@@ -2170,41 +2168,19 @@ class Store:
 
     # --- folders (session grouping within a project) --------------------
     def create_folder(self, *, project_id: str, name: str) -> dict:
-        now = _now_ms()
-        fid = f"fold_{uuid.uuid4().hex[:10]}"
-        self._exec(
-            "INSERT INTO folders(folder_id,project_id,name,created_at) "
-            "VALUES(?,?,?,?)",
-            (fid, project_id, name, now),
-        )
-        return {
-            "folder_id": fid,
-            "project_id": project_id,
-            "name": name,
-            "created_at": now,
-        }
+        return self._folders.create(project_id=project_id, name=name)
 
     def list_folders(self, project_id: str) -> list[dict]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT folder_id,project_id,name,created_at FROM folders "
-                "WHERE project_id=? ORDER BY name",
-                (project_id,),
-            ).fetchall()
-        return [dict(r) for r in rows]
+        return self._folders.list(project_id)
 
     def rename_folder(self, folder_id: str, name: str) -> None:
-        self._exec("UPDATE folders SET name=? WHERE folder_id=?", (name, folder_id))
+        self._folders.rename(folder_id, name)
 
     def delete_folder(self, folder_id: str) -> None:
-        # un-file any frames in the folder, then drop it
-        self._exec("UPDATE frames SET folder_id=NULL WHERE folder_id=?", (folder_id,))
-        self._exec("DELETE FROM folders WHERE folder_id=?", (folder_id,))
+        self._folders.delete(folder_id)
 
     def set_frame_folder(self, frame_id: str, folder_id: str | None) -> None:
-        self._exec(
-            "UPDATE frames SET folder_id=? WHERE frame_id=?", (folder_id, frame_id)
-        )
+        self._folders.set_frame_folder(frame_id, folder_id)
 
     # --- memories --------------------------------------------------------
     def add_memory(
@@ -2397,80 +2373,29 @@ class Store:
         compacted: list[dict],
         project_id: str = "default",
     ) -> str:
-        archive_id = f"ca-{uuid.uuid4().hex[:12]}"
-        self._exec(
-            "INSERT INTO compaction_archives(archive_id,frame_id,project_id,"
-            "summary,compacted,n_messages,created_at) VALUES(?,?,?,?,?,?,?)",
-            (
-                archive_id,
-                frame_id,
-                project_id,
-                summary,
-                json.dumps(compacted, ensure_ascii=False),
-                len(compacted),
-                _now_ms(),
-            ),
+        return self._compactions.archive(
+            frame_id=frame_id,
+            summary=summary,
+            compacted=compacted,
+            project_id=project_id,
         )
-        return archive_id
 
     # --- endpoints ----------------------------------------------
     def upsert_endpoint(self, name: str, **fields: Any) -> None:
-        now = _now_ms()
-        with self._lock:
-            exists = self._conn.execute(
-                "SELECT 1 FROM managed_endpoints WHERE name=?", (name,)
-            ).fetchone()
-            if exists:
-                fields["updated_at"] = now
-                cols = ", ".join(f"{k}=?" for k in fields)
-                self._conn.execute(
-                    f"UPDATE managed_endpoints SET {cols} WHERE name=?",
-                    (*fields.values(), name),
-                )
-            else:
-                fields.setdefault("created_at", now)
-                fields["updated_at"] = now
-                fields["name"] = name
-                cols = ", ".join(fields)
-                qs = ", ".join("?" for _ in fields)
-                self._conn.execute(
-                    f"INSERT INTO managed_endpoints({cols}) VALUES({qs})",
-                    tuple(fields.values()),
-                )
-            self._conn.commit()
+        self._endpoints.upsert(name, **fields)
 
     def list_endpoints(self) -> list[dict]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM managed_endpoints ORDER BY created_at"
-            ).fetchall()
-        return [dict(r) for r in rows]
+        return self._endpoints.list()
 
     # --- host_call audit ----------------------------------------
     def log_host_call(
         self, *, method: str, args: list, ok: bool, frame_id: str | None = None
     ) -> None:
-        if method in DERIVABLE_HOST_CALLS:
-            return  # never persisted (credentials scrubber)
-        if method in SECRET_ARG_HOST_CALLS:
-            # audit that the call happened, but never the secret payload.
-            preview = "<redacted secret args>"
-        else:
-            try:
-                preview = json.dumps(args, ensure_ascii=False)[:500]
-            except (TypeError, ValueError):
-                preview = "<unserializable>"
-        self._exec(
-            "INSERT INTO host_call_log(call_id,frame_id,method,args_preview,ok,"
-            "created_at) VALUES(?,?,?,?,?,?)",
-            (
-                f"hc-{uuid.uuid4().hex[:12]}",
-                frame_id,
-                method,
-                preview,
-                1 if ok else 0,
-                _now_ms(),
-            ),
+        self._host_calls.log(
+            method=method,
+            args=args,
+            ok=ok,
+            frame_id=frame_id,
         )
 
     # --- generic read-only query (host.query backing) -------------------
