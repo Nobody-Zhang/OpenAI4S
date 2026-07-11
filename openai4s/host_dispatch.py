@@ -24,6 +24,7 @@ from openai4s.config import Config, get_config
 from openai4s.host.completion import CompletionService
 from openai4s.host.credentials import CredentialService
 from openai4s.host.data import HostDataService
+from openai4s.host.delegation import DelegationService
 from openai4s.host.endpoints import EndpointService
 from openai4s.host.endpoints import endpoint_fingerprint as _endpoint_fingerprint
 from openai4s.host.endpoints import fallback_port as _fallback_port
@@ -234,34 +235,6 @@ GATEABLE_TOOLS = frozenset(
 )
 
 
-_BUILTIN_SPECIALIST_PROMPTS = {
-    "REMOTE_GPU_PROVISIONER": """\
-You are the remote-GPU provisioning specialist. Your job is to turn a user-added
-SSH GPU host into real, verified services that the main scientist can call.
-
-Protocol:
-1. Inspect the current state with `host.remote_gpu_status()` and choose the
-   default/reachable SSH alias unless the user named a specific one.
-2. Use visible shell steps (`host.bash("ssh <alias> ...")`) to inspect the
-   remote host, create a scratch/service directory, and install or locate real
-   model runners. Prefer existing scripts/environments already present on the
-   host before downloading anything large.
-3. Provision only real services. For this app the important capabilities are:
-   `fold` (a wrapper consumed by `host.fold`) and `score_mutations` (an ESM
-   masked-marginal wrapper consumed by `host.score_mutations`). If you also
-   provision ProteinMPNN or another method, register it under a clear capability
-   name such as `proteinmpnn`.
-4. Verify before registering. A capability must have either a verified script
-   path or a structured `path_exists` / `executable_exists` probe that exits 0
-   on the remote host. Then call
-   `host.register_remote_capability(alias, capability, script=..., engine=...,
-   invoke=..., markers=..., probe={"kind":"path_exists","path":...})`.
-5. If provisioning cannot be completed, return a concise blocking reason and the
-   exact remote checks you ran. Never claim a model is configured until verified.
-""",
-}
-
-
 def _gate_target(method: str, args: list) -> str:
     """The tool-specific string a permission pattern is matched against
     (path for file tools, domain for fetch, …)."""
@@ -460,6 +433,11 @@ class HostDispatcher:
         )
         # Steering hooks wired by the delegation layer.
         self.steer_fns: dict[str, Callable[..., Any]] = {}
+        self._delegation_service = DelegationService(
+            delegate_provider=lambda: self._delegate_fn,
+            steering=lambda: self.steer_fns,
+            store=lambda: self.store,
+        )
         self._skill_service = SkillService(self.cfg)
         self._skills = self._skill_service.loader  # private compatibility alias
         self._credential_service = CredentialService()
@@ -852,7 +830,7 @@ class HostDispatcher:
             "query": True,
             "artifacts": True,
             "lineage": True,
-            "delegate": self._delegate_fn is not None,
+            "delegate": self._delegation_service.available(),
             "skills": True,
             "endpoints": True,
             "mcp": True,
@@ -1387,64 +1365,22 @@ class HostDispatcher:
 
     # --- delegation + steering -----------------------------------
     def _m_delegate(self, spec: dict) -> Any:
-        if self._delegate_fn is None:
-            raise RuntimeError("host.delegate not available: no sub-agent runner wired")
-        # Specialist injection: delegating to a named specialist prepends that
-        # specialist's persona/system prompt so the sub-agent actually behaves
-        # as the specialist.
-        name = spec.get("specialist") or spec.get("name")
-        if name:
-            try:
-                agent = self.store.get_agent(name)
-            except Exception:  # noqa: BLE001
-                agent = None
-            builtin_prompt = _BUILTIN_SPECIALIST_PROMPTS.get(str(name).upper())
-            system_prompt = (
-                agent.get("system_prompt") if agent else None
-            ) or builtin_prompt
-            if system_prompt:
-                req = spec.get("request")
-                persona = (
-                    f"You are acting as the specialist **{name}**.\n"
-                    f"{system_prompt}\n\n"
-                )
-                if isinstance(req, str):
-                    spec = {**spec, "request": persona + req}
-                elif isinstance(req, dict) and "request" in req:
-                    spec = {
-                        **spec,
-                        "request": {
-                            **req,
-                            "request": persona + str(req.get("request", "")),
-                        },
-                    }
-        return self._delegate_fn(spec)
+        return self._delegation_service.delegate(spec)
 
     def _m_children(self, *_a: Any) -> Any:
-        fn = self.steer_fns.get("children")
-        return fn() if fn else []
+        return self._delegation_service.children()
 
     def _m_collect(self, spec: dict) -> Any:
-        fn = self.steer_fns.get("collect")
-        if not fn:
-            raise RuntimeError("host.collect not available in this session")
-        return fn(spec)
+        return self._delegation_service.collect(spec)
 
     def _m_stop_child(self, child_id: str) -> Any:
-        fn = self.steer_fns.get("stop_child")
-        if not fn:
-            raise RuntimeError("host.stop_child not available")
-        return fn(child_id)
+        return self._delegation_service.stop_child(child_id)
 
     def _m_send_message(self, spec: dict) -> Any:
-        fn = self.steer_fns.get("send_message")
-        if not fn:
-            raise RuntimeError("host.send_message not available")
-        return fn(spec)
+        return self._delegation_service.send_message(spec)
 
     def _m_delegation_stats(self, *_a: Any) -> Any:
-        fn = self.steer_fns.get("delegation_stats")
-        return fn() if fn else {"total": 0, "running": 0, "done": 0, "failed": 0}
+        return self._delegation_service.stats()
 
     # --- structured output (completion_bullets) ---------------
     def _m_submit_output(self, spec: dict) -> dict:
