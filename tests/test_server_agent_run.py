@@ -247,7 +247,9 @@ def test_native_batch_returns_canonical_tool_history_and_never_completes(
         {"name": "web_search", "arguments": {"query": "ATP"}},
     ]
     assert all(current is dispatcher for current, _ in invoked)
-    assert applied == ["apply", "apply", "apply"]
+    # One preparation for the parallel read-only wave, then the trailing
+    # environment application check.
+    assert applied == ["apply", "apply"]
     assert outcome.completion is None
     assert outcome.stop_reason is None
 

@@ -15,7 +15,7 @@ from openai4s.agent.actions import (
     NativeToolBatch,
     count_code_blocks,
 )
-from openai4s.agent.control import execute_native_batch
+from openai4s.agent.control import execute_native_batch, tool_parallel_policy
 from openai4s.agent.events import (
     ActionRouted,
     AgentEvent,
@@ -306,12 +306,22 @@ class WebActionExecutor:
         if isinstance(action, FinalizeAction):
             return execute_finalize_action(action)
         if isinstance(action, NativeToolBatch):
-            kwargs = {"cancelled": self.cancelled}
+            kwargs = {
+                "cancelled": self.cancelled,
+                "prepare_group": self.apply_pending,
+                "parallel_policy": lambda call: tool_parallel_policy(
+                    call, self.tool_catalog
+                ),
+            }
             if self.tool_catalog is not None:
                 kwargs["validate"] = lambda name, arguments: tool_validation_error(
                     name, arguments, self.tool_catalog
                 )
-            outcome = execute_native_batch(action, self._invoke_native, **kwargs)
+            outcome = execute_native_batch(
+                action,
+                lambda call: self._invoke_native(call, apply_pending=False),
+                **kwargs,
+            )
             if self.cancelled():
                 return outcome
             return self._apply_trailing_pending(outcome)
@@ -372,8 +382,9 @@ class WebActionExecutor:
             stop_reason=stop_reason,
         )
 
-    def _invoke_native(self, call) -> tuple[str, bool]:
-        self.apply_pending()
+    def _invoke_native(self, call, *, apply_pending: bool = True) -> tuple[str, bool]:
+        if apply_pending:
+            self.apply_pending()
         payload = (
             {"name": call.name, "arguments": call.arguments}
             if hasattr(call, "name")

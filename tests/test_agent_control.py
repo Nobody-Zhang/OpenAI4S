@@ -1,5 +1,8 @@
 """Failure and cancellation contracts for native control-tool batches."""
 
+import threading
+import time
+
 from openai4s.agent.actions import NativeToolBatch, NativeToolCall
 from openai4s.agent.control import execute_native_batch
 
@@ -83,3 +86,108 @@ def test_normalized_known_tool_arguments_are_validated_before_invocation():
     assert "invalid arguments" in outcome.history_messages[0]["content"]
     assert "$.path: expected string" in outcome.history_messages[0]["content"]
     assert "$.surprise: unknown property" in outcome.history_messages[0]["content"]
+
+
+def test_independent_read_only_calls_run_in_parallel_with_ordered_results():
+    calls = NativeToolBatch(tuple(_call(index) for index in range(3)))
+    all_started = threading.Event()
+    started: list[int] = []
+    lock = threading.Lock()
+
+    def invoke(call):
+        with lock:
+            started.append(call.ordinal)
+            if len(started) == 3:
+                all_started.set()
+        if not all_started.wait(1):
+            raise AssertionError("independent read-only calls did not overlap")
+        # Deliberately complete in reverse order; provider history must not.
+        time.sleep((2 - call.ordinal) * 0.005)
+        return f"result-{call.ordinal}", True
+
+    outcome = execute_native_batch(
+        calls,
+        invoke,
+        validate=lambda _name, _arguments: None,
+        parallel_policy=lambda call: (
+            True,
+            (f"artifact:version-{call.ordinal}",),
+        ),
+    )
+
+    assert [item["content"] for item in outcome.history_messages] == [
+        "result-0",
+        "result-1",
+        "result-2",
+    ]
+    assert [item["tool_call_id"] for item in outcome.history_messages] == [
+        "call-0",
+        "call-1",
+        "call-2",
+    ]
+
+
+def test_conflicting_read_only_resources_are_serialized():
+    calls = NativeToolBatch(tuple(_call(index) for index in range(3)))
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+
+    def invoke(call):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(0.01)
+        with lock:
+            active -= 1
+        return f"result-{call.ordinal}", True
+
+    outcome = execute_native_batch(
+        calls,
+        invoke,
+        validate=lambda _name, _arguments: None,
+        parallel_policy=lambda _call: (True, ("workspace:data.csv",)),
+    )
+
+    assert peak == 1
+    assert all(not item["is_error"] for item in outcome.history_messages)
+
+
+def test_mutating_call_is_a_barrier_for_all_later_calls():
+    calls = NativeToolBatch(tuple(_call(index) for index in range(4)))
+    active = 0
+    peak_after_mutation = 0
+    mutation_finished = False
+    lock = threading.Lock()
+
+    def invoke(call):
+        nonlocal active, peak_after_mutation, mutation_finished
+        with lock:
+            active += 1
+            if mutation_finished:
+                peak_after_mutation = max(peak_after_mutation, active)
+        time.sleep(0.005)
+        with lock:
+            active -= 1
+            if call.ordinal == 1:
+                mutation_finished = True
+        return f"result-{call.ordinal}", True
+
+    outcome = execute_native_batch(
+        calls,
+        invoke,
+        validate=lambda _name, _arguments: None,
+        parallel_policy=lambda call: (
+            call.ordinal != 1,
+            (f"resource:{call.ordinal}",),
+        ),
+    )
+
+    assert peak_after_mutation == 1
+    assert [item["content"] for item in outcome.history_messages] == [
+        "result-0",
+        "result-1",
+        "result-2",
+        "result-3",
+    ]

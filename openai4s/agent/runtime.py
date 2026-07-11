@@ -36,7 +36,7 @@ from .compaction import (
     safe_keep_recent,
     should_compact,
 )
-from .control import execute_native_batch
+from .control import execute_native_batch, tool_parallel_policy
 from .events import AgentEvent, OutcomeProduced, ReplyReceived
 from .finalize import execute_finalize_action
 from .models import ExecutionOutcome, ModelReply, RunState
@@ -213,12 +213,19 @@ class LocalActionExecutor:
             return execute_tool_call(self.dispatcher, payload, self.tool_catalog)
 
         if self.tool_catalog is None:
-            return execute_native_batch(batch, invoke)
+            return execute_native_batch(
+                batch,
+                invoke,
+                parallel_policy=tool_parallel_policy,
+            )
         return execute_native_batch(
             batch,
             invoke,
             validate=lambda name, arguments: tool_validation_error(
                 name, arguments, self.tool_catalog
+            ),
+            parallel_policy=lambda call: tool_parallel_policy(
+                call, self.tool_catalog
             ),
         )
 
