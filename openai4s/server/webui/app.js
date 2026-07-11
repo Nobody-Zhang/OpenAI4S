@@ -4309,7 +4309,14 @@ async function executeNotebookCode(code, language, controls) {
     hint(t("nb.action.queued", language === "r" ? "R" : "Python"));
     if (S.currentId === frameId) { invalidateKernelCache(); await loadExecutionLog(frameId); loadArtifacts(frameId); scheduleWorkbenchRefresh(); } return true;
   } catch (error) { hint(t("nb.repl.execFailed", error.message), true); return false; }
-  finally { if (S.pendingReplIdentity && S.pendingReplIdentity.execution_id === executionId) S.pendingReplIdentity = null; if (runButton) runButton.disabled = false; if (input) input.disabled = false; if (stop) stop.classList.add("hidden"); }
+  finally {
+    if (S.pendingReplIdentity && S.pendingReplIdentity.execution_id === executionId) S.pendingReplIdentity = null;
+    if (runButton) runButton.disabled = false; if (input) input.disabled = false; if (stop) stop.classList.add("hidden");
+    // Execution-owner and live-cell events rebuild the Notebook while this
+    // request is pending, so the controls captured above may be detached.
+    // Repaint once more from authoritative queue/pending state after cleanup.
+    if (S.currentId === frameId && S.dock.open && S.activeTab === "notebook") renderNotebook();
+  }
 }
 // Cache for the Notebook header's kernel state + env list. renderNotebook rebuilds
 // the whole pane on every streaming frame; without a cache the state chip and env
@@ -4549,15 +4556,19 @@ function renderNotebook() {
   const languageLabel = el("label", "nb-language-label", t("nb.repl.language"));
   const language = el("select", "nb-language-select");
   [["python", "Python"], ["r", "R"]].forEach(([value, label]) => { const option = el("option", null, label); option.value = value; language.appendChild(option); });
-  language.value = S._replLanguage; languageLabel.appendChild(language); editorBar.appendChild(languageLabel);
+  const pendingRepl = S.pendingReplIdentity && S.pendingReplIdentity.frame_id === S.currentId ? S.pendingReplIdentity : null;
+  const replIdentity = pendingRepl || identityForOwner(S.executionQueue, "user_repl");
+  const replBusy = !!replIdentity;
+  language.value = S._replLanguage; language.disabled = replBusy; languageLabel.appendChild(language); editorBar.appendChild(languageLabel);
   const editorActions = el("div", "nb-live-input-actions");
   const run = el("button", "solid-btn small", t("nb.repl.run"));
-  const stop = el("button", "repl-stop hidden"); stop.title = t("nb.repl.interruptTitle"); stop.innerHTML = icon("stop", 15); stop.onclick = async () => {
+  run.disabled = replBusy || !S.currentId;
+  const stop = el("button", "repl-stop" + (replBusy ? "" : " hidden")); stop.title = t("nb.repl.interruptTitle"); stop.innerHTML = icon("stop", 15); stop.onclick = async () => {
     try { const result = await scopedExecutionRequest(S.currentId, "kernel/interrupt", "notebook interrupt", "user_repl"); if (result && result.ok) hint(t("nb.repl.interruptSent")); }
     catch (error) { hint(t("nb.action.failed", error.message), true); }
   };
   editorActions.appendChild(run); editorActions.appendChild(stop); editorBar.appendChild(editorActions); editor.appendChild(editorBar);
-  const inp = el("textarea", "nb-repl-input"); inp.rows = 7; inp.spellcheck = false; inp.placeholder = t("nb.repl.inputPlaceholder"); inp.disabled = !S.currentId; inp.value = S._replDrafts[S._replLanguage] || ""; editor.appendChild(inp);
+  const inp = el("textarea", "nb-repl-input"); inp.rows = 7; inp.spellcheck = false; inp.placeholder = t("nb.repl.inputPlaceholder"); inp.disabled = !S.currentId || replBusy; inp.value = S._replDrafts[S._replLanguage] || ""; editor.appendChild(inp);
   const executeDraft = async () => {
     const currentLanguage = language.value === "r" ? "r" : "python", code = inp.value;
     if (await executeNotebookCode(code, currentLanguage, { runButton: run, input: inp, stop })) {

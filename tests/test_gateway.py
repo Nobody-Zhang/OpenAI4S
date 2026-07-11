@@ -867,6 +867,7 @@ def test_token_gate_401_and_cookie_redirect(monkeypatch, tmp_path, capsys):
     handler._route("GET")
     code, body = replies[-1]
     assert code == 200 and body["status"] == "ok"
+    assert "data_dir" not in body
 
     # valid ?token= on a GET → 303 to / with the os_token cookie set
     resp = {"code": None, "headers": {}}

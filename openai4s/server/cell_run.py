@@ -427,9 +427,9 @@ class CellExecutionService:
         capture: CaptureResult,
     ) -> None:
         status = (
-            "error"
-            if result.get("error")
-            else ("interrupted" if result.get("interrupted") else "ok")
+            "interrupted"
+            if result.get("interrupted")
+            else ("error" if result.get("error") else "ok")
         )
         emit(
             {

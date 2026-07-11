@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 
+import pytest
+
 from openai4s.config import Config, LLMConfig
 from openai4s.server import gateway as gateway_mod
 
@@ -110,6 +112,15 @@ def test_checkpoint_fork_and_workbench_routes_share_domain_service(tmp_path):
 
 def test_notebook_export_and_renderer_routes_return_immutable_descriptors(tmp_path):
     runner, handler, frame_id = _setup(tmp_path)
+    code, error = _call(
+        handler,
+        "GET",
+        f"/frames/{frame_id}/notebook/export",
+        query={"language": ["javascript"]},
+    )
+    assert code == 400
+    assert error == {"error": "notebook language must be python, r, or bundle"}
+
     binary = _call(
         handler,
         "GET",
@@ -145,6 +156,32 @@ def test_notebook_export_and_renderer_routes_return_immutable_descriptors(tmp_pa
     assert descriptor["version_id"] == stored["latest_version_id"]
     assert descriptor["trusted_html"] is False
     runner.close()
+
+
+def test_unknown_session_workbench_routes_fail_with_one_404_contract(tmp_path):
+    runner, handler, _frame_id = _setup(tmp_path)
+    routes = (
+        "/frames/missing/action-timeline",
+        "/frames/missing/execution-queue",
+        "/frames/missing/context",
+        "/frames/missing/security",
+        "/frames/missing/recovery",
+        "/frames/missing/recovery/actions",
+        "/frames/missing/branches",
+        "/frames/missing/checkpoints",
+        "/frames/missing/branches/checkpoints",
+        "/frames/missing/revert/operations",
+        "/frames/missing/notebook/export",
+        "/frames/missing/execution",
+    )
+    try:
+        for route in routes:
+            with pytest.raises(gateway_mod.GatewayError) as caught:
+                _call(handler, "GET", route)
+            assert caught.value.code == 404
+            assert caught.value.message == "session not found"
+    finally:
+        runner.close()
 
 
 def test_fork_from_cell_route_fails_closed_until_supported(tmp_path):

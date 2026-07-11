@@ -406,6 +406,9 @@ def test_execution_interrupts_send_the_exact_cached_identity() -> None:
     assert 'scopedExecutionRequest(S.currentId, "cancel"' in cancel
     assert 'scopedExecutionRequest(S.currentId, "kernel/interrupt"' in notebook
     assert '"user_repl"' in notebook
+    assert 'identityForOwner(S.executionQueue, "user_repl")' in notebook
+    assert '"repl-stop" + (replBusy ? "" : " hidden")' in notebook
+    assert "inp.disabled = !S.currentId || replBusy" in notebook
     assert "ownerKind" in exact and "pendingReplIdentity" in exact
     assert 'ownerKind === "user_repl"' in exact
     assert "owner.kind === ownerKind" in owner

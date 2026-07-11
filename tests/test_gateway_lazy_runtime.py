@@ -100,9 +100,20 @@ def _install_fake_runtime(monkeypatch, runner, *, expect_attempt_for=None):
             return self.live
 
         def execute(self, code, origin="agent", on_chunk=None, *, cell_id=None):
-            del origin, on_chunk
+            del origin
             if "host.submit_output" in code:
                 self.dispatcher.last_output = {"output": {"ok": True}}
+            if on_chunk is not None:
+                on_chunk("live output")
+            if "interrupt_result()" in code:
+                return {
+                    "id": cell_id,
+                    "stdout": "",
+                    "stderr": "",
+                    "error": "Interrupted",
+                    "interrupted": True,
+                    "usage": {},
+                }
             return {
                 "id": cell_id,
                 "stdout": "",
@@ -317,9 +328,41 @@ def test_explicit_start_and_repl_spawn_but_repl_attempt_precedes_spawn(
     result = runner.run_repl(repl_frame, "default", "print('hello')")
     assert result["cell"]["status"] == "ok"
     assert len(kernels) == 2
+    repl_events = [
+        event
+        for event in runner.hub.events
+        if event.get("root_frame_id") == repl_frame
+    ]
+    assert [
+        event["type"]
+        for event in repl_events
+        if event["type"].startswith("notebook_cell_")
+    ] == [
+        "notebook_cell_start",
+        "notebook_cell_chunk",
+        "notebook_cell_finished",
+    ]
+    assert next(
+        event for event in repl_events if event["type"] == "notebook_cell_chunk"
+    )["chunk"] == "live output"
+    assert not any(event["type"] == "text_chunk" for event in repl_events)
     attempts = runner.store.list_execution_attempts(root_frame_id=repl_frame)
     assert len(attempts) == 1
     assert attempts[0]["terminal_state"] == "completed"
+
+
+def test_repl_response_and_persisted_cell_keep_interrupted_terminal_state(
+    monkeypatch, tmp_path
+):
+    runner = gateway_mod.SessionRunner(_cfg(tmp_path), _Hub())
+    _install_fake_runtime(monkeypatch, runner)
+    frame_id = _frame(runner)
+
+    result = runner.run_repl(frame_id, "default", "interrupt_result()")
+
+    assert result["cell"]["status"] == "interrupted"
+    assert result["cell"]["error"] == "Interrupted"
+    assert runner.store.list_cells(frame_id)[0]["status"] == "interrupted"
 
 
 def test_environment_selection_without_kernel_only_persists(monkeypatch, tmp_path):

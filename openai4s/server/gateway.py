@@ -3754,12 +3754,20 @@ class SessionRunner:
         ) as execution:
             # CellExecutionService allocates the durable attempt before its
             # prepare_language hook lazily starts Python.
+            #
+            # A REPL cell still needs the structured Notebook lifecycle while
+            # it is running.  Keep chat-only compatibility events out of the
+            # conversation: direct Notebook execution is not an Agent turn.
+            def emit_notebook(event: dict) -> None:
+                if event.get("type") not in {"text_chunk", "step", "step_update"}:
+                    emit(event)
+
             info = self._execute_and_log(
                 st,
                 code,
                 "user",
-                emit,
-                stream=False,
+                emit_notebook,
+                stream=True,
                 language=language,
             )
             r = info["result"]
@@ -3782,7 +3790,11 @@ class SessionRunner:
                     "source": code,
                     "stdout": r.get("stdout") or "",
                     "stderr": r.get("stderr") or "",
-                    "status": "error" if r.get("error") else "ok",
+                    "status": (
+                        "interrupted"
+                        if r.get("interrupted")
+                        else ("error" if r.get("error") else "ok")
+                    ),
                     "error": r.get("error"),
                     "figures": info["figures"],
                     "files_written": info["files_written"],
@@ -4310,7 +4322,6 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                         {
                             "status": "ok",
                             "model": cfg.llm.model,
-                            "data_dir": str(cfg.data_dir),
                         }
                     )
                     return
@@ -5235,6 +5246,21 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 self._json(self._exec_log(m.group(1)))
                 return
             # ---- scientific session workbench projections -------------
+            # These routes all describe an existing durable research session.
+            # Validate that boundary once so an unknown id cannot look like a
+            # truthful empty timeline/queue/recovery state (or leak a KeyError
+            # as a 500 from the stricter projections).
+            workbench = re.fullmatch(
+                r"/frames/([^/]+)/(?:"
+                r"action-timeline|execution-queue|context|security|"
+                r"recovery(?:/actions)?|"
+                r"branches(?:/(?:checkpoints|fork|revert-preview|revert))?|"
+                r"checkpoints|revert/(?:preview|apply|undo|operations)|"
+                r"notebook/export|execution)",
+                sub,
+            )
+            if workbench and store.get_frame(workbench.group(1)) is None:
+                raise GatewayError(404, "session not found")
             m = re.fullmatch(r"/frames/([^/]+)/action-timeline", sub)
             if m and method == "GET":
                 after = (q.get("after_ordinal") or [None])[0]
@@ -5461,8 +5487,19 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 return
             m = re.fullmatch(r"/frames/([^/]+)/notebook/export", sub)
             if m and method == "GET":
+                language = (q.get("language") or [None])[0]
+                if language is not None and str(language).lower() not in {
+                    "python",
+                    "r",
+                    "bundle",
+                }:
+                    self._json(
+                        {"error": "notebook language must be python, r, or bundle"},
+                        400,
+                    )
+                    return
                 exported = runner.session_domain.notebook_export(
-                    m.group(1), language=(q.get("language") or [None])[0]
+                    m.group(1), language=language
                 )
                 self._send(
                     200,

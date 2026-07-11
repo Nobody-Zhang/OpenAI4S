@@ -129,3 +129,37 @@ def test_url_command_is_offline_and_returns_success(monkeypatch, capsys):
 
     assert module.main(["url"]) == 0
     assert capsys.readouterr().out.strip() == "http://127.0.0.1:9876/"
+
+
+def test_status_reports_the_local_data_dir_without_trusting_health(monkeypatch, capsys):
+    module = _cli_module()
+    config = SimpleNamespace(
+        host="127.0.0.1",
+        port=9876,
+        data_dir=Path("/trusted/local-data"),
+    )
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self):
+            return b'{"status":"ok","model":"demo","data_dir":"/leaked"}'
+
+    monkeypatch.setattr(module, "get_config", lambda: config)
+    monkeypatch.setattr(module, "_read_pid", lambda cfg: 123)
+    monkeypatch.setattr(module, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(
+        module.urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: Response(),
+    )
+
+    assert module.cmd_status(SimpleNamespace()) == 0
+    output = capsys.readouterr().out
+    assert "model    : demo" in output
+    assert "data_dir : /trusted/local-data" in output
+    assert "/leaked" not in output

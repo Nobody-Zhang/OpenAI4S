@@ -166,6 +166,31 @@ def test_submit_output_does_not_skip_capture_or_execution_log(tmp_path):
     assert finished["files_written"] == ["result.csv"]
 
 
+def test_interrupted_result_wins_over_its_error_text_in_notebook_event(tmp_path):
+    harness = Harness()
+    harness.run_result = {
+        "stdout": "",
+        "stderr": "",
+        "error": "Interrupted",
+        "interrupted": True,
+    }
+    service = CellExecutionService(harness.ports(), id_factory=lambda: "cell-stop")
+    events = []
+
+    result = service.execute(
+        _session(tmp_path),
+        CellRequest("long_running_call()", "user"),
+        events.append,
+    )
+
+    assert result.result["interrupted"] is True
+    assert events[-1]["type"] == "notebook_cell_finished"
+    assert events[-1]["status"] == "interrupted"
+    assert events[-1]["error"] == "Interrupted"
+    assert harness.records[0]["result"] is result.result
+    assert harness.records[0]["result"]["interrupted"] is True
+
+
 def test_protocol_only_submit_is_audited_without_streaming_a_notebook_cell(tmp_path):
     harness = Harness()
     service = CellExecutionService(harness.ports(), id_factory=lambda: "cell-submit")

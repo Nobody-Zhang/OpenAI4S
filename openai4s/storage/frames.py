@@ -641,9 +641,9 @@ class FrameRepository:
         cell_id = result.get("id") or f"c-{uuid.uuid4().hex[:12]}"
         usage = result.get("usage") or {}
         status = (
-            "error"
-            if result.get("error")
-            else ("interrupted" if result.get("interrupted") else "ok")
+            "interrupted"
+            if result.get("interrupted")
+            else ("error" if result.get("error") else "ok")
         )
         # Execution history is an append-only audit record. A duplicate Cell ID
         # means the caller is attempting to overwrite an already-observed

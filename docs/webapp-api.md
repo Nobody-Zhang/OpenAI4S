@@ -97,7 +97,7 @@ success response body. Serializer shapes are in §4.
 
 | Method & path | Behavior |
 | --- | --- |
-| `GET /health` (not under `/api`) | `{"status":"ok","model","data_dir"}`. Exempt from the token gate. |
+| `GET /health` (not under `/api`) | Minimal public projection `{"status":"ok","model"}`. Exempt from the token gate and deliberately omits host filesystem paths. |
 | `GET /me` | Hardcoded local identity: `{"user_id":"local-dev","email":null,"provider","has_api_key","shared_api_key":false,"auth_mode":"none"}`. |
 | `GET /auth/status` | `{"authenticated":true,"auth_mode":"none"}` (always). |
 | `GET /csrf` | `{"csrf_token":"local"}` (a stub; the real CSRF defense is the Origin check). |

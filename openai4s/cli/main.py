@@ -116,7 +116,11 @@ def cmd_status(args) -> int:
             health = json.loads(r.read().decode("utf-8"))
         print(f"daemon: running (pid {pid}) at {_url(cfg)}")
         print(f"  model    : {health.get('model')}")
-        print(f"  data_dir : {health.get('data_dir')}")
+        # The loopback health response is intentionally a minimal public
+        # projection.  The CLI already owns the local configuration, so it can
+        # report the data directory without publishing an absolute host path
+        # over HTTP.
+        print(f"  data_dir : {cfg.data_dir}")
         return 0
     except urllib.error.URLError:
         print(f"daemon: pid {pid} alive but /health unreachable")

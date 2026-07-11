@@ -370,7 +370,7 @@ def test_execution_log_status_json_fallback_append_only_and_clock(tmp_path):
         frame_id=frame,
         root_frame_id=frame,
         code="fail()",
-        result={"id": "cell-2", "error": "boom", "interrupted": True},
+        result={"id": "cell-2", "error": "Interrupted", "interrupted": True},
     )
     assert first_id == "cell-1"
     assert error_id == "cell-2"
@@ -380,7 +380,7 @@ def test_execution_log_status_json_fallback_append_only_and_clock(tmp_path):
     assert cells[0]["figures"] == ["figure.png"]
     assert cells[0]["files_read"] == ["input.csv"]
     assert cells[0]["files_written"] == ["output.csv"]
-    assert cells[1]["status"] == "error"
+    assert cells[1]["status"] == "interrupted"
     assert repository.cell_detail("missing") is None
 
     with store._lock:
