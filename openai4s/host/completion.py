@@ -40,16 +40,24 @@ PAST_TENSE_STARTERS = frozenset(
         "identified",
     }
 )
+_CJK_START = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 
 
 def validate_completion_bullets(bullets: list) -> str | None:
-    """Require 1-4 non-empty, past-tense, verb-first completion bullets."""
+    """Require 1-4 non-empty completed-action bullets.
+
+    English bullets retain the past-tense verb guard. CJK languages do not
+    encode tense with the same morphology, so their non-empty verb phrases are
+    accepted instead of being forced through an English suffix rule.
+    """
     if not isinstance(bullets, list) or not (1 <= len(bullets) <= 4):
         return "completion_bullets must be a list of 1-4 items"
     for bullet in bullets:
         if not isinstance(bullet, str) or not bullet.strip():
             return "each completion bullet must be a non-empty string"
         first = re.split(r"\s+", bullet.strip())[0].lower()
+        if _CJK_START.match(first):
+            continue
         if not (first.endswith("ed") or first in PAST_TENSE_STARTERS):
             return (
                 f"completion bullet {bullet!r} must start with a past-tense verb "

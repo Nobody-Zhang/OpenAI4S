@@ -427,7 +427,7 @@ class ArtifactManager:
         self,
         session: ArtifactSession,
         path: Path,
-        cell_id: str,
+        cell_id: str | None,
         emit: EventSink,
         env_snapshot_id: str | None = None,
     ) -> dict | None:
@@ -490,7 +490,7 @@ class ArtifactManager:
         self,
         session: ArtifactSession,
         cell_index: int,
-        cell_id: str,
+        cell_id: str | None,
         before: dict[str, int],
         emit: EventSink,
         language: str = "python",

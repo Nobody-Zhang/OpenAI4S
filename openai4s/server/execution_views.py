@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Callable, Protocol
 
+from openai4s.agent.actions import is_completion_only_cell
+
 
 class ExecutionViewStore(Protocol):
     def list_cells(self, root_frame_id: str) -> list[dict]: ...
@@ -33,6 +35,9 @@ class ExecutionViewService:
         kernels: list[str] = []
         entries = []
         for cell in self.store.list_cells(root_frame_id):
+            language = cell.get("language") or "python"
+            if is_completion_only_cell(cell.get("code") or "", language):
+                continue
             kernel_id = cell.get("kernel_id") or "python"
             if kernel_id not in kernels:
                 kernels.append(kernel_id)
@@ -40,7 +45,7 @@ class ExecutionViewService:
                 {
                     "cell_index": cell.get("cell_index"),
                     "kernel_id": kernel_id,
-                    "language": cell.get("language") or "python",
+                    "language": language,
                     "source": cell.get("code") or "",
                     "stdout": cell.get("stdout") or "",
                     "stderr": cell.get("stderr") or "",

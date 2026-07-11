@@ -135,6 +135,36 @@ def test_submit_output_does_not_skip_capture_or_execution_log(tmp_path):
     assert events[2]["chunk"] == "live output"
 
 
+def test_protocol_only_submit_is_audited_without_streaming_a_notebook_cell(tmp_path):
+    harness = Harness()
+    service = CellExecutionService(harness.ports(), id_factory=lambda: "cell-submit")
+    session = _session(tmp_path)
+    events = []
+
+    result = service.execute(
+        session,
+        CellRequest(
+            "host.submit_output({'ok': True}, ['Completed the analysis'])",
+            "agent",
+        ),
+        events.append,
+    )
+
+    assert harness.order == [
+        "prepare",
+        "label",
+        "snapshot",
+        "protect",
+        "safety",
+        "run",
+        "capture",
+        "record",
+    ]
+    assert events == []
+    assert result.cell_id == "cell-submit"
+    assert harness.records[0]["code"].startswith("host.submit_output")
+
+
 def test_safety_refusal_is_a_logged_soft_error_without_runtime_or_capture(tmp_path):
     harness = Harness()
     harness.refusal = "blocked by safety policy"

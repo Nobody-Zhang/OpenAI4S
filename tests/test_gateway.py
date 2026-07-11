@@ -91,6 +91,56 @@ def test_gateway_plain_answer_is_nudged_until_structured_submit(monkeypatch, tmp
     assert hub.events[-1]["status"] == "completed"
 
 
+def test_gateway_projects_submit_only_result_as_live_and_persisted_final_message(
+    monkeypatch, tmp_path
+):
+    cfg = _cfg(tmp_path)
+    hub = _Hub()
+    runner = gateway_mod.SessionRunner(cfg, hub)
+    store = get_store(cfg.db_path)
+    fid = store.new_frame(kind="turn", project_id="default", status="ready")
+
+    def fake_ensure(st):
+        st.dispatcher = SimpleNamespace(last_output=None)
+        st.messages = [{"role": "system", "content": "sys"}]
+        st.booted = True
+
+    def finish_without_model_prose(st, emit, visible):
+        del emit, visible
+        st.dispatcher.last_output = {
+            "output": {"summary": "已完成真实数据分析。"},
+            "completion_bullets": ["生成了结果表", "总结了关键发现"],
+        }
+        st.last_model_prose = ""
+        return "submitted"
+
+    monkeypatch.setattr(runner, "_ensure_kernel", fake_ensure)
+    monkeypatch.setattr(runner, "_loop", finish_without_model_prose)
+    monkeypatch.setattr(runner, "_spawn_title_summary", lambda *a, **k: None)
+
+    result = runner.run_message(fid, "default", "分析这些真实数据")
+
+    assert result["status"] == "completed"
+    messages = store.list_messages(fid)
+    assert [message["role"] for message in messages] == ["user", "assistant"]
+    assert "已完成真实数据分析" in messages[-1]["content"]
+    assert "生成了结果表" in messages[-1]["content"]
+    assert "no textual response" not in messages[-1]["content"]
+    final_text_index = max(
+        index
+        for index, event in enumerate(hub.events)
+        if event.get("type") == "text_chunk"
+        and "已完成真实数据分析" in event.get("chunk", "")
+    )
+    terminal_index = max(
+        index
+        for index, event in enumerate(hub.events)
+        if event.get("type") == "frame_update"
+        and event.get("status") == "completed"
+    )
+    assert final_text_index < terminal_index
+
+
 def test_submit_message_runs_turn_in_background(tmp_path):
     cfg = _cfg(tmp_path)
     runner = gateway_mod.SessionRunner(cfg, _Hub())

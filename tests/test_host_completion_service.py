@@ -74,6 +74,11 @@ def test_irregular_and_suffix_past_tense_rules_remain_case_sensitive_to_words():
     )
 
 
+def test_completion_bullets_accept_cjk_completed_action_phrases():
+    assert validate_completion_bullets(["撰写了完整报告"]) is None
+    assert validate_completion_bullets(["已完成真实数据分析", "生成了结果表"]) is None
+
+
 @pytest.mark.parametrize(
     "output, schema, expected",
     [

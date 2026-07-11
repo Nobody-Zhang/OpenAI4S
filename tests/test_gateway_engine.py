@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -96,6 +97,56 @@ def _prepare_message_runner(monkeypatch, tmp_path, dispatcher):
     monkeypatch.setattr(runner, "_wire_delegation", lambda _state: None)
     monkeypatch.setattr(runner, "_spawn_title_summary", lambda *args, **kwargs: None)
     return runner, hub, frame_id
+
+
+def test_native_file_control_calls_create_versioned_artifacts(tmp_path):
+    runner = gateway_mod.SessionRunner(_cfg(tmp_path), _Hub())
+    frame_id = runner.store.new_frame(
+        kind="turn", project_id="default", status="ready"
+    )
+    state = runner._state(frame_id, "default")
+    events = []
+    target = state.workspace / "analysis.md"
+
+    def write_first():
+        target.write_text("first", encoding="utf-8")
+        return "ok", True
+
+    def write_second():
+        target.write_text("second", encoding="utf-8")
+        return "ok", True
+
+    first = runner._invoke_control_with_artifacts(
+        state,
+        SimpleNamespace(name="write_file"),
+        events.append,
+        write_first,
+    )
+    assert first == ("ok", True)
+    artifact = runner.store.artifact_by_filename(
+        "analysis.md", frame_id, strict=True
+    )
+    assert artifact is not None
+    first_version = artifact["latest_version_id"]
+
+    second = runner._invoke_control_with_artifacts(
+        state,
+        SimpleNamespace(name="edit_file"),
+        events.append,
+        write_second,
+    )
+    assert second == ("ok", True)
+
+    artifact = runner.store.artifact_by_filename(
+        "analysis.md", frame_id, strict=True
+    )
+    versions = runner.store.list_versions(artifact["artifact_id"])
+    assert len(versions) == 2
+    assert artifact["latest_version_id"] != first_version
+    assert Path(
+        runner.store.version_meta(first_version)["snapshot_path"]
+    ).read_text(encoding="utf-8") == "first"
+    assert any(event.get("type") == "artifact_created" for event in events)
 
 
 def test_web_native_schema_history_and_cell_only_completion(monkeypatch, tmp_path):

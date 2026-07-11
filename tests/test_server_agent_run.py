@@ -13,7 +13,7 @@ from openai4s.agent.actions import (
     NativeToolBatch,
     NativeToolCall,
 )
-from openai4s.agent.events import ReplyReceived, TextDelta, TurnStarted
+from openai4s.agent.events import ActionRouted, ReplyReceived, TextDelta, TurnStarted
 from openai4s.agent.models import ModelReply, RunState
 from openai4s.server import agent_run
 from openai4s.server.agent_run import ProseStreamer, WebActionExecutor, WebEventSink
@@ -150,6 +150,46 @@ def test_web_event_sink_falls_back_when_provider_emits_no_deltas():
     ]
     assert [block["text"] for block in visible] == ["Blocking reply."]
     assert usage == [{"prompt_tokens": 3}]
+
+
+def test_web_event_sink_narrates_tool_only_action_without_leaking_arguments():
+    sent = []
+    visible = []
+    sink = WebEventSink(
+        sent.append,
+        "frame-1",
+        visible,
+        lambda usage: None,
+        language="zh",
+    )
+    action = NativeToolBatch(
+        (_native_call(0, name="web_search", arguments={"query": "private"}),)
+    )
+
+    sink.emit(TurnStarted(turn=0))
+    sink.emit(ReplyReceived(ModelReply(content="", tool_calls=action.calls), turn=0))
+    sink.emit(ActionRouted(action, turn=0))
+
+    assert len(sent) == 1
+    assert sent[0]["block_type"] == "text"
+    assert "检索" in sent[0]["chunk"]
+    assert "private" not in sent[0]["chunk"]
+    assert [block["text"] for block in visible] == [sink.current_prose]
+    assert sink.model_prose == ""
+
+
+def test_web_event_sink_does_not_duplicate_real_prose_at_action_boundary():
+    sent = []
+    visible = []
+    sink = _event_sink(send=sent, visible=visible)
+    action = CodeCell("python", "print(42)")
+
+    sink.emit(TurnStarted(turn=0))
+    sink.emit(ReplyReceived(ModelReply(content="I will compute it."), turn=0))
+    sink.emit(ActionRouted(action, turn=0))
+
+    assert [event["chunk"] for event in sent] == ["I will compute it.\n"]
+    assert [block["text"] for block in visible] == ["I will compute it."]
 
 
 def test_native_batch_returns_canonical_tool_history_and_never_completes(

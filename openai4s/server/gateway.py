@@ -59,6 +59,7 @@ from openai4s.server.agent_run import ProseStreamer as _ProseStreamer
 from openai4s.server.agent_run import WebActionExecutor, WebEventSink
 from openai4s.server.artifacts import ArtifactManager, ArtifactOperationError
 from openai4s.server.cell_run import CellExecutionPorts, CellExecutionService
+from openai4s.server.completions import completion_message, response_language
 from openai4s.server.execution_views import ExecutionViewService
 
 # Keep the former gateway helper names as compatibility aliases; plan behavior
@@ -74,7 +75,7 @@ from openai4s.server.skills import SkillCustomizationService
 from openai4s.server.titles import SessionTitleService
 from openai4s.skills_loader import SkillLoader
 from openai4s.store import Store, get_store
-from openai4s.tools import control_tool_specs
+from openai4s.tools import control_tool_specs, get_tool
 
 os.environ.setdefault("MPLBACKEND", "Agg")  # headless matplotlib for figure capture
 
@@ -401,6 +402,7 @@ class SessionState:
         # Explore mode: autonomous deep exploration — larger turn budget and the
         # turn only ends via host.submit_output (prose-only replies are nudged).
         self.explore: bool = False
+        self.last_model_prose: str = ""
         # `env_name` is the environment the current kernel actually runs in;
         # `desired_env` is the user's/agent's pinned selection. They differ only
         # during a transient fallback to base when the pin cannot be resolved.
@@ -667,6 +669,9 @@ with `host.edit_file(...)` — these render as write/edit cards.
 Output style (each code cell + each host.* call renders as an activity card):
 - Write a short sentence of PROSE before each step explaining what you are about to \
 do and why (this streams live to the user).
+- After each search, fetch, or computation, state the CONCRETE result that affects \
+the next step in 1-3 short prose sentences. Report observations and conclusions, \
+not hidden chain-of-thought. Activity cards alone are not a user-facing analysis.
 - Keep each cell SMALL and focused on ONE action — one search, one env step, one \
 skill load, one download, one figure, one edit. The timeline then reads as a clean \
 sequence of steps, exactly like the reference. A leading `# gerund comment` on a \
@@ -676,7 +681,8 @@ pure-compute cell titles that card.
 create in the working directory is AUTOMATICALLY captured as an artifact the user can \
 open. You do NOT need to call `host.save_artifact`; writing the file is enough.
 - Before calling `host.submit_output(...)`, write a short final one-paragraph prose \
-summary of what you produced (it becomes your closing message).
+summary of the actual findings and name the deliverable files (it becomes your \
+closing message). The protocol-only submit cell is hidden from the Notebook.
 
 Harness tools (an opencode-parity toolset, callable from any ```python cell as host.*):
 - `host.todo_write([{content,status}]) / host.todo_read()` — OPTIONAL progress \
@@ -1853,6 +1859,49 @@ class SessionRunner:
             drain_remote_provenance=self._remote_provenance_drain(st),
         )
 
+    def _invoke_control_with_artifacts(self, st, call, emit, invoke):
+        """Capture files written by model-native control tools exactly once.
+
+        Kernel-side ``host.write_file`` remains inside the normal Cell
+        transaction.  This wrapper is intentionally only installed around the
+        model's native/legacy JSON control-tool boundary, where no Cell
+        snapshot exists.
+        """
+        name = call.get("name") if isinstance(call, dict) else getattr(call, "name", "")
+        tool = get_tool(name)
+        if tool is None or not tool.writes_files:
+            return invoke()
+
+        before = self.artifacts.snapshot(st.workspace)
+        self.artifacts.protect_latest(st)
+        try:
+            return invoke()
+        finally:
+            try:
+                captured = self.artifacts.capture(
+                    st,
+                    st.cell_index,
+                    None,
+                    before,
+                    emit,
+                    language="native",
+                    drain_remote_provenance=self._remote_provenance_drain(st),
+                )
+                if captured.artifacts:
+                    self._emit_artifact_step(
+                        st,
+                        "Saving "
+                        + (
+                            captured.artifacts[0]["filename"]
+                            if len(captured.artifacts) == 1
+                            else f"{len(captured.artifacts)} artifacts"
+                        ),
+                        captured.artifacts,
+                        emit,
+                    )
+            except Exception:  # noqa: BLE001 — capture cannot mask tool outcome
+                traceback.print_exc()
+
     def _capture_env_snapshot(self, st=None) -> str | None:
         return self.artifacts.capture_environment(
             self._remote_provenance_drain(st)
@@ -2158,6 +2207,40 @@ class SessionRunner:
                 traceback.print_exc()
             if st.cancel.is_set():
                 status = "cancelled"
+            if status == "completed" and loop_reason == "submitted":
+                current_artifacts = self.store.list_artifacts(
+                    {"root_frame_id": root_frame_id}
+                )
+                produced_artifacts = [
+                    artifact
+                    for artifact in current_artifacts
+                    if artifact_versions_before.get(
+                        artifact.get("artifact_id") or artifact.get("id")
+                    )
+                    != artifact.get("latest_version_id")
+                ]
+                prior_text = "\n\n".join(
+                    str(block.get("text") or "") for block in assistant_visible
+                ).strip()
+                final_text = completion_message(
+                    getattr(st.dispatcher, "last_output", None),
+                    produced_artifacts,
+                    previous_text=prior_text,
+                    language=response_language(user_text),
+                    require_fallback=not bool(st.last_model_prose.strip()),
+                )
+                if final_text:
+                    assistant_visible.append(
+                        {"at": int(time.time() * 1000), "text": final_text}
+                    )
+                    emit(
+                        {
+                            "type": "text_chunk",
+                            "frame_id": root_frame_id,
+                            "block_type": "text",
+                            "chunk": final_text + "\n",
+                        }
+                    )
             # Persist each visible prose block with the time it was produced (see
             # _loop) rather than collapsing the whole turn's text into one message
             # stamped at turn-end. The latter sorted every step card into a single
@@ -2187,7 +2270,11 @@ class SessionRunner:
                 tail = err_text
             elif status == "cancelled" and not had_prose:
                 tail = "_已取消。_"
-            elif status == "completed" and not had_prose:
+            elif (
+                status == "completed"
+                and loop_reason != "submitted"
+                and not had_prose
+            ):
                 tail = "_(no textual response)_"
             if tail:
                 self.store.add_message(
@@ -2266,7 +2353,23 @@ class SessionRunner:
                 output_tokens=usage.get("completion_tokens", 0) or 0,
             )
 
-        events = WebEventSink(emit, rid, assistant_visible, add_usage)
+        latest_user_text = next(
+            (
+                message.get("content", "")
+                for message in reversed(st.messages)
+                if message.get("role") == "user"
+            ),
+            "",
+        )
+        events = WebEventSink(
+            emit,
+            rid,
+            assistant_visible,
+            add_usage,
+            language=response_language(latest_user_text),
+            narrate_actions=not st.plan,
+            cancelled=st.cancel.is_set,
+        )
 
         def apply_pending() -> None:
             if st.pending_env:
@@ -2302,6 +2405,11 @@ class SessionRunner:
                 events=events,
                 prose_nudge=_SUBMIT_NUDGE,
                 explore_nudge=_EXPLORE_NUDGE,
+                native_wrapper=lambda call, invoke: (
+                    self._invoke_control_with_artifacts(
+                        st, call, emit, invoke
+                    )
+                ),
                 explore_mode=st.explore,
                 plan_mode=st.plan,
                 finalize_plan=finalize_plan,
@@ -2316,7 +2424,9 @@ class SessionRunner:
             max_turns=max_turns,
         )
         state = RunState(st.messages, max_turns=max_turns)
-        return engine.run(state).stop_reason
+        result = engine.run(state)
+        st.last_model_prose = events.model_prose
+        return result.stop_reason
 
     def _execute_with_watchdog(
         self,

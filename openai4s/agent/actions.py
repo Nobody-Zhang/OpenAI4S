@@ -24,6 +24,7 @@ effects on import).
 """
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, TypeAlias
 
@@ -71,6 +72,58 @@ class NativeToolBatch:
 
 
 Action: TypeAlias = CodeCell | NativeToolBatch
+
+
+def is_completion_only_cell(cell: CodeCell | str, language: str = "python") -> bool:
+    """Return whether a Python cell only signals ``host.submit_output``.
+
+    Completion remains a real kernel RPC, but a direct protocol-only call is
+    not scientific analysis and should not be presented as a Notebook cell.
+    Calls nested inside the submitted arguments keep the cell visible because
+    they may perform real computation while constructing the result.
+    """
+    if isinstance(cell, CodeCell):
+        language = cell.language
+        code = cell.code
+    else:
+        code = cell
+    if language != "python" or not isinstance(code, str):
+        return False
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, TypeError, ValueError):
+        return False
+    if len(tree.body) != 1 or not isinstance(tree.body[0], ast.Expr):
+        return False
+    call = tree.body[0].value
+    if not isinstance(call, ast.Call):
+        return False
+    target = call.func
+    if not (
+        isinstance(target, ast.Attribute)
+        and target.attr == "submit_output"
+        and isinstance(target.value, ast.Name)
+        and target.value.id == "host"
+    ):
+        return False
+    values = [*call.args, *(keyword.value for keyword in call.keywords)]
+    hidden_work = (
+        ast.Call,
+        ast.Await,
+        ast.Yield,
+        ast.YieldFrom,
+        ast.NamedExpr,
+        ast.ListComp,
+        ast.SetComp,
+        ast.DictComp,
+        ast.GeneratorExp,
+        ast.Lambda,
+    )
+    return not any(
+        isinstance(node, hidden_work)
+        for value in values
+        for node in ast.walk(value)
+    )
 
 
 def extract_action(text: str) -> CodeCell | None:

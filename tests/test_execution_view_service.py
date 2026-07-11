@@ -125,6 +125,36 @@ def test_execution_log_keeps_order_defaults_and_first_seen_kernels():
     assert interrupted["status"] == "interrupted"
     assert interrupted["cpu_seconds"] == 0.0
     assert interrupted["peak_rss_kb"] == 0
+
+
+def test_execution_log_hides_protocol_only_completion_but_keeps_mixed_cell():
+    store = _Store()
+    store.cells["frame"] = [
+        {
+            "cell_index": 1,
+            "kernel_id": "python",
+            "language": "python",
+            "code": "host.submit_output({'ok': True}, ['Completed it'])",
+            "stdout": "{'status': 'ok'}\n",
+            "status": "ok",
+        },
+        {
+            "cell_index": 2,
+            "kernel_id": "python",
+            "language": "python",
+            "code": (
+                "score = compute_score()\n"
+                "host.submit_output({'score': score}, ['Computed the score'])"
+            ),
+            "stdout": "0.93\n",
+            "status": "ok",
+        },
+    ]
+
+    payload = _service(store).execution_log("frame")
+
+    assert [entry["cell_index"] for entry in payload["entries"]] == [2]
+    assert "compute_score" in payload["entries"][0]["source"]
     assert _service(store).execution_log("missing") == {
         "kernels": [],
         "entries": [],

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
+from openai4s.agent.actions import is_completion_only_cell
 from openai4s.execution import CaptureResult, CellExecutionResult, CellRequest
 from openai4s.kernel import KernelLease, KernelSupervisor
 
@@ -69,8 +70,14 @@ class CellExecutionService:
         runtime_error = self.ports.prepare_language(session, request.language)
         kernel_id = self.ports.kernel_id(session, request.language)
         title = self.title_factory(request.code, index)
-        on_chunk = self._start_stream(
-            session, request, emit, index, kernel_id, title
+        show_in_notebook = not (
+            request.origin == "agent"
+            and is_completion_only_cell(request.code, request.language)
+        )
+        on_chunk = (
+            self._start_stream(session, request, emit, index, kernel_id, title)
+            if show_in_notebook
+            else None
         )
 
         before = self.ports.snapshot(session.workspace)

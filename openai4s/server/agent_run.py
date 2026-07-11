@@ -15,9 +15,16 @@ from openai4s.agent.actions import (
     count_code_blocks,
 )
 from openai4s.agent.control import execute_native_batch
-from openai4s.agent.events import AgentEvent, ReplyReceived, TextDelta, TurnStarted
+from openai4s.agent.events import (
+    ActionRouted,
+    AgentEvent,
+    ReplyReceived,
+    TextDelta,
+    TurnStarted,
+)
 from openai4s.agent.models import ExecutionOutcome, ModelReply, RunState
 from openai4s.agent.runtime import format_observation
+from openai4s.server.completions import action_narration
 from openai4s.tools import (
     MAX_TOOL_CALLS_PER_TURN,
     execute_tool_call,
@@ -100,12 +107,17 @@ class WebEventSink:
     root_frame_id: str
     assistant_visible: list[dict]
     add_usage: Callable[[dict], None]
+    language: str = "en"
+    narrate_actions: bool = True
+    cancelled: Callable[[], bool] = _never_cancelled
     current_prose: str = field(default="", init=False)
+    model_prose: str = field(default="", init=False)
     _streamer: ProseStreamer | None = field(default=None, init=False)
 
     def emit(self, event: AgentEvent) -> None:
         if isinstance(event, TurnStarted):
             self.current_prose = ""
+            self.model_prose = ""
             self._streamer = ProseStreamer(self.send, self.root_frame_id)
         elif isinstance(event, TextDelta):
             self._ensure_streamer().feed(event.text)
@@ -115,6 +127,7 @@ class WebEventSink:
             if event.reply.usage:
                 self.add_usage(event.reply.usage)
             prose = strip_fenced_blocks(event.reply.content).strip()
+            self.model_prose = prose
             self.current_prose = prose
             if prose:
                 self.assistant_visible.append(
@@ -129,6 +142,26 @@ class WebEventSink:
                             "chunk": prose + "\n",
                         }
                     )
+        elif (
+            isinstance(event, ActionRouted)
+            and self.narrate_actions
+            and not self.current_prose
+            and not self.cancelled()
+        ):
+            prose = action_narration(event.action, self.language)
+            if prose:
+                self.current_prose = prose
+                self.assistant_visible.append(
+                    {"at": int(time.time() * 1000) - 1, "text": prose}
+                )
+                self.send(
+                    {
+                        "type": "text_chunk",
+                        "frame_id": self.root_frame_id,
+                        "block_type": "text",
+                        "chunk": prose + "\n",
+                    }
+                )
 
     def _ensure_streamer(self) -> ProseStreamer:
         if self._streamer is None:
@@ -154,6 +187,9 @@ class WebActionExecutor:
     events: WebEventSink
     prose_nudge: str
     explore_nudge: str
+    native_wrapper: (
+        Callable[[Any, Callable[[], tuple[str, bool]]], tuple[str, bool]] | None
+    ) = None
     explore_mode: bool = False
     plan_mode: bool = False
     finalize_plan: Callable[[ModelReply, str], None] | None = None
@@ -216,10 +252,16 @@ class WebActionExecutor:
 
     def _invoke_native(self, call) -> tuple[str, bool]:
         self.apply_pending()
-        return execute_tool_call(
-            self.dispatcher(),
-            {"name": call.name, "arguments": call.arguments},
+        payload = (
+            {"name": call.name, "arguments": call.arguments}
+            if hasattr(call, "name")
+            else call
         )
+
+        def invoke() -> tuple[str, bool]:
+            return execute_tool_call(self.dispatcher(), payload)
+
+        return self.native_wrapper(call, invoke) if self.native_wrapper else invoke()
 
     def _apply_trailing_pending(
         self, outcome: ExecutionOutcome
@@ -253,11 +295,10 @@ class WebActionExecutor:
                     errors.append("remaining legacy tool calls skipped: cancelled")
                     break
                 try:
-                    self.apply_pending()
+                    text, _ok = self._invoke_native(call)
                 except Exception as exc:  # noqa: BLE001
                     errors.append(f"pending environment switch failed: {exc}")
                     break
-                text, _ok = execute_tool_call(self.dispatcher(), call)
                 parts.append(text)
             if not self.cancelled():
                 try:

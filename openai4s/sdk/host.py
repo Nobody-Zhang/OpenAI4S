@@ -658,9 +658,11 @@ class _Host:
     ) -> dict:
         """Submit the task's structured result + human-facing completion bullets.
 
-        completion_bullets must be 1-4 past-tense, verb-first strings. If
-        output_schema is given, `output` is validated against it. A validation
-        failure returns {"error":...} so the model can retry.
+        completion_bullets must be 1-4 completed-action strings. English uses
+        past-tense, verb-first wording; CJK verb phrases are accepted without
+        English tense morphology. If output_schema is given, `output` is
+        validated against it. A validation failure returns {"error":...} so
+        the model can retry.
         """
         return self._call(
             "submit_output",

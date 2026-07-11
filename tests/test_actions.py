@@ -16,6 +16,7 @@ from openai4s.agent.actions import (
     NativeToolCall,
     count_code_blocks,
     extract_action,
+    is_completion_only_cell,
     route_action,
 )
 
@@ -78,6 +79,29 @@ def test_count_code_blocks_spans_both_languages():
 def test_shared_texts_mention_both_channels():
     assert "```python" in NO_CODE_NUDGE and "```r" in NO_CODE_NUDGE
     assert "only the FIRST" in MULTI_CELL_NOTE
+
+
+def test_completion_only_cell_detection_is_strict_and_python_only():
+    direct = """# protocol-only completion
+host.submit_output(
+    {"answer": answer},
+    ["已完成分析"],
+)
+"""
+    assert is_completion_only_cell(direct)
+    assert is_completion_only_cell(CodeCell("python", direct))
+
+    assert not is_completion_only_cell(
+        "result = compute()\nhost.submit_output(result, ['Computed it'])"
+    )
+    assert not is_completion_only_cell(
+        "host.submit_output(build_result(), ['Computed it'])"
+    )
+    assert not is_completion_only_cell(
+        "host.submit_output({'rows': [f(x) for x in xs]}, ['Computed it'])"
+    )
+    assert not is_completion_only_cell("submit_output({}, ['Computed it'])")
+    assert not is_completion_only_cell(direct, "r")
 
 
 def test_action_type_covers_cells_and_native_batches():
