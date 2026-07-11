@@ -130,6 +130,7 @@ def test_control_tool_classes_own_their_security_policy():
         "register_remote_capability",
         "dynamic_tool_define",
         "dynamic_tool_promote",
+        "exec_background",
     }
     assert get_tool("read_text_file").secret_path({"path": "config/.env"}) == (
         "config/.env"

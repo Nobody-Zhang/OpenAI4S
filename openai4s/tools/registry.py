@@ -17,8 +17,21 @@ from dataclasses import dataclass
 from typing import Any
 
 from openai4s.tools.artifacts import ListArtifactsTool, SaveArtifactTool
+from openai4s.tools.background import (
+    InterruptBackgroundExecTool,
+    ListBackgroundExecsTool,
+    PeekBackgroundExecTool,
+    SubmitBackgroundExecTool,
+)
 from openai4s.tools.base import Tool
 from openai4s.tools.content_search import ContentSearchTool
+from openai4s.tools.data import (
+    FramesTool,
+    LineageGetTool,
+    LineageGraphTool,
+    QuerySchemaTool,
+    ReadOnlyQueryTool,
+)
 from openai4s.tools.delegation import (
     CollectChildrenTool,
     DelegateTaskTool,
@@ -77,6 +90,11 @@ TOOL_TYPES: tuple[type[Tool], ...] = (
     LoadSkillTool,
     ListArtifactsTool,
     SaveArtifactTool,
+    QuerySchemaTool,
+    ReadOnlyQueryTool,
+    FramesTool,
+    LineageGetTool,
+    LineageGraphTool,
     ReadTodosTool,
     WriteTodosTool,
     ReadPlanTool,
@@ -86,6 +104,10 @@ TOOL_TYPES: tuple[type[Tool], ...] = (
     CollectChildrenTool,
     StopChildTool,
     SendChildMessageTool,
+    SubmitBackgroundExecTool,
+    ListBackgroundExecsTool,
+    PeekBackgroundExecTool,
+    InterruptBackgroundExecTool,
     ListMCPServersTool,
     ListMCPToolsTool,
     CallMCPTool,

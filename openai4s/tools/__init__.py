@@ -12,6 +12,12 @@ host_dispatch / loop / gateway) at module load, so it stays importable with
 zero side effects. Wiring into the agent loops happens elsewhere.
 """
 from openai4s.tools.artifacts import ListArtifactsTool, SaveArtifactTool
+from openai4s.tools.background import (
+    InterruptBackgroundExecTool,
+    ListBackgroundExecsTool,
+    PeekBackgroundExecTool,
+    SubmitBackgroundExecTool,
+)
 from openai4s.tools.base import Tool
 from openai4s.tools.catalog import SessionToolCatalog
 from openai4s.tools.content_search import ContentSearchTool
@@ -19,6 +25,13 @@ from openai4s.tools.contexts import (
     ControlToolContext,
     EnvironmentToolContext,
     WorkspaceToolContext,
+)
+from openai4s.tools.data import (
+    FramesTool,
+    LineageGetTool,
+    LineageGraphTool,
+    QuerySchemaTool,
+    ReadOnlyQueryTool,
 )
 from openai4s.tools.delegation import (
     CollectChildrenTool,
@@ -98,6 +111,15 @@ __all__ = [
     "WorkspaceToolContext",
     "EnvironmentToolContext",
     "ControlToolContext",
+    "QuerySchemaTool",
+    "ReadOnlyQueryTool",
+    "FramesTool",
+    "LineageGetTool",
+    "LineageGraphTool",
+    "SubmitBackgroundExecTool",
+    "ListBackgroundExecsTool",
+    "PeekBackgroundExecTool",
+    "InterruptBackgroundExecTool",
     "ListDirectoryTool",
     "ReadTextFileTool",
     "WriteFileTool",

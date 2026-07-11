@@ -129,7 +129,14 @@ def test_progressive_specs_keep_core_dynamic_and_activate_relevant_groups(tmp_pa
         "sum_values",
     } <= base
     assert base.isdisjoint(
-        {"list_artifacts", "delegate_task", "call_mcp_tool", "read_plan"}
+        {
+            "list_artifacts",
+            "delegate_task",
+            "call_mcp_tool",
+            "read_plan",
+            "query",
+            "exec_background",
+        }
     )
 
     mcp_and_artifacts = {
@@ -150,8 +157,36 @@ def test_progressive_specs_keep_core_dynamic_and_activate_relevant_groups(tmp_pa
         spec.name for spec in catalog.specs_for([{"role": "tool", "content": "done"}])
     }
 
+    data_and_background = {
+        spec.name
+        for spec in catalog.specs_for(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "Query the SQL table schema and lineage, then monitor a "
+                        "long-running background job."
+                    ),
+                }
+            ]
+        )
+    }
+    assert {
+        "query_schema",
+        "query",
+        "frames",
+        "lineage_get",
+        "lineage_graph",
+        "exec_background",
+        "exec_list",
+        "exec_peek",
+        "exec_interrupt",
+    } <= data_and_background
+
     catalog.activate_groups("remote")
     assert "remote_gpu_status" in {spec.name for spec in catalog.specs_for([])}
     groups = {item["id"]: item for item in catalog.group_metadata()}
     assert groups["core"]["always"] is True
     assert groups["remote"]["active"] is True
+    assert groups["data"]["active"] is True
+    assert groups["background"]["active"] is True
