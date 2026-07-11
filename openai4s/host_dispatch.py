@@ -1806,7 +1806,7 @@ class HostDispatcher:
         if not p.exists():
             return {"error": f"prov_record: no such output file: {path}"}
         data = p.read_bytes()
-        rec = self.store.save_artifact(
+        return self.store.record_cell_artifact(
             path=str(p),
             filename=spec.get("filename") or p.name,
             content_type=spec.get("content_type"),
@@ -1814,16 +1814,8 @@ class HostDispatcher:
             checksum=hashlib.sha256(data).hexdigest(),
             producing_cell_id=spec.get("producing_cell_id"),
             frame_id=self.frame_id,
+            input_version_ids=spec.get("input_version_ids") or [],
         )
-        for input_vid in spec.get("input_version_ids") or []:
-            if input_vid and input_vid != rec["version_id"]:
-                self.store.add_lineage_edge(
-                    input_version_id=input_vid,
-                    output_version_id=rec["version_id"],
-                    producing_cell_id=spec.get("producing_cell_id"),
-                    frame_id=self.frame_id,
-                )
-        return rec
 
     # --- delegation + steering -----------------------------------
     def _m_delegate(self, spec: dict) -> Any:

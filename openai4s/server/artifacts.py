@@ -176,10 +176,7 @@ class ArtifactManager:
             checksum = self.checksum(path)
         except OSError:
             return None
-        existing = self.store.artifact_by_filename(
-            relative, session.root_frame_id, strict=True
-        )
-        record = self.store.save_artifact(
+        record = self.store.record_cell_artifact(
             path=str(path),
             filename=relative,
             content_type=self.guess_content_type(relative),
@@ -187,8 +184,8 @@ class ArtifactManager:
             checksum=checksum,
             producing_cell_id=cell_id,
             frame_id=session.root_frame_id,
+            root_frame_id=session.root_frame_id,
             project_id=session.project_id,
-            artifact_id=(existing["artifact_id"] if existing else None),
             env_snapshot_id=env_snapshot_id,
         )
         self.write_version_snapshot(record["version_id"], relative, src_path=path)

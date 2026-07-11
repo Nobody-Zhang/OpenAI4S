@@ -4,6 +4,10 @@ store.py is a future extraction target (docs/refactor-plan.md) — these lock
 the row shapes and id conventions callers depend on TODAY, so an extraction
 that drops or renames a column fails here first.
 """
+import sqlite3
+
+import pytest
+
 from openai4s.config import Config, LLMConfig
 from openai4s.store import get_store
 
@@ -105,6 +109,216 @@ def test_save_artifact_return_shape_and_version_row_columns(tmp_path):
     assert row["producing_cell_id"] == "cell-1"
     assert row["frame_id"] == "f-1"
     assert store.version_meta("v-does-not-exist") is None
+
+
+def test_record_cell_artifact_coalesces_metadata_and_lineage_atomically(tmp_path):
+    store = _store(tmp_path)
+    frame_id = store.new_frame(kind="turn", project_id="default")
+    source = tmp_path / "input.txt"
+    source.write_text("science")
+    source_record = store.save_artifact(
+        path=str(source),
+        filename=source.name,
+        content_type="text/plain",
+        size_bytes=7,
+        checksum="source",
+        frame_id=frame_id,
+    )
+    output = tmp_path / "output.csv"
+    output.write_text("value\n1\n")
+    checksum = "same-bytes"
+
+    provenance = store.record_cell_artifact(
+        path=str(output),
+        filename=output.name,
+        content_type="text/plain",
+        size_bytes=8,
+        checksum=checksum,
+        producing_cell_id="cell-1",
+        frame_id=frame_id,
+        input_version_ids=[source_record["version_id"], source_record["version_id"]],
+    )
+    repeated = store.record_cell_artifact(
+        path=str(output),
+        filename=output.name,
+        content_type="text/plain",
+        size_bytes=8,
+        checksum=checksum,
+        producing_cell_id="cell-1",
+        frame_id=frame_id,
+        input_version_ids=[source_record["version_id"]],
+    )
+    assert repeated["version_id"] == provenance["version_id"]
+    env_id = store.upsert_env_snapshot(
+        {"kind": "python", "packages": [], "package_count": 0}
+    )
+    capture = store.record_cell_artifact(
+        path=str(output),
+        filename=output.name,
+        content_type="text/csv",
+        size_bytes=8,
+        checksum=checksum,
+        producing_cell_id="cell-1",
+        frame_id=frame_id,
+        root_frame_id=frame_id,
+        env_snapshot_id=env_id,
+    )
+
+    assert capture["artifact_id"] == provenance["artifact_id"]
+    assert capture["version_id"] == provenance["version_id"]
+    assert capture["content_type"] == "text/csv"
+    assert len(store.list_versions(provenance["artifact_id"])) == 1
+    metadata = store.version_meta(provenance["version_id"])
+    assert metadata["content_type"] == "text/csv"
+    assert metadata["env_snapshot_id"] == env_id
+    assert store.get_artifact(provenance["artifact_id"])["content_type"] == "text/csv"
+    assert store.lineage_inputs(provenance["version_id"]) == [
+        {
+            "version_id": source_record["version_id"],
+            "filename": "input.txt",
+            "path": str(source),
+        }
+    ]
+
+    next_cell = store.record_cell_artifact(
+        path=str(output),
+        filename=output.name,
+        content_type="text/csv",
+        size_bytes=8,
+        checksum=checksum,
+        producing_cell_id="cell-2",
+        frame_id=frame_id,
+    )
+    assert next_cell["artifact_id"] == provenance["artifact_id"]
+    assert next_cell["version_id"] != provenance["version_id"]
+    assert len(store.list_versions(provenance["artifact_id"])) == 2
+
+
+def test_record_cell_artifact_finds_exact_version_before_newer_duplicate(tmp_path):
+    store = _store(tmp_path)
+    frame_id = store.new_frame(kind="turn", project_id="default")
+    output = tmp_path / "result.csv"
+    output.write_text("value\n1\n")
+    checksum = "provenance-bytes"
+
+    provenance = store.record_cell_artifact(
+        path=str(output),
+        filename=output.name,
+        content_type=None,
+        size_bytes=8,
+        checksum=checksum,
+        producing_cell_id="cell-provenance",
+        frame_id=frame_id,
+    )
+    intervening = store.save_artifact(
+        path=str(tmp_path / "explicit-copy.csv"),
+        filename=output.name,
+        content_type="text/csv",
+        size_bytes=8,
+        checksum="explicit-bytes",
+        producing_cell_id="cell-explicit",
+        frame_id=frame_id,
+    )
+
+    capture = store.record_cell_artifact(
+        path=str(output),
+        filename=output.name,
+        content_type="text/csv",
+        size_bytes=8,
+        checksum=checksum,
+        producing_cell_id="cell-provenance",
+        frame_id=frame_id,
+    )
+
+    assert capture["artifact_id"] == provenance["artifact_id"]
+    assert capture["version_id"] == provenance["version_id"]
+    assert store.get_artifact(provenance["artifact_id"])["latest_version_id"] == (
+        provenance["version_id"]
+    )
+    assert store.get_artifact(intervening["artifact_id"])["latest_version_id"] == (
+        intervening["version_id"]
+    )
+
+
+def test_record_cell_artifact_coalesces_unframed_alias_and_versions_new_bytes(
+    tmp_path,
+):
+    store = _store(tmp_path)
+    output = tmp_path / "unframed.txt"
+    output.write_text("first")
+    alias = tmp_path / "unframed-alias.txt"
+    alias.symlink_to(output)
+
+    first = store.record_cell_artifact(
+        path=str(output),
+        filename="result.txt",
+        content_type=None,
+        size_bytes=5,
+        checksum="first-bytes",
+        producing_cell_id="cell-unframed",
+        frame_id=None,
+    )
+    finalized = store.record_cell_artifact(
+        path=str(alias),
+        filename="result.txt",
+        content_type="text/plain",
+        size_bytes=5,
+        checksum="first-bytes",
+        producing_cell_id="cell-unframed",
+        frame_id=None,
+    )
+
+    assert finalized["artifact_id"] == first["artifact_id"]
+    assert finalized["version_id"] == first["version_id"]
+    assert finalized["content_type"] == "text/plain"
+
+    output.write_text("second")
+    changed = store.record_cell_artifact(
+        path=str(output),
+        filename="result.txt",
+        content_type="text/plain",
+        size_bytes=6,
+        checksum="second-bytes",
+        producing_cell_id="cell-unframed",
+        frame_id=None,
+    )
+
+    assert changed["artifact_id"] == first["artifact_id"]
+    assert changed["version_id"] != first["version_id"]
+    assert len(store.list_versions(first["artifact_id"])) == 2
+
+
+def test_record_cell_artifact_rolls_back_version_when_lineage_fails(tmp_path):
+    store = _store(tmp_path)
+    frame_id = store.new_frame(kind="turn", project_id="default")
+    source = store.save_artifact(
+        path=str(tmp_path / "input.txt"),
+        filename="input.txt",
+        content_type="text/plain",
+        size_bytes=1,
+        checksum="input",
+        frame_id=frame_id,
+    )
+    store._conn.execute(
+        "CREATE TRIGGER fail_lineage BEFORE INSERT ON lineage_edges "
+        "BEGIN SELECT RAISE(ABORT, 'lineage failed'); END"
+    )
+    store._conn.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="lineage failed"):
+        store.record_cell_artifact(
+            path=str(tmp_path / "output.txt"),
+            filename="output.txt",
+            content_type="text/plain",
+            size_bytes=1,
+            checksum="output",
+            producing_cell_id="cell-fail",
+            frame_id=frame_id,
+            input_version_ids=[source["version_id"]],
+        )
+
+    assert store.artifact_by_filename("output.txt", frame_id, strict=True) is None
+    assert store.version_for_path(str(tmp_path / "output.txt")) is None
 
 
 def test_list_versions_row_shape_ordering_and_latest_pointer(tmp_path):

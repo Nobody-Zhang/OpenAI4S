@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from openai4s.config import Config, LLMConfig
+from openai4s.host_dispatch import HostDispatcher
+from openai4s.kernel import Kernel
 from openai4s.server.artifacts import ArtifactManager
 from openai4s.store import get_store
 
@@ -17,6 +19,7 @@ class ArtifactHarness:
             data_dir=tmp_path / "data",
             llm=LLMConfig(provider="deepseek", api_key="test-key"),
         )
+        self.cfg = cfg
         self.store = get_store(cfg.db_path)
         self.frame_id = self.store.new_frame(
             kind="turn", project_id="default", status="ready"
@@ -78,6 +81,97 @@ def test_register_freezes_version_before_emitting_event(tmp_path):
     assert Path(
         harness.store.version_meta(first["version_id"])["snapshot_path"]
     ).read_bytes() == b"ALPHA"
+
+
+def test_capture_finalizes_provenance_version_without_duplicating_it(tmp_path):
+    harness = ArtifactHarness(tmp_path)
+    source = harness.workspace / "input.txt"
+    source.write_text("science")
+    source_record = harness.store.save_artifact(
+        path=str(source),
+        filename=source.name,
+        content_type="text/plain",
+        size_bytes=7,
+        checksum="source",
+        frame_id=harness.frame_id,
+        project_id="default",
+    )
+    dispatcher = HostDispatcher(cfg=harness.cfg, frame_id=harness.frame_id)
+    events = []
+
+    with Kernel(dispatcher=dispatcher, cwd=str(harness.workspace)) as kernel:
+        before = harness.manager.snapshot(harness.workspace)
+        first_result = kernel.execute(
+            "text = open('input.txt').read()\n"
+            "with open('derived.txt', 'w') as handle:\n"
+            "    handle.write(text.upper())\n",
+            cell_id="cell-derived-1",
+        )
+        assert first_result["error"] is None
+        output = harness.store.artifact_by_filename(
+            "derived.txt", harness.frame_id, strict=True
+        )
+        assert output is not None
+        provenance_version = output["latest_version_id"]
+        assert len(harness.store.list_versions(output["artifact_id"])) == 1
+
+        first_capture = harness.manager.capture(
+            harness.session,
+            1,
+            "cell-derived-1",
+            before,
+            events.append,
+            language="python",
+        )
+
+        assert first_capture.artifacts[0]["version_id"] == provenance_version
+        assert events[0]["artifact"]["version_id"] == provenance_version
+        output = harness.store.get_artifact(output["artifact_id"])
+        assert output["latest_version_id"] == provenance_version
+        assert len(harness.store.list_versions(output["artifact_id"])) == 1
+        metadata = harness.store.version_meta(provenance_version)
+        assert metadata["env_snapshot_id"] is not None
+        assert Path(metadata["snapshot_path"]).read_text() == "SCIENCE"
+        assert harness.store.lineage_inputs(provenance_version) == [
+            {
+                "version_id": source_record["version_id"],
+                "filename": "input.txt",
+                "path": str(source),
+            }
+        ]
+
+        before_second = harness.manager.snapshot(harness.workspace)
+        second_result = kernel.execute(
+            "text = open('input.txt').read()\n"
+            "with open('derived.txt', 'w') as handle:\n"
+            "    handle.write(text.lower())\n",
+            cell_id="cell-derived-2",
+        )
+        assert second_result["error"] is None
+        second_capture = harness.manager.capture(
+            harness.session,
+            2,
+            "cell-derived-2",
+            before_second,
+            events.append,
+            language="python",
+        )
+
+    assert second_capture.artifacts[0]["artifact_id"] == output["artifact_id"]
+    second_version = second_capture.artifacts[0]["version_id"]
+    assert second_version != provenance_version
+    assert len(harness.store.list_versions(output["artifact_id"])) == 2
+    assert Path(harness.store.resolve_artifact_path(provenance_version)).read_text() == (
+        "SCIENCE"
+    )
+    assert Path(harness.store.resolve_artifact_path(second_version)).read_text() == (
+        "science"
+    )
+    assert len(
+        harness.store.list_artifacts(
+            {"root_frame_id": harness.frame_id, "filename": "derived.txt"}
+        )
+    ) == 1
 
 
 def test_protect_latest_backfills_live_bytes_for_legacy_version(tmp_path):

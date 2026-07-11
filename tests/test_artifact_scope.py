@@ -60,6 +60,43 @@ def test_child_frames_and_artifacts_inherit_root_project_scope(tmp_path):
     assert version["frame_id"] == grandchild
 
 
+def test_root_capture_finalizes_child_provenance_without_changing_producer(tmp_path):
+    store = get_store(_config(tmp_path).db_path)
+    root = store.new_frame(kind="turn", project_id="project-science")
+    child = store.new_frame(parent_id=root, kind="delegate")
+    path = tmp_path / "result.csv"
+    path.write_text("x\n1\n")
+
+    provenance = store.record_cell_artifact(
+        path=str(path),
+        filename="result.csv",
+        content_type=None,
+        size_bytes=4,
+        checksum="same",
+        producing_cell_id="cell-child",
+        frame_id=child,
+    )
+    capture = store.record_cell_artifact(
+        path=str(path),
+        filename="result.csv",
+        content_type="text/csv",
+        size_bytes=4,
+        checksum="same",
+        producing_cell_id="cell-child",
+        frame_id=root,
+        root_frame_id=root,
+        project_id="project-science",
+    )
+
+    assert capture["artifact_id"] == provenance["artifact_id"]
+    assert capture["version_id"] == provenance["version_id"]
+    artifact = store.get_artifact(provenance["artifact_id"])
+    metadata = store.version_meta(provenance["version_id"])
+    assert artifact["root_frame_id"] == root
+    assert artifact["project_id"] == "project-science"
+    assert metadata["frame_id"] == child
+
+
 def test_artifact_rejects_version_from_different_root(tmp_path):
     store = get_store(_config(tmp_path).db_path)
     first_root = store.new_frame(kind="turn", project_id="project-one")
