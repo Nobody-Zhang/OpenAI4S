@@ -141,6 +141,20 @@ def test_missing_api_key_raises(monkeypatch):
         llm.chat([{"role": "user", "content": "hi"}], c)
 
 
+def test_loopback_openai_endpoint_can_run_without_fake_api_key(cap):
+    c = LLMConfig(
+        provider="chatgpt",
+        api_key="",
+        base_url="http://127.0.0.1:11434/v1",
+        model="qwen3:8b",
+    )
+
+    llm.chat([{"role": "user", "content": "hi"}], c)
+
+    assert cap.url == "http://127.0.0.1:11434/v1/chat/completions"
+    assert "Authorization" not in cap.headers
+
+
 # --- wire selection + auth headers ---------------------------------------
 
 

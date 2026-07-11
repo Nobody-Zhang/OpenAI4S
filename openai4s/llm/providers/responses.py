@@ -50,10 +50,11 @@ def _chat_responses(
     _apply_responses_tools(payload, tools or [], tool_choice, parallel_tool_calls)
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {cfg.api_key}",
         "User-Agent": os.environ.get("OPENAI4S_LLM_USER_AGENT", _BROWSER_UA),
         "Accept": "text/event-stream",
     }
+    if cfg.api_key:
+        headers["Authorization"] = f"Bearer {cfg.api_key}"
     text_parts: list[str] = []
     state: dict[str, Any] = {
         "usage": {},

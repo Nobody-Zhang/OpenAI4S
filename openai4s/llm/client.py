@@ -87,19 +87,19 @@ def chat(
     post_sse,
 ) -> dict[str, Any]:
     """Route one normalized request through the configured provider adapter."""
-    if not cfg.api_key:
-        raise LLMError(
-            f"no API key configured for provider {cfg.provider!r}: set the "
-            f"OPENAI4S_{cfg.provider.upper()}_API_KEY (or generic OPENAI4S_LLM_API_KEY) "
-            f"environment variable, or add it to a .env file at the repo root. "
-            f"See .env.example."
-        )
     spec = provider_spec(cfg.provider)
     base = cfg.base_url or spec["base_url"]
     model = cfg.model or spec["model"]
     capabilities = get_model_capabilities(
         cfg.provider, model, base_url=base
     )
+    if not cfg.api_key and not capabilities.local_endpoint:
+        raise LLMError(
+            f"no API key configured for provider {cfg.provider!r}: set the "
+            f"OPENAI4S_{cfg.provider.upper()}_API_KEY (or generic OPENAI4S_LLM_API_KEY) "
+            f"environment variable, or add it to a .env file at the repo root. "
+            f"See .env.example."
+        )
     _guard_vision(cfg.provider, messages, capabilities=capabilities)
     wire = spec["wire"]
     caller = _WIRE_DISPATCH[wire]

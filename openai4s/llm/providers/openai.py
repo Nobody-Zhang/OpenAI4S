@@ -44,9 +44,10 @@ def _chat_openai(
     _apply_chat_tools(payload, tools or [], tool_choice, parallel_tool_calls)
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {cfg.api_key}",
         "User-Agent": os.environ.get("OPENAI4S_LLM_USER_AGENT", _BROWSER_UA),
     }
+    if cfg.api_key:
+        headers["Authorization"] = f"Bearer {cfg.api_key}"
     # Real token streaming: when a delta callback is supplied AND streaming isn't
     # explicitly disabled, POST with `stream:true` and forward each token to
     # on_delta as it arrives, so prose renders live instead of one blob per turn.
