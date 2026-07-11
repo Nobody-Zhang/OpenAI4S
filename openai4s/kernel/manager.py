@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from openai4s.kernel.environment import build_kernel_environment
+from openai4s.security.sandbox import KernelSandbox, create_kernel_sandbox
 
 _WORKER = Path(__file__).resolve().parent / "worker.py"
 
@@ -34,6 +35,7 @@ class Kernel:
         env_root: str | None = None,
         env_name: str | None = None,
         argv: list[str] | None = None,
+        sandbox: KernelSandbox | None = None,
     ):
         self.dispatcher = dispatcher
         self.mode = mode
@@ -49,19 +51,29 @@ class Kernel:
         # manager loop (execute/host_call routing/restart/interrupt) is reused
         # verbatim. Kept across restart() so a respawn preserves the language.
         self.argv = argv
+        # The OS boundary is independent of the JSON frame protocol: it only
+        # wraps the worker argv and supplies a private temp directory.  Host RPC
+        # remains on the existing pipes and is still serviced by this manager's
+        # one synchronous reader loop.
+        self._sandbox = sandbox or create_kernel_sandbox(self.cwd)
         self.generation = 0  # bumped on every (re)spawn
-        self._proc = self._spawn()
+        try:
+            self._proc = self._spawn()
+        except Exception:
+            self._sandbox.close()
+            raise
 
     def _spawn(self) -> "subprocess.Popen":
+        command = self.argv or [self.python, "-u", str(_WORKER)]
         proc = subprocess.Popen(
-            self.argv or [self.python, "-u", str(_WORKER)],
+            self._sandbox.wrap_command(command),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
             cwd=self.cwd,
-            env=self._child_env(),
+            env=self._sandbox.apply_environment(self._child_env()),
         )
         # Drain stderr continuously into a bounded tail. Without this, a cell
         # whose child processes write to inherited fd2 (R `system()`, an
@@ -158,6 +170,12 @@ class Kernel:
     @property
     def pid(self) -> int:
         return self._proc.pid
+
+    @property
+    def sandbox_status(self) -> dict[str, Any]:
+        """Serializable OS-boundary state for status APIs and the UI."""
+
+        return self._sandbox.status.to_dict()
 
     def interrupt(self) -> None:
         """Deliver ONE SIGINT to the worker ( exec_interrupt).
@@ -260,6 +278,7 @@ class Kernel:
                     stream and stream.close()
                 except Exception:  # noqa: BLE001
                     pass
+            self._sandbox.close()
 
     def __enter__(self) -> "Kernel":
         return self
