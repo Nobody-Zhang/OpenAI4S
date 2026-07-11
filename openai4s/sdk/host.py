@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from openai4s.sdk.bash import BashExecutor
 from openai4s.sdk.compute import (
     SessionConcurrencyFull,
     _Compute,
@@ -369,17 +370,26 @@ class _Host:
         self,
         host_call: Callable[[str, list], Any],
         denied: frozenset[str] = frozenset(),
+        bash_authorizer: Callable[[str, list], Any] | None = None,
     ):
         # Wrap the raw RPC so every SDK call encodes its args for the wire
         # (snake->camel + drop-None) exactly once, transparently to accessors.
         def _encoded_call(method: str, args: list) -> Any:
             return host_call(method, encode_args(args))
 
+        def _encoded_bash_authorizer(method: str, args: list) -> Any:
+            target = bash_authorizer or host_call
+            return target(method, encode_args(args))
+
         # `_denied` is the set of control-plane symbols this kernel was NOT
         # spliced with. Set FIRST so __getattribute__ can consult it
         # while the rest of __init__ runs.
         object.__setattr__(self, "_denied", frozenset(denied))
         self._call = _encoded_call
+        self._bash = BashExecutor(
+            self._call,
+            authorization_call=_encoded_bash_authorizer,
+        )
         self.skills = _Skills(self._call)
         # query/mcp are control-plane; only attach when not denied so that a
         # denied kernel has no such attribute at all (genuine AttributeError).
@@ -711,80 +721,7 @@ class _Host:
         carries the active prebuilt env's bin/ (so pip/mafft/iqtree resolve).
         The static shell precheck and the egress fence still apply.
         """
-        import os
-        import subprocess
-
-        if not isinstance(command, str) or not command.strip():
-            raise RuntimeError("bash: empty command")
-        # Cheap static gate — same blocklist the host-side bash used to run.
-        try:
-            from openai4s.security.shellcheck import precheck_command
-
-            reason = precheck_command(command)
-        except Exception:  # noqa: BLE001 — the gate itself must fail open
-            reason = None
-        if reason:
-            raise RuntimeError(f"bash: blocked by static safety precheck: {reason}")
-        # Best-effort outbound-domain fence. The domains are extracted HERE
-        # (pure scan), but the verdict comes from the HOST via one read-only
-        # RPC: the live OPENAI4S_EGRESS toggle and the request_network_access
-        # grants exist only in the host process — this worker's env/grants are
-        # a stale snapshot from spawn time. Falls back to the local fence when
-        # the host is unreachable.
-        blocked_msg = None
-        domains: list = []
-        try:
-            from openai4s import egress
-
-            domains = egress.command_domains(command)
-        except Exception:  # noqa: BLE001 — fence lookup must fail open
-            domains = []
-        if domains:
-            verdict = None
-            try:
-                verdict = self._call("egress_check", [{"domains": domains}])
-            except Exception:  # noqa: BLE001 — host unreachable → local fence
-                verdict = None
-            if isinstance(verdict, dict):
-                if verdict.get("blocked"):
-                    blocked_msg = verdict.get("message") or (
-                        f"bash: domain {verdict['blocked']} is outside the "
-                        "egress allowlist"
-                    )
-            else:
-                try:
-                    from openai4s import egress
-
-                    blocked = egress.scan_command(command)
-                    if blocked is not None:
-                        blocked_msg = egress.blocked_error(blocked).get("error")
-                except Exception:  # noqa: BLE001
-                    blocked_msg = None
-        if blocked_msg:
-            raise RuntimeError(blocked_msg)
-        cwd = os.getcwd()
-        if workdir:
-            cand = os.path.realpath(os.path.join(cwd, str(workdir)))
-            if not os.path.isdir(cand):
-                raise RuntimeError(f"bash: workdir not found: {workdir}")
-            cwd = cand
-        try:
-            proc = subprocess.run(
-                command,
-                shell=True,
-                cwd=cwd,
-                capture_output=True,
-                text=True,
-                timeout=float(timeout or 120),
-            )
-        except subprocess.TimeoutExpired:
-            raise RuntimeError(f"bash: timed out after {timeout}s") from None
-        return {
-            "exit_code": proc.returncode,
-            "stdout": (proc.stdout or "")[-30000:],
-            "stderr": (proc.stderr or "")[-8000:],
-            "workdir": cwd,
-        }
+        return self._bash.run(command, timeout=timeout, workdir=workdir)
 
     def read_file(self, path: str, *, offset: int = 0, limit: int = 2000) -> dict:
         """Read a workspace file (optionally a line window). Returns {content,...}."""
@@ -1013,7 +950,12 @@ class _Host:
         return self._call("remember", [{"content": content, "block": block}])
 
 
-def build_host(host_call: Callable[[str, list], Any], mode: str = "repl") -> _Host:
+def build_host(
+    host_call: Callable[[str, list], Any],
+    mode: str = "repl",
+    *,
+    bash_authorizer: Callable[[str, list], Any] | None = None,
+) -> _Host:
     """Assemble the host.* facade for a kernel.
 
     capability gate = splice trimming, not a runtime if-check. The `repl`
@@ -1026,7 +968,11 @@ def build_host(host_call: Callable[[str, list], Any], mode: str = "repl") -> _Ho
     ./handoff/*.json instead of host.query/host.frames.
     """
     if mode == "repl":
-        return _Host(host_call)
+        return _Host(host_call, bash_authorizer=bash_authorizer)
     if mode in ("python", "analysis", "r", "R"):
-        return _Host(host_call, denied=_ANALYSIS_DENY)
+        return _Host(
+            host_call,
+            denied=_ANALYSIS_DENY,
+            bash_authorizer=bash_authorizer,
+        )
     raise ValueError(f"build_host: unknown kernel mode {mode!r}")

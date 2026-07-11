@@ -5,6 +5,8 @@ import threading
 
 import pytest
 
+from openai4s.config import Config, LLMConfig
+from openai4s.host_dispatch import build_dispatcher
 from openai4s.kernel import Kernel
 from openai4s.kernel.environment import build_kernel_environment
 
@@ -15,6 +17,26 @@ def _echo_dispatcher(method, args):
     if method == "add":
         return sum(args[0]["nums"])
     raise ValueError(f"unknown method {method}")
+
+
+def _authorized_bash_dispatcher(tmp_path):
+    """Real Host policy/authorization with an explicit test-only allow rule."""
+
+    cfg = Config(
+        data_dir=tmp_path / ".data",
+        llm=LLMConfig(provider="deepseek", api_key="test-only"),
+    )
+    dispatcher = build_dispatcher(cfg, workspace=tmp_path)
+    frame_id = dispatcher.store.new_frame(kind="turn")
+    dispatcher.frame_id = frame_id
+    dispatcher.store.set_permission_rule(
+        scope="conversation",
+        scope_id=frame_id,
+        tool="bash",
+        pattern="*",
+        decision="allow",
+    )
+    return dispatcher
 
 
 def test_print_capture():
@@ -134,7 +156,9 @@ cmd = shlex.quote(sys.executable) + ' -c ' + shlex.quote(probe)
 print(host.bash(cmd)['stdout'].strip())
 print(os.environ.get('OPENAI4S_PROVENANCE_OFF', '<missing>'))
 """
-    with Kernel(dispatcher=_echo_dispatcher, cwd=str(tmp_path)) as kernel:
+    with Kernel(
+        dispatcher=_authorized_bash_dispatcher(tmp_path), cwd=str(tmp_path)
+    ) as kernel:
         result = kernel.execute(code)
 
     assert result["error"] is None
@@ -499,10 +523,12 @@ def test_host_bash_is_kernel_local_and_never_rpcs(tmp_path):
     python/R cells. A dispatcher that rejects a 'bash' method proves no RPC
     happens; the command's output is captured in the cell like any subprocess."""
 
+    authorized = _authorized_bash_dispatcher(tmp_path)
+
     def no_bash_dispatcher(method, args):
         if method == "bash":
             raise AssertionError("host.bash must not reach the host dispatcher")
-        return _echo_dispatcher(method, args)
+        return authorized(method, args)
 
     with Kernel(dispatcher=no_bash_dispatcher, cwd=str(tmp_path)) as k:
         r = k.execute("r = host.bash('echo kernel-local'); print(r['stdout'])")
@@ -511,6 +537,15 @@ def test_host_bash_is_kernel_local_and_never_rpcs(tmp_path):
         # the shell ran in the worker's cwd (the workspace)
         r2 = k.execute("print(host.bash('pwd')['workdir'])")
         assert str(tmp_path.resolve()) in r2["stdout"]
+
+    methods = [
+        row[0]
+        for row in authorized.store._conn.execute(
+            "SELECT method FROM host_call_log ORDER BY created_at"
+        ).fetchall()
+    ]
+    assert "bash" in methods  # safe result audit
+    assert "authorize_bash" in methods
 
 
 def test_host_bash_static_precheck_blocks_catastrophe(tmp_path):

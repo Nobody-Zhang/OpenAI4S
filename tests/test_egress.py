@@ -192,15 +192,30 @@ def _wait_ask(events):
 
 
 def _kernel_local_host():
-    """The SDK host with a host_call that must never fire — host.bash is
-    kernel-local (the host executes only python/R cells; shell runs in the
-    worker process, where this test stands in for the worker)."""
-    from openai4s.sdk.host import build_host
+    """SDK host with a test-only capability issuer and no Host execution."""
+    from pathlib import Path
+
+    from openai4s.host.bash import BashAuthorizationService
+    from openai4s.sdk.host import build_host, decode_args
 
     def _no_rpc(method, args):
         raise AssertionError(f"host.bash must not RPC to the host: {method}")
 
-    return build_host(_no_rpc)
+    service = BashAuthorizationService(
+        workspace=lambda: Path.cwd(), frame_id=lambda: None
+    )
+
+    def authorize(method, args):
+        decoded = decode_args(args)
+        if method == "authorize_bash":
+            return service.authorize(decoded[0])
+        if method == "consume_bash_authorization":
+            return service.consume(decoded[0])
+        if method == "record_bash_result":
+            return service.record_result(decoded[0])
+        raise AssertionError(f"unexpected authorization method: {method}")
+
+    return build_host(_no_rpc, bash_authorizer=authorize)
 
 
 def test_bash_blocked_domain_soft_fails_before_running(tmp_path, monkeypatch):
@@ -234,7 +249,15 @@ def test_kernel_local_bash_sees_runtime_grants_via_host_verdict(tmp_path, monkey
 
     _allowlist(monkeypatch)
     monkeypatch.chdir(tmp_path)
-    disp, _frame, _ = _dispatcher(tmp_path)
+    disp, frame, store = _dispatcher(tmp_path)
+    disp.set_workspace(tmp_path)
+    store.set_permission_rule(
+        scope="conversation",
+        scope_id=frame,
+        tool="bash",
+        pattern="*",
+        decision="allow",
+    )
     host = build_host(lambda method, args: disp(method, args))
 
     # blocked before any grant — the verdict comes from the host

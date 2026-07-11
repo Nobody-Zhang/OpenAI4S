@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from openai4s.config import Config, get_config
+from openai4s.host.bash import BashAuthorizationService, redact_shell_text
 from openai4s.host.completion import CompletionService
 from openai4s.host.credentials import CredentialService
 from openai4s.host.data import HostDataService
@@ -79,6 +80,20 @@ def _domain(url: str) -> str:
     return re.sub(r"^https?://(www\.)?", "", url or "").split("/")[0]
 
 
+def _configured_bash_allowed_roots() -> list[str]:
+    """Trusted host-global extra cwd roots for capability-authorized shell.
+
+    The ordinary session workspace is always allowed and is not listed here.
+    Empty entries are ignored.  The service canonicalizes and validates every
+    configured path before issuing a token.
+    """
+
+    import os
+
+    raw = os.environ.get("OPENAI4S_BASH_ALLOWED_ROOTS", "")
+    return [item for item in raw.split(os.pathsep) if item.strip()]
+
+
 def _step_begin(method: str, args: list) -> tuple[str, str, dict] | None:
     """(kind, title, input) for a visible tool call, else None."""
     a = args[0] if args and isinstance(args[0], dict) else {}
@@ -93,6 +108,19 @@ def _step_begin(method: str, args: list) -> tuple[str, str, dict] | None:
             "network",
             f"Requesting network access to {dom}",
             {"domain": dom, "reason": a.get("reason", "")},
+        )
+    if method == "authorize_bash":
+        command = a.get("command", "")
+        preview = redact_shell_text(command, limit=1000)
+        executable = preview.strip().split(None, 1)[0] if preview.strip() else "command"
+        return (
+            "bash",
+            f"Running {Path(executable).name or 'shell command'}",
+            {
+                "command": preview,
+                "command_sha256": a.get("command_sha256"),
+                "cwd": a.get("cwd", ""),
+            },
         )
     if method == "edit_file":
         p = a.get("path", "")
@@ -232,6 +260,9 @@ GATEABLE_TOOLS = frozenset(
         # user decision, so it routes through the permission broker like any other
         # risk-bearing tool. The agent cannot widen the fence unilaterally.
         "request_network_access",
+        # Authorization, not execution: the handler only issues a capability.
+        # Permission rules remain keyed as ``bash`` below for compatibility.
+        "authorize_bash",
     }
 )
 
@@ -254,6 +285,10 @@ def _gate_target(method: str, args: list) -> str:
         return a.get("query", "") or ""
     if method == "request_network_access":
         return a.get("domain", "") or first or ""
+    if method == "bash":
+        # Permission requests/rules are durable.  Never copy a command-line
+        # credential into those records; matching occurs on this redacted form.
+        return redact_shell_text(a.get("command", "") or first, limit=4000)
     if method == "env_setup":
         packages = a.get("packages") or []
         return (
@@ -433,6 +468,19 @@ class HostDispatcher:
             frame_id=lambda: self.frame_id,
             workspace=lambda: self.workspace_path,
         )
+        # Lifecycle owners may stamp the supervisor's persistent generation
+        # here.  Until then the capability still binds the worker's per-process
+        # generation claim; the service independently checks this value whenever
+        # it is populated.
+        self.bash_generation_id: str | int | None = None
+        self._bash_authorization = BashAuthorizationService(
+            workspace=lambda: self._files.workspace(),
+            frame_id=lambda: self.frame_id,
+            generation=lambda: self.bash_generation_id,
+            allowed_roots=_configured_bash_allowed_roots,
+            audit=lambda **fields: self.store.log_host_call(**fields),
+            step_sink=lambda: self.on_step,
+        )
         self._data_service = HostDataService(
             store=lambda: self.store,
             config=lambda: self.cfg,
@@ -582,6 +630,7 @@ class HostDispatcher:
                     step_id = None
         ok = True
         result = None
+        deferred_step = False
         try:
             # opencode-style permission gate: block on user approval for
             # risk-bearing tools. Covers this dispatcher (foreground + background
@@ -612,13 +661,14 @@ class HostDispatcher:
                 ok = False
                 return result
             if requires_approval:
-                target = _gate_target(method, args)
+                permission_method = "bash" if method == "authorize_bash" else method
+                target = _gate_target(permission_method, args)
                 from openai4s.permissions import broker
 
                 gate = broker().gate(
                     store=self.store,
                     frame_id=self.frame_id,
-                    method=method,
+                    method=permission_method,
                     target=target,
                     view=view,
                 )
@@ -631,6 +681,12 @@ class HostDispatcher:
             if isinstance(result, dict) and set(result.keys()) == {"error"}:
                 ok = False  # soft-fail contract
             else:
+                if method == "authorize_bash" and isinstance(result, dict):
+                    deferred_step = self._bash_authorization.attach_step(
+                        str(result.get("token") or ""),
+                        step_id=step_id,
+                        view=view,
+                    )
                 result = self._screen_tool_result(method, result, control_tool)
             return result
         except Exception:
@@ -640,7 +696,7 @@ class HostDispatcher:
             self.store.log_host_call(
                 method=method, args=args, ok=ok, frame_id=self.frame_id
             )
-            if step_id is not None and self.on_step is not None:
+            if step_id is not None and self.on_step is not None and not deferred_step:
                 try:
                     output, summary = _step_end(method, view[0], result, ok)
                     self.on_step(
@@ -888,6 +944,21 @@ class HostDispatcher:
     # cells; shell commands run INSIDE the kernel worker via the kernel-local
     # `host.bash` (sdk/host.py), which keeps the static shell precheck and the
     # egress fence.
+
+    def _m_authorize_bash(self, spec: dict) -> dict:
+        """Authorize one kernel-local command without executing it on Host."""
+
+        return self._bash_authorization.authorize(spec or {})
+
+    def _m_consume_bash_authorization(self, spec: dict) -> dict:
+        """Atomically consume a shell capability immediately before worker spawn."""
+
+        return self._bash_authorization.consume(spec or {})
+
+    def _m_record_bash_result(self, spec: dict) -> dict:
+        """Audit the worker-reported result; never execute or replay the command."""
+
+        return self._bash_authorization.record_result(spec or {})
 
     def _m_egress_check(self, spec: dict) -> dict:
         """Read-only egress verdict for domains the kernel-local host.bash saw.

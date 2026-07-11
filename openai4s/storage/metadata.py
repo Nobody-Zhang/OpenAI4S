@@ -10,9 +10,19 @@ from typing import Any, Callable
 # Credential reads are derivable and must never be duplicated in the audit log.
 DERIVABLE_HOST_CALLS = frozenset({"credentials_get", "credentials_list"})
 
-# Credential writes remain auditable by method name, but their raw arguments do
-# not cross the persistence boundary.
-SECRET_ARG_HOST_CALLS = frozenset({"credentials_set"})
+# Secret-bearing RPCs remain auditable by method name, but their raw arguments
+# do not cross the persistence boundary.
+SECRET_ARG_HOST_CALLS = frozenset(
+    {
+        "credentials_set",
+        # Shell authorization carries the raw command and worker-reported
+        # output.  A separate synthetic ``bash`` audit entry contains only the
+        # bounded/redacted projection produced by BashAuthorizationService.
+        "authorize_bash",
+        "consume_bash_authorization",
+        "record_bash_result",
+    }
+)
 
 
 class NotesRepository:
