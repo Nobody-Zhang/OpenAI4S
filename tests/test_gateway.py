@@ -979,8 +979,8 @@ def test_execution_log_route_serializer_contract(tmp_path):
 
 def test_lineage_serializer_producing_cell_and_inputs(tmp_path):
     """The artifact lineage payload (UI provenance view): a produced artifact
-    reports its producing cell interaction + save event, and
-    dependency_mappings.inputs = files_read minus files_written minus itself.
+    reports its producing cell interaction + save event, and merges legacy
+    execution-log reads with real version lineage before filtering outputs.
     An unknown artifact returns the same shape, empty."""
     cfg, runner, store, fid, st = _runner_frame(tmp_path)
     handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
@@ -992,12 +992,40 @@ def test_lineage_serializer_producing_cell_and_inputs(tmp_path):
         code="plot(df)",
         result={"id": "cell-7", "stdout": "", "stderr": "", "error": None},
         cell_index=3,
-        files_read=["raw.csv", "fig.txt"],
+        files_read=["legacy.csv", "fig.txt", "raw.csv"],
         files_written=["fig.txt"],
+    )
+    raw = store.save_artifact(
+        path=str(st.workspace / "raw.csv"),
+        filename="raw.csv",
+        content_type="text/csv",
+        size_bytes=3,
+        checksum="raw",
+        frame_id=fid,
+    )
+    edge_only = store.save_artifact(
+        path=str(st.workspace / "edge.csv"),
+        filename="edge.csv",
+        content_type="text/csv",
+        size_bytes=4,
+        checksum="edge",
+        frame_id=fid,
     )
     f = st.workspace / "fig.txt"
     f.write_text("bytes")
     rec = runner._register_file(st, f, "cell-7", lambda e: None)
+    store.add_lineage_edge(
+        input_version_id=raw["version_id"],
+        output_version_id=rec["version_id"],
+        producing_cell_id="cell-7",
+        frame_id=fid,
+    )
+    store.add_lineage_edge(
+        input_version_id=edge_only["version_id"],
+        output_version_id=rec["version_id"],
+        producing_cell_id="cell-7",
+        frame_id=fid,
+    )
 
     lin = handler._lineage(rec["artifact_id"])
     assert lin["artifact_id"] == rec["artifact_id"]
@@ -1009,8 +1037,12 @@ def test_lineage_serializer_producing_cell_and_inputs(tmp_path):
     assert cell["source"] == "plot(df)"
     assert cell["exit_status"] == "ok"
     assert cell["files_written"] == ["fig.txt"]
-    # inputs exclude what the cell itself wrote and the artifact's own filename
-    assert lin["dependency_mappings"] == {"inputs": ["raw.csv"]}
+    assert cell["files_read"] == ["legacy.csv", "fig.txt", "raw.csv", "edge.csv"]
+    # inputs exclude what the cell itself wrote and the artifact's own filename,
+    # while retaining both legacy telemetry and Store-backed lineage edges.
+    assert lin["dependency_mappings"] == {
+        "inputs": ["legacy.csv", "raw.csv", "edge.csv"]
+    }
 
     empty = handler._lineage("a-does-not-exist")
     assert empty == {
@@ -1019,6 +1051,58 @@ def test_lineage_serializer_producing_cell_and_inputs(tmp_path):
         "interactions": [],
         "dependency_mappings": {"inputs": []},
     }
+
+
+def test_lineage_serializer_follows_latest_and_restored_version_edges(tmp_path):
+    cfg, runner, store, fid, st = _runner_frame(tmp_path)
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    handler = object.__new__(handler_cls)
+    sources = []
+    for name in ("input-a.txt", "input-b.txt"):
+        path = st.workspace / name
+        path.write_text(name)
+        sources.append(
+            store.save_artifact(
+                path=str(path),
+                filename=name,
+                content_type="text/plain",
+                size_bytes=len(name),
+                checksum=name,
+                frame_id=fid,
+            )
+        )
+
+    output = st.workspace / "result.txt"
+    versions = []
+    for index, source in enumerate(sources, start=1):
+        cell_id = f"cell-{index}"
+        store.log_cell(
+            frame_id=fid,
+            root_frame_id=fid,
+            code=f"write version {index}",
+            result={"id": cell_id, "stdout": "", "stderr": "", "error": None},
+            cell_index=index,
+            files_read=[],
+            files_written=["result.txt"],
+        )
+        output.write_text(f"version {index}")
+        record = runner._register_file(st, output, cell_id, lambda event: None)
+        versions.append(record)
+        store.add_lineage_edge(
+            input_version_id=source["version_id"],
+            output_version_id=record["version_id"],
+            producing_cell_id=cell_id,
+            frame_id=fid,
+        )
+
+    latest = handler._lineage(versions[0]["artifact_id"])
+    assert latest["dependency_mappings"] == {"inputs": ["input-b.txt"]}
+    assert latest["interactions"][0]["files_read"] == ["input-b.txt"]
+
+    store.set_latest_version(versions[0]["artifact_id"], versions[0]["version_id"])
+    restored = handler._lineage(versions[0]["artifact_id"])
+    assert restored["dependency_mappings"] == {"inputs": ["input-a.txt"]}
+    assert restored["interactions"][0]["files_read"] == ["input-a.txt"]
 
 
 def test_upload_base64_decode_and_raw_fallback(tmp_path):

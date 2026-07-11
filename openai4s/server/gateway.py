@@ -5801,18 +5801,38 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                     "dependency_mappings": {"inputs": []},
                 }
             interactions = []
-            inputs: list[str] = []
             vid = a.get("latest_version_id")
             cell = None
+            vmeta = None
+            edge_inputs: list[str] = []
             if vid:
                 vmeta = store.version_meta(vid)
+                for item in store.lineage_inputs(vid):
+                    label = (
+                        item.get("filename")
+                        or item.get("path")
+                        or item.get("version_id")
+                    )
+                    if label:
+                        edge_inputs.append(str(label))
                 pcid = (vmeta or {}).get("producing_cell_id")
                 if pcid:
                     cell = store.cell_detail(pcid)
+            fw: list[str] = []
+            legacy_reads: list[str] = []
             if cell:
                 fw = cell.get("files_written") or []
-                fr = cell.get("files_read") or []
-                inputs = [f for f in fr if f not in fw and f != a["filename"]]
+                legacy_reads = cell.get("files_read") or []
+            known_reads: list[str] = []
+            seen_reads: set[str] = set()
+            for filename in [*legacy_reads, *edge_inputs]:
+                if filename and filename not in seen_reads:
+                    seen_reads.add(filename)
+                    known_reads.append(filename)
+            outputs = set(fw)
+            outputs.add(a["filename"])
+            inputs = [filename for filename in known_reads if filename not in outputs]
+            if cell:
                 interactions.append(
                     {
                         "kind": "cell",
@@ -5822,10 +5842,15 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                         "exit_status": cell.get("status") or "ok",
                         "source": cell.get("code") or "",
                         "files_written": fw,
-                        "files_read": fr,
+                        "files_read": known_reads,
                     }
                 )
-            interactions.append({"kind": "save", "at": _iso(a.get("created_at"))})
+            interactions.append(
+                {
+                    "kind": "save",
+                    "at": _iso((vmeta or {}).get("created_at") or a.get("created_at")),
+                }
+            )
             return {
                 "artifact_id": artifact_id,
                 "filename": a.get("filename"),

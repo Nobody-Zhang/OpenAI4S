@@ -1442,9 +1442,15 @@ function onEvent(m) {
     // and refresh the viewer if that very artifact is currently open.
     const art = m.artifact || {};
     const aid = art.id || art.artifact_id;
+    if (aid) syncArtifactVersion(art, true);
     if (aid) {
       (S._artBust = S._artBust || {})[aid] = art.version_id || String(Date.now());
-      if (S.dockArtifact && S.dockArtifact.id === aid && !S.provMode && S.activeTab === aid) renderViewer();
+      if (S.dockArtifact && S.dockArtifact.id === aid && S.activeTab === aid) {
+        // Capture emits before the execution log is persisted. Render the
+        // invalidated/loading provenance state now; loadExecutionLog() fetches
+        // the complete cell+lineage payload after the cell transaction.
+        renderViewer();
+      }
     }
     const fn = art.filename || "";
     // An overwritten file may reuse the same cache key (fallback URL) — drop just
@@ -2744,15 +2750,49 @@ async function loadModels() {
 }
 
 /* ---------- artifacts (inline + files) ---------- */
+function artifactCacheKey(a) {
+  if (!a || !a.id) return "_live";
+  const seen = S._artVer && S._artVer[a.id];
+  const version = seen || a.version_id || a.latest_version_id || a.checksum || "unknown";
+  return a.id + ":" + version;
+}
+function syncArtifactVersion(patch, force) {
+  const aid = patch && (patch.id || patch.artifact_id);
+  if (!aid) return false;
+  const version = patch.version_id || patch.latest_version_id || patch.checksum;
+  const seen = S._artVer || (S._artVer = {});
+  const dockMatch = !!(S.dockArtifact && S.dockArtifact.id === aid);
+  const previous = seen[aid] || (dockMatch && (S.dockArtifact.version_id || S.dockArtifact.latest_version_id || S.dockArtifact.checksum));
+  const changed = !!(version && previous && previous !== version);
+  if (version) seen[aid] = version;
+  const update = Object.assign({}, patch, { id: aid });
+  if (version) update.version_id = version;
+  (S.openTabs || []).forEach(item => { if (item.id === aid) Object.assign(item, update); });
+  if (dockMatch) Object.assign(S.dockArtifact, update);
+  if (dockMatch && (changed || force)) {
+    S.lineage = null; S._lineageFor = null;
+    S._lineageReq = (S._lineageReq || 0) + 1;
+    const key = artifactCacheKey(S.dockArtifact);
+    if (S._envSnapById) delete S._envSnapById[key];
+  }
+  return changed || (dockMatch && !!force);
+}
 async function loadArtifacts(id) {
+  const request = S._artifactLoadReq = (S._artifactLoadReq || 0) + 1;
   let a = []; try { a = await api(`/frames/${id}/artifacts`); } catch { a = []; }
-  if (id !== S.currentId) return;
+  if (id !== S.currentId || request !== S._artifactLoadReq) return;
   a = Array.isArray(a) ? a : [];
   // Bust the URL cache of any artifact whose latest version changed since we last
   // saw it (covers overwrite-in-place edits even if the live event was missed).
-  const seen = S._artVer || (S._artVer = {});
-  a.forEach(x => { const v = x.version_id || x.checksum; if (v && seen[x.id] && seen[x.id] !== v) (S._artBust = S._artBust || {})[x.id] = v; if (v) seen[x.id] = v; });
+  let refreshProv = false;
+  a.forEach(x => {
+    const v = x.version_id || x.latest_version_id || x.checksum;
+    const changed = syncArtifactVersion(x, false);
+    if (changed && v) (S._artBust = S._artBust || {})[x.id] = v;
+    if (changed && S.provMode && S.dockArtifact && S.dockArtifact.id === x.id) refreshProv = true;
+  });
   S.artifacts = a; renderConversationArtifacts();
+  if (refreshProv && S.dockArtifact) showProvenance(S.dockArtifact);
   if (S.dock.open && S.activeTab === "files") {
     // In project scope, a conversation switch may have crossed into another
     // project — reload the aggregate (cache was invalidated on project change).
@@ -3297,10 +3337,11 @@ function renderArtifactEditor(body, a) {
   save.onclick = async () => {
     save.disabled = true; save.textContent = t("common.saving");
     try {
-      await api(`/artifacts/${a.id}/edit`, { method: "POST", body: JSON.stringify({ content: ta.value }) });
+      const edited = await api(`/artifacts/${a.id}/edit`, { method: "POST", body: JSON.stringify({ content: ta.value }) });
+      syncArtifactVersion({ id: a.id, version_id: edited && edited.version_id }, true);
       S._editing = null; (S._artBust = S._artBust || {})[a.id] = Date.now(); hint(t("artifact.saved", (a.filename || "")));
       if (S.currentId) loadArtifacts(S.currentId);
-      renderViewer();
+      if (S.provMode) showProvenance(S.dockArtifact || a); else renderViewer();
     } catch (e) { save.disabled = false; save.textContent = t("common.save"); hint(t("artifact.save.err", e.message), true); }
   };
 }
@@ -3356,7 +3397,7 @@ async function showVersions(a) {
       row.appendChild(info);
       const acts = el("div", "ver-acts");
       const view = el("a", "outline-btn small", t("common.view")); view.href = `/api/artifacts/${v.version_id}`; view.target = "_blank"; acts.appendChild(view);
-      if (!v.is_latest) { const rb = el("button", "solid-btn small", t("versions.restore")); rb.onclick = async () => { rb.disabled = true; rb.textContent = t("versions.restoring"); try { await api(`/artifacts/${a.id}/versions/${v.version_id}/restore`, { method: "POST" }); hint(t("versions.restored", v.ordinal)); (S._artBust = S._artBust || {})[a.id] = Date.now(); if (S.currentId) loadArtifacts(S.currentId); if (S.dockArtifact === a) renderViewer(); render(); } catch (e) { rb.disabled = false; rb.textContent = t("versions.restore"); hint(t("versions.restore.err", e.message), true); } }; acts.appendChild(rb); }
+      if (!v.is_latest) { const rb = el("button", "solid-btn small", t("versions.restore")); rb.onclick = async () => { rb.disabled = true; rb.textContent = t("versions.restoring"); try { const restored = await api(`/artifacts/${a.id}/versions/${v.version_id}/restore`, { method: "POST" }); syncArtifactVersion((restored && restored.artifact) || { id: a.id, version_id: v.version_id }, true); hint(t("versions.restored", v.ordinal)); (S._artBust = S._artBust || {})[a.id] = Date.now(); if (S.currentId) loadArtifacts(S.currentId); if (S.dockArtifact && S.dockArtifact.id === a.id) { if (S.provMode) showProvenance(S.dockArtifact); else renderViewer(); } render(); } catch (e) { rb.disabled = false; rb.textContent = t("versions.restore"); hint(t("versions.restore.err", e.message), true); } }; acts.appendChild(rb); }
       row.appendChild(acts); wrap.appendChild(row);
     });
     body.appendChild(wrap);
@@ -3484,6 +3525,11 @@ async function loadExecutionLog(id) {
   if (id !== S.currentId) return;  // a newer session was opened while this was in flight
   S.cells = (d && d.entries) || []; S.kernels = (d && d.kernels) || [];
   renderNotebook();
+  if (S.provMode && S.dockArtifact) {
+    S.lineage = null; S._lineageFor = null;
+    S._lineageReq = (S._lineageReq || 0) + 1;
+    showProvenance(S.dockArtifact);
+  }
 }
 const _NB_DIV = "----- output -----";
 function nbLiveStart(tool, raw, serverKernelId, serverCellIndex, serverLanguage) {
@@ -3844,7 +3890,14 @@ function provRow(label, files) {
 function showProvenance(a) {
   S.dockArtifact = a; S.provMode = true; S.provSub = S.provSub || "code";
   addOpenTab(a); setActiveTab(a.id);
-  if (!S.lineage || S._lineageFor !== a.id) { loadLineage(a).then(l => { S.lineage = l; S._lineageFor = a.id; if (S.provMode && S.dockArtifact === a) renderViewer(); }); }
+  const key = artifactCacheKey(a);
+  if (!S.lineage || S._lineageFor !== key) {
+    const request = S._lineageReq = (S._lineageReq || 0) + 1;
+    loadLineage(a).then(l => {
+      if (request !== S._lineageReq || !S.provMode || !S.dockArtifact || S.dockArtifact.id !== a.id || artifactCacheKey(S.dockArtifact) !== key) return;
+      S.lineage = l; S._lineageFor = key; renderViewer();
+    });
+  }
 }
 function renderProvenanceInto(v, a) {
   const tabs = el("div", "prov-subtabs");
@@ -3853,7 +3906,7 @@ function renderProvenanceInto(v, a) {
   });
   v.appendChild(tabs);
   const body = el("div", "prov-body"); v.appendChild(body);
-  const lin = (S._lineageFor === a.id) ? S.lineage : null;
+  const lin = (S._lineageFor === artifactCacheKey(a)) ? S.lineage : null;
   const cell = lin && (lin.interactions || []).find(i => i.kind === "cell");
   if (S.provSub === "code") {
     if (cell && cell.source) { body.appendChild(codeBlock(cell.source, { lang: cell.language || "python", langLabel: cell.language || "python", env: cell.environment })); }
@@ -3875,10 +3928,11 @@ function renderProvenanceInto(v, a) {
 // produced this artifact (Python version + every installed dist → version), like
 // the reference daemon's Environment tab. Prefers the snapshot CAPTURED at the
 // artifact's production run (bound per-version); falls back to a live freeze for
-// uploads / pre-feature artifacts. Cached per artifact id so tab-flips don't refetch.
+// uploads / pre-feature artifacts. Cached per artifact version so overwrites and
+// restores cannot reuse a stale production environment.
 async function renderProvEnvironment(body, a) {
   body.appendChild(el("div", "dock-empty", t("prov.env.loadingSnapshot")));
-  const key = (a && a.id) || "_live";
+  const key = artifactCacheKey(a);
   S._envSnapById = S._envSnapById || {};
   let env;
   try {
@@ -3886,7 +3940,7 @@ async function renderProvEnvironment(body, a) {
       a && a.id ? api(`/artifacts/${a.id}/environment`) : api("/kernel/environment")));
   }
   catch (e) { if (S.provMode && S.provSub === "environment") { body.innerHTML = ""; body.appendChild(el("div", "dock-empty", t("prov.env.loadFailed", e.message))); } return; }
-  if (!S.provMode || S.provSub !== "environment") return;  // tab changed while loading
+  if (!S.provMode || S.provSub !== "environment" || (a && artifactCacheKey(S.dockArtifact) !== key)) return;  // tab or version changed while loading
   body.innerHTML = "";
   const chip = (k, val) => { const c = el("span", "env-chip"); c.appendChild(el("span", "env-chip-k", k)); c.appendChild(el("span", "env-chip-v", val)); return c; };
   const pkgs = env.packages || [];
@@ -3954,15 +4008,15 @@ async function renderProvMessages(body) {
 function renderProvReview(body, a, lin) {
   if (!lin) { body.appendChild(el("div", "dock-empty", t("common.loading"))); return; }
   const inter = lin.interactions || []; const cell = inter.find(i => i.kind === "cell");
-  const inputs = (lin.dependency_mappings && lin.dependency_mappings.inputs) || (cell && cell.files_read) || [];
+  const mapped = lin.dependency_mappings && lin.dependency_mappings.inputs;
+  const inputs = Array.isArray(mapped) ? mapped : (cell && cell.files_read) || [];
   if (!cell && !inputs.length) { body.appendChild(el("div", "dock-empty", t("prov.review.noLineage"))); return; }
   const card = el("div", "prov-card");
   if (cell) {
     card.appendChild(el("div", "prov-h", t("prov.review.producedBy", (cell.cell_index != null ? cell.cell_index : "?"))));
     card.appendChild(el("div", "prov-meta", (cell.language || "python") + " · " + (cell.exit_status || cell.status || "ok") + (cell.kernel_id ? (" · " + cell.kernel_id) : "")));
     if ((cell.files_written || []).length) card.appendChild(provRow("wrote", cell.files_written));
-    const reads = (cell.files_read && cell.files_read.length) ? cell.files_read : inputs;
-    if (reads.length) card.appendChild(provRow("reads / inputs", reads));
+    if (inputs.length) card.appendChild(provRow("reads / inputs", inputs));
     const link = el("a", "prov-link"); link.appendChild(iconEl("arrow-left", 14)); link.appendChild(el("span", null, t("prov.review.viewCode"))); link.onclick = () => { S.provMode = false; setActiveTab("notebook"); scrollToCell(cell.cell_index, cell.kernel_id); }; card.appendChild(link);
   } else if (inputs.length) card.appendChild(provRow("reads / inputs", inputs));
   body.appendChild(card);

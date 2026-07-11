@@ -288,6 +288,44 @@ def test_notebook_live_state_and_outputs_follow_the_ui_contract() -> None:
     assert "output" in output_source
 
 
+def test_provenance_caches_follow_artifact_versions_and_refresh_mutations() -> None:
+    key_source = _extract_js_function(APP_JS, "artifactCacheKey")
+    sync_source = _extract_js_function(APP_JS, "syncArtifactVersion")
+    event_source = _extract_js_function(APP_JS, "onEvent")
+    artifacts_source = _extract_js_function(APP_JS, "loadArtifacts")
+    execution_source = _extract_js_function(APP_JS, "loadExecutionLog")
+    show_source = _extract_js_function(APP_JS, "showProvenance")
+    render_source = _extract_js_function(APP_JS, "renderProvenanceInto")
+    environment_source = _extract_js_function(APP_JS, "renderProvEnvironment")
+    editor_source = _extract_js_function(APP_JS, "renderArtifactEditor")
+    versions_source = _extract_js_function(APP_JS, "showVersions")
+    review_source = _extract_js_function(APP_JS, "renderProvReview")
+
+    assert "a.id" in key_source
+    assert "a.version_id" in key_source
+    assert "a.latest_version_id" in key_source
+    assert "S._artVer" in key_source
+    assert "S.openTabs" in sync_source and "S.dockArtifact" in sync_source
+    assert "S.lineage = null" in sync_source and "S._lineageFor = null" in sync_source
+    assert "S._lineageReq" in sync_source
+    assert "syncArtifactVersion(art, true)" in event_source
+    assert "syncArtifactVersion(x, false)" in artifacts_source
+    assert "S._artifactLoadReq" in artifacts_source
+    assert "request !== S._artifactLoadReq" in artifacts_source
+    assert "showProvenance(S.dockArtifact)" in execution_source
+    assert "S._lineageReq" in execution_source
+    assert "artifactCacheKey(a)" in show_source
+    assert "artifactCacheKey(S.dockArtifact)" in show_source
+    assert "request !== S._lineageReq" in show_source
+    assert "artifactCacheKey(a)" in render_source
+    assert "artifactCacheKey(a)" in environment_source
+    assert "artifactCacheKey(S.dockArtifact)" in environment_source
+    assert "syncArtifactVersion({ id: a.id" in editor_source
+    assert "syncArtifactVersion((restored && restored.artifact)" in versions_source
+    assert "Array.isArray(mapped)" in review_source
+    assert "cell.files_read && cell.files_read.length" not in review_source
+
+
 def test_session_and_project_menus_download_artifact_zip() -> None:
     project_source = _extract_js_function(APP_JS, "renderProjMenu")
     session_source = _extract_js_function(APP_JS, "sessionMenu")
