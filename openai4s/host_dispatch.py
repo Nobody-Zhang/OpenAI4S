@@ -39,6 +39,7 @@ from openai4s.host.remote_capabilities import RemoteCapabilityService
 from openai4s.host.remote_capabilities import (
     normalize_remote_capability_probe as _normalize_remote_capability_probe,
 )
+from openai4s.host.remote_science import RemoteScienceService
 from openai4s.host.skills import SkillService
 from openai4s.llm import chat
 from openai4s.store import SECRET_ARG_HOST_CALLS, get_store
@@ -450,6 +451,9 @@ class HostDispatcher:
         self._mcp_service = MCPService(self.store)
         self._remote_capability_service = RemoteCapabilityService(
             normalize_probe=lambda spec: _normalize_remote_capability_probe(spec),
+        )
+        self._remote_science_service = RemoteScienceService(
+            provenance_recorder=lambda *args: self._record_remote_prov(*args),
         )
         # app tiles rendered this session
         self._app_tiles: list[dict] = []
@@ -929,272 +933,22 @@ class HostDispatcher:
         remote_dir: str,
         prov_json_str: str | None,
     ) -> None:
-        """Buffer one remote-GPU job's provenance (remote env + code git + model
-        weights, parsed from the wrapper's ===PROVENANCE_JSON=== block) so the
-        gateway can fold it into the producing cell's env snapshot — making a
-        remotely-computed artifact reproducible."""
-        import json as _json
-
-        env = None
-        if prov_json_str:
-            try:
-                env = _json.loads(prov_json_str.strip())
-            except Exception:  # noqa: BLE001
-                env = None
-        entry = {
-            "service": service,
-            "host": host,
-            "engine": engine,
-            "remote_dir": remote_dir,
-            "env": env,
-        }
-        buf = getattr(self, "_remote_provenance", None)
-        if buf is None:
-            buf = []
-            self._remote_provenance = buf
-        buf.append(entry)
+        self._remote_science_service.record_remote_provenance(
+            service,
+            host,
+            engine,
+            remote_dir,
+            prov_json_str,
+        )
 
     def pop_remote_provenance(self) -> list:
-        """Return and clear buffered remote-job provenance (drained per cell)."""
-        buf = getattr(self, "_remote_provenance", None) or []
-        self._remote_provenance = []
-        return buf
+        return self._remote_science_service.pop_remote_provenance()
 
-    # --- protein structure prediction (remote GPU fold service) ----------
     def _m_fold(self, spec: dict) -> dict:
-        """Predict a 3D protein structure on the configured remote GPU host.
+        return self._remote_science_service.fold(spec)
 
-        Runs the offline Protenix (AF3-class) folder over SSH on the 8×A100 box
-        and returns a REAL PDB + per-residue pLDDT. This is a genuine neural
-        prediction — callers must NEVER fabricate a placeholder/synthetic
-        backbone. Host + script come from OPENAI4S_FOLD_SSH /
-        OPENAI4S_FOLD_SCRIPT (set these to your GPU host alias + fold.sh path).
-        Returns {ok, pdb, plddt_csv, confidence, mean_plddt, ptm, length,
-        engine, host, remote_dir} or {error}."""
-        import base64 as _b64
-        import json as _json
-        import os as _os
-        import re as _re
-        import shlex as _shlex
-        import subprocess as _sub
-        import uuid as _uuid
-
-        seq = "".join((spec.get("sequence") or "").split()).upper()
-        seq = _re.sub(r"[^ACDEFGHIKLMNPQRSTVWY]", "", seq)
-        if not seq:
-            return {"error": "fold: a protein 'sequence' (amino acids) is required"}
-        if len(seq) > 1200:
-            return {
-                "error": f"fold: sequence too long ({len(seq)} aa); the demo "
-                "host caps single-sequence folds at 1200 aa"
-            }
-        name = (
-            _re.sub(r"[^A-Za-z0-9_-]", "", str(spec.get("name") or "protein"))
-            or "protein"
-        )
-        gpu = int(spec.get("gpu", 0))
-        cycle = int(spec.get("cycle", 10))
-        step = int(spec.get("step", 40))
-        from openai4s.compute import registry as _reg
-
-        host, cap = _reg.capability_host("fold")
-        if not host:
-            return {
-                "error": "fold: no remote GPU host with a folding service is "
-                "configured (Settings → Remote GPU). Refusing to fabricate a "
-                "structure — configure a host first."
-            }
-        script = (cap or {}).get("script") or _os.environ.get(
-            "OPENAI4S_FOLD_SCRIPT", "/opt/os-fold/fold.sh"
-        )
-        base = _os.environ.get("OPENAI4S_FOLD_JOBS_DIR", "/opt/os-fold/jobs")
-        jobdir = f"{base}/{name}_{_uuid.uuid4().hex[:8]}"
-        remote = (
-            f"mkdir -p {_shlex.quote(jobdir)} && {_shlex.quote(script)} "
-            f"--seq {_shlex.quote(seq)} --name {_shlex.quote(name)} "
-            f"--out {_shlex.quote(jobdir)} --gpu {gpu} --cycle {cycle} --step {step}"
-        )
-        try:
-            proc = _sub.run(
-                ["ssh", "-o", "ConnectTimeout=15", "-o", "BatchMode=yes", host, remote],
-                capture_output=True,
-                timeout=900,
-            )
-        except _sub.TimeoutExpired:
-            return {"error": f"fold: timed out after 900s on {host}"}
-        except OSError as e:  # noqa: BLE001
-            return {"error": f"fold: ssh to {host} failed: {e}"}
-        out = proc.stdout.decode("utf-8", "replace")
-        err = proc.stderr.decode("utf-8", "replace")
-
-        def _block(a: str, b: str) -> str | None:
-            i = out.find(a)
-            if i < 0:
-                return None
-            i += len(a)
-            j = out.find(b, i)
-            return out[i:j] if j >= 0 else None
-
-        manifest_s = _block("===FOLD_RESULT_JSON===", "===END_FOLD_RESULT_JSON===")
-        pdb_b64 = _block("===FOLD_PDB_B64===", "===FOLD_PLDDT_CSV_B64===")
-        plddt_b64 = _block("===FOLD_PLDDT_CSV_B64===", "===FOLD_CONFIDENCE_JSON_B64===")
-        # confidence is the last b64 block; it's now followed by the provenance
-        # block (if the wrapper emits one) before ===FOLD_DONE===, so bound at
-        # whichever comes first.
-        conf_b64 = _block(
-            "===FOLD_CONFIDENCE_JSON_B64===", "===PROVENANCE_JSON==="
-        ) or _block("===FOLD_CONFIDENCE_JSON_B64===", "===FOLD_DONE===")
-        if not (manifest_s and pdb_b64):
-            tail = (err[-800:] if err.strip() else out[-800:]).strip()
-            return {
-                "error": f"fold: prediction did not complete on {host} "
-                f"(rc={proc.returncode}). tail: {tail}"
-            }
-        try:
-            manifest = _json.loads(manifest_s.strip())
-            pdb_text = _b64.b64decode(pdb_b64.strip()).decode("utf-8", "replace")
-            plddt_csv = (
-                _b64.b64decode(plddt_b64.strip()).decode("utf-8", "replace")
-                if plddt_b64
-                else ""
-            )
-            confidence = (
-                _json.loads(_b64.b64decode(conf_b64.strip()).decode("utf-8", "replace"))
-                if conf_b64
-                else {}
-            )
-        except Exception as e:  # noqa: BLE001
-            return {"error": f"fold: could not parse prediction output: {e}"}
-        prov_s = _block("===PROVENANCE_JSON===", "===END_PROVENANCE_JSON===")
-        self._record_remote_prov("fold", host, manifest.get("engine"), jobdir, prov_s)
-        return {
-            "ok": True,
-            "pdb": pdb_text,
-            "plddt_csv": plddt_csv,
-            "confidence": confidence,
-            "mean_plddt": manifest.get("mean_plddt"),
-            "ptm": manifest.get("ptm"),
-            "length": manifest.get("length"),
-            "residues_modeled": manifest.get("residues_modeled"),
-            "engine": manifest.get("engine", "protenix_base_default_v1.0.0"),
-            "msa": manifest.get("msa", False),
-            "host": f"{host} (8×NVIDIA A100-80GB · Protenix AF3-class)",
-            "remote_dir": jobdir,
-        }
-
-    # --- mutation / variant-effect scoring (remote GPU ESM service) ------
     def _m_score_mutations(self, spec: dict) -> dict:
-        """Score single-substitution variant effects with a REAL model (ESM
-        masked-marginal) on the configured remote GPU host. Returns real
-        per-mutation scores, or a hard error — it NEVER fabricates. If no
-        scoring service is registered in the remote-GPU memory, it errors so the
-        caller reports honestly instead of inventing numbers (no np.random,
-        no BLOSUM-dressed-as-ESM)."""
-        import base64 as _b64
-        import json as _json
-        import os as _os
-        import re as _re
-        import shlex as _shlex
-        import subprocess as _sub
-        import uuid as _uuid
-
-        from openai4s.compute import registry as _reg
-
-        seq = "".join((spec.get("sequence") or "").split()).upper()
-        seq = _re.sub(r"[^ACDEFGHIKLMNPQRSTVWY]", "", seq)
-        if not seq:
-            return {"error": "score_mutations: a protein 'sequence' is required"}
-        if len(seq) > 1024:
-            return {
-                "error": f"score_mutations: sequence too long ({len(seq)} aa); cap is 1024"
-            }
-        host, cap = _reg.capability_host("score_mutations")
-        if not host:
-            return {
-                "error": "score_mutations: no remote GPU host has a mutation-"
-                "scoring service configured, so there is no real predictor "
-                "available. Do NOT fabricate scores (no np.random, no "
-                "BLOSUM-as-ESM, no fake heatmap) — report that this step "
-                "cannot be done for real. Provision a service via "
-                "Settings → Remote GPU."
-            }
-        script = (cap or {}).get("script")
-        if not script:
-            return {"error": f"score_mutations: host {host} has no script recorded"}
-        name = (
-            _re.sub(r"[^A-Za-z0-9_-]", "", str(spec.get("name") or "protein"))
-            or "protein"
-        )
-        gpu = int(spec.get("gpu", 0))
-        positions = spec.get("positions")
-        base = _os.environ.get("OPENAI4S_ESM_JOBS_DIR", "/opt/os-esm/jobs")
-        jobdir = f"{base}/{name}_{_uuid.uuid4().hex[:8]}"
-        cmd = (
-            f"mkdir -p {_shlex.quote(jobdir)} && {_shlex.quote(script)} "
-            f"--seq {_shlex.quote(seq)} --name {_shlex.quote(name)} "
-            f"--out {_shlex.quote(jobdir)} --gpu {gpu}"
-        )
-        if positions:
-            pos_str = (
-                ",".join(str(int(p)) for p in positions)
-                if isinstance(positions, (list, tuple))
-                else str(positions)
-            )
-            cmd += f" --positions {_shlex.quote(pos_str)}"
-        try:
-            proc = _sub.run(
-                ["ssh", "-o", "ConnectTimeout=15", "-o", "BatchMode=yes", host, cmd],
-                capture_output=True,
-                timeout=1200,
-            )
-        except _sub.TimeoutExpired:
-            return {"error": f"score_mutations: timed out after 1200s on {host}"}
-        except OSError as e:  # noqa: BLE001
-            return {"error": f"score_mutations: ssh to {host} failed: {e}"}
-        out = proc.stdout.decode("utf-8", "replace")
-        err = proc.stderr.decode("utf-8", "replace")
-
-        def _block(a: str, b: str) -> str | None:
-            i = out.find(a)
-            if i < 0:
-                return None
-            i += len(a)
-            j = out.find(b, i)
-            return out[i:j] if j >= 0 else None
-
-        summary_s = _block("===MUT_RESULT_JSON===", "===END_MUT_RESULT_JSON===")
-        # csv is the last b64 block, followed by the optional provenance block
-        # before ===MUT_DONE=== — bound at whichever comes first.
-        csv_b64 = _block("===MUT_CSV_B64===", "===PROVENANCE_JSON===") or _block(
-            "===MUT_CSV_B64===", "===MUT_DONE==="
-        )
-        if not (summary_s and csv_b64):
-            tail = (err[-800:] if err.strip() else out[-800:]).strip()
-            return {
-                "error": f"score_mutations: no real result from {host} "
-                f"(rc={proc.returncode}) — report the failure, do NOT "
-                f"fabricate. tail: {tail}"
-            }
-        try:
-            summary = _json.loads(summary_s.strip())
-            scores_csv = _b64.b64decode(csv_b64.strip()).decode("utf-8", "replace")
-        except Exception as e:  # noqa: BLE001
-            return {"error": f"score_mutations: could not parse output: {e}"}
-        prov_s = _block("===PROVENANCE_JSON===", "===END_PROVENANCE_JSON===")
-        self._record_remote_prov(
-            "score_mutations", host, (cap or {}).get("engine"), jobdir, prov_s
-        )
-        return {
-            "ok": True,
-            "scores_csv": scores_csv,
-            "summary": summary,
-            "mean_score": summary.get("mean_score"),
-            "top5": summary.get("top5"),
-            "length": summary.get("length"),
-            "model": summary.get("model") or (cap or {}).get("engine"),
-            "host": f"{host} · {(cap or {}).get('engine', 'ESM')}",
-            "remote_dir": jobdir,
-        }
+        return self._remote_science_service.score_mutations(spec)
 
     def _m_request_network_access(self, spec: dict) -> dict:
         """Widen the outbound domain allowlist (the egress escape hatch).
