@@ -52,9 +52,7 @@ def _no_attempt_generation(
     del attempt_id, session, language
 
 
-def _no_attempt_finish(
-    attempt_id: str, terminal_state: str, error: Any = None
-) -> None:
+def _no_attempt_finish(attempt_id: str, terminal_state: str, error: Any = None) -> None:
     del attempt_id, terminal_state, error
 
 
@@ -77,12 +75,8 @@ class CellExecutionPorts:
         [CellSession, CellRequest, str, ChunkSink | None, KernelLease | None],
         dict[str, Any],
     ]
-    capture: Callable[
-        [CellSession, int, str, Any, EventSink, str], CaptureResult
-    ]
-    emit_artifact_step: Callable[
-        [CellSession, str, list[dict], EventSink], None
-    ]
+    capture: Callable[[CellSession, int, str, Any, EventSink, str], CaptureResult]
+    emit_artifact_step: Callable[[CellSession, str, list[dict], EventSink], None]
     record_cell: Callable[..., None]
     allocate_attempt: Callable[
         [CellSession, CellRequest, str, str | None], str | None
@@ -126,7 +120,14 @@ class CellExecutionService:
             session, request, cell_id, action_group_id
         )
         if attempt_id is not None:
-            self.ports.mark_attempt_started(attempt_id)
+            try:
+                self.ports.mark_attempt_started(attempt_id)
+            except BaseException as exc:
+                # A milestone write that raises (e.g. SQLite busy) must still
+                # finalize the attempt, or its terminal_state stays NULL and the
+                # action timeline shows the group "running" forever.
+                self._finish_attempt(attempt_id, "record_failed", exc)
+                raise
         try:
             runtime_error = self.ports.prepare_language(session, request.language)
             kernel_id = self.ports.kernel_id(session, request.language)
@@ -243,7 +244,11 @@ class CellExecutionService:
 
         result["id"] = cell_id
         if attempt_id is not None:
-            self.ports.mark_attempt_response(attempt_id)
+            try:
+                self.ports.mark_attempt_response(attempt_id)
+            except BaseException as exc:
+                self._finish_attempt(attempt_id, "record_failed", exc)
+                raise
         if request.stream and result.get("error"):
             try:
                 self._emit_error(
@@ -267,9 +272,7 @@ class CellExecutionService:
             if attempt_id is not None:
                 self.ports.mark_attempt_capture(attempt_id)
             if capture.artifacts and request.stream:
-                self.ports.emit_artifact_step(
-                    session, title, capture.artifacts, emit
-                )
+                self.ports.emit_artifact_step(session, title, capture.artifacts, emit)
         except BaseException as exc:
             self._finish_attempt(attempt_id, "capture_failed", exc)
             raise
@@ -418,7 +421,11 @@ class CellExecutionService:
     ) -> CellExecutionResult:
         result = _error_result(cell_id, message)
         if attempt_id is not None:
-            self.ports.mark_attempt_response(attempt_id)
+            try:
+                self.ports.mark_attempt_response(attempt_id)
+            except BaseException as exc:
+                self._finish_attempt(attempt_id, "record_failed", exc)
+                raise
         if request.stream:
             try:
                 self._emit_error(
@@ -562,9 +569,7 @@ class CellExecutionService:
             files_read=[],
             visibility=("system" if completion_only else request.visibility),
             pin=(False if completion_only else request.pin),
-            replay_policy=(
-                "never" if completion_only else request.replay_policy
-            ),
+            replay_policy=("never" if completion_only else request.replay_policy),
         )
 
     @staticmethod

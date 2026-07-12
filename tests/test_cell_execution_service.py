@@ -240,9 +240,7 @@ def test_live_cell_output_is_bounded_once_for_notebook_and_activity(
     )
 
     notebook_chunks = [
-        event["chunk"]
-        for event in events
-        if event["type"] == "notebook_cell_chunk"
+        event["chunk"] for event in events if event["type"] == "notebook_cell_chunk"
     ]
     activity_chunks = [
         event["chunk"]
@@ -524,9 +522,7 @@ def test_attempt_is_allocated_before_prepare_and_completes_all_milestones(tmp_pa
     ports = replace(
         harness.ports(),
         allocate_attempt=lambda session, request, cell_id, group_id: (
-            attempts.append(
-                ("allocated", cell_id, group_id, list(harness.order))
-            )
+            attempts.append(("allocated", cell_id, group_id, list(harness.order)))
             or "attempt-1"
         ),
         mark_attempt_started=lambda attempt_id: attempts.append(
@@ -601,6 +597,38 @@ def test_worker_exception_still_finishes_allocated_attempt(tmp_path):
     assert not any(item[0] in {"response", "capture"} for item in attempts)
     assert harness.records[0]["state_revision"] == 1
     assert harness.records[0]["result"]["error"] == "worker exited"
+
+
+def test_attempt_milestone_write_failure_still_finalizes_attempt(tmp_path):
+    """A milestone write that raises (e.g. SQLite 'database is locked') must
+    still finalize the attempt as record_failed; otherwise terminal_state stays
+    NULL and the action timeline shows the group 'running' forever."""
+    harness = Harness()
+    attempts: list[tuple] = []
+
+    def _boom(_attempt_id):
+        raise RuntimeError("database is locked")
+
+    ports = replace(
+        harness.ports(),
+        allocate_attempt=lambda *args: "attempt-lock",
+        mark_attempt_started=_boom,
+        finish_attempt=lambda attempt_id, state, error: attempts.append(
+            ("finished", attempt_id, state, error)
+        ),
+    )
+    service = CellExecutionService(ports, id_factory=lambda: "cell-lock")
+
+    with pytest.raises(RuntimeError, match="database is locked"):
+        service.execute(
+            _session(tmp_path),
+            CellRequest("print(1)", "agent", stream=False),
+            lambda event: None,
+            action_group_id="group-lock",
+        )
+
+    assert attempts[-1][:3] == ("finished", "attempt-lock", "record_failed")
+    assert attempts[-1][3] == {"kind": "RuntimeError", "message": "database is locked"}
 
 
 def test_worker_failure_is_recorded_once_and_retry_uses_a_new_cell_id(tmp_path):
