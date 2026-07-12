@@ -13,6 +13,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
+from openai4s.agent.actions import NO_CODE_NUDGE, NO_NATIVE_COMPLETION_NUDGE
 from openai4s.agent.engine import AgentEngine
 from openai4s.agent.finalize import with_finalize_response
 from openai4s.agent.ledger import RuntimeActionLedger, new_turn_id
@@ -29,7 +30,7 @@ from openai4s.config import Config, get_config
 from openai4s.host_dispatch import HostDispatcher, build_dispatcher
 from openai4s.kernel import Kernel
 from openai4s.kernel.lazy import LazyKernel
-from openai4s.llm import chat
+from openai4s.llm import chat, get_model_capabilities
 from openai4s.security import classify_code, screen_trajectory
 from openai4s.tools import parse_tool_calls, scan_fenced_blocks
 
@@ -112,8 +113,11 @@ private chain-of-thought.
 from PRIOR Observations, but must not predict or claim outputs from the cell that \
 has not run yet. Raw tables, matrices, and tracebacks belong in the Notebook; \
 summarize their verified implications in the following turn.
-- If a cell errors, read the traceback in the Observation and fix it in the \
-next cell.
+- If a cell errors, execution stopped at that first exception: do not assume \
+later statements, variables, or files exist. Read the traceback and send one \
+complete repair cell beginning before the failed dependency. Never answer with \
+only the tail of the previous cell or a fragment that depends on statements \
+which did not run.
 """
 
 
@@ -374,6 +378,17 @@ class Agent:
         try:
             with lazy_kernel:
                 tool_catalog = self.dispatcher.tool_catalog()
+                prose_nudge = NO_CODE_NUDGE
+                try:
+                    capabilities = get_model_capabilities(
+                        self.cfg.llm.provider,
+                        self.cfg.llm.model,
+                        base_url=self.cfg.llm.base_url,
+                    )
+                    if not capabilities.tool_calling:
+                        prose_nudge = NO_NATIVE_COMPLETION_NUDGE
+                except Exception:  # noqa: BLE001 - compatible provider fallback
+                    pass
                 transcript_events = TranscriptEventSink(transcript, log=self._log)
                 action_ledger = self._action_ledger(tool_catalog, task)
                 event_sink: Any = (
@@ -402,6 +417,8 @@ class Agent:
                         self._execute_r,
                         log=self._log,
                         tool_catalog=tool_catalog,
+                        prose_nudge=prose_nudge,
+                        action_ledger=action_ledger,
                     ),
                     context_policy=(
                         self.context_policy

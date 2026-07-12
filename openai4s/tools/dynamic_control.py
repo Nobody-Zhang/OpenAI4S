@@ -1,4 +1,4 @@
-"""Human-governed lifecycle tools for session-scoped dynamic tools.
+"""Human-governed lifecycle tools for versioned Dynamic Tools.
 
 These classes expose only lifecycle control.  A defined dynamic capability is
 represented by ``ProxyDynamicTool`` in the session catalog and its code still
@@ -9,6 +9,17 @@ from __future__ import annotations
 
 from openai4s.tools.base import Tool
 from openai4s.tools.contexts import ControlToolContext
+from openai4s.tools.taxonomy import resource_key
+
+
+def _scoped_target(arguments: dict, *, include_manifest: bool = False) -> str:
+    fields = [
+        str(arguments.get("scope") or ""),
+        str(arguments.get("name") or ""),
+    ]
+    if include_manifest:
+        fields.append(str(arguments.get("manifest_id") or ""))
+    return ":".join(fields)
 
 
 class DefineDynamicTool(Tool):
@@ -85,8 +96,104 @@ class PromoteDynamicTool(Tool):
     resource_key_prefix = "dynamic_tool"
     resource_target_key = "name"
 
+    def permission_target(self, arguments: dict) -> str:
+        return _scoped_target(arguments)
+
+    def resource_keys(self, arguments: dict) -> tuple[str, ...]:
+        return (resource_key("dynamic_tool_scope", _scoped_target(arguments)),)
+
     def execute(self, runtime: ControlToolContext, arguments: dict) -> dict:
         return runtime.invoke(self.host_method, dict(arguments))
 
 
-__all__ = ["DefineDynamicTool", "ListDynamicTools", "PromoteDynamicTool"]
+class ListDynamicToolVersions(Tool):
+    name = "list_dynamic_tool_versions"
+    host_method = "dynamic_tool_versions"
+    description = (
+        "List project/global Dynamic Tool versions, active pointers, and audit events."
+    )
+    parameters = {
+        "properties": {
+            "name": {"type": "string", "minLength": 1, "maxLength": 64},
+            "scope": {"type": "string", "enum": ["project", "global"]},
+        },
+        "required": [],
+    }
+    requires_approval = False
+    resource_key_prefix = "dynamic_tool_scope"
+    resource_target_default = "catalog"
+
+    def execute(self, runtime: ControlToolContext, arguments: dict) -> dict:
+        return runtime.invoke(self.host_method, dict(arguments))
+
+
+class ActivateDynamicToolVersion(Tool):
+    name = "activate_dynamic_tool_version"
+    host_method = "dynamic_tool_activate"
+    description = "Activate one immutable project/global Dynamic Tool version."
+    parameters = {
+        "properties": {
+            "name": {"type": "string", "minLength": 1, "maxLength": 64},
+            "scope": {"type": "string", "enum": ["project", "global"]},
+            "manifest_id": {
+                "type": "string",
+                "minLength": 68,
+                "maxLength": 68,
+            },
+        },
+        "required": ["name", "scope", "manifest_id"],
+    }
+    read_only = False
+    dangerous = True
+    side_effect_class = "high_risk"
+    resource_key_prefix = "dynamic_tool_scope"
+
+    def permission_target(self, arguments: dict) -> str:
+        return _scoped_target(arguments, include_manifest=True)
+
+    def resource_keys(self, arguments: dict) -> tuple[str, ...]:
+        return (
+            resource_key(
+                "dynamic_tool_scope",
+                _scoped_target(arguments, include_manifest=True),
+            ),
+        )
+
+    def execute(self, runtime: ControlToolContext, arguments: dict) -> dict:
+        return runtime.invoke(self.host_method, dict(arguments))
+
+
+class RollbackDynamicToolVersion(Tool):
+    name = "rollback_dynamic_tool_version"
+    host_method = "dynamic_tool_rollback"
+    description = "Roll back to the previously active project/global Dynamic Tool version."
+    parameters = {
+        "properties": {
+            "name": {"type": "string", "minLength": 1, "maxLength": 64},
+            "scope": {"type": "string", "enum": ["project", "global"]},
+        },
+        "required": ["name", "scope"],
+    }
+    read_only = False
+    dangerous = True
+    side_effect_class = "high_risk"
+    resource_key_prefix = "dynamic_tool_scope"
+
+    def permission_target(self, arguments: dict) -> str:
+        return _scoped_target(arguments)
+
+    def resource_keys(self, arguments: dict) -> tuple[str, ...]:
+        return (resource_key("dynamic_tool_scope", _scoped_target(arguments)),)
+
+    def execute(self, runtime: ControlToolContext, arguments: dict) -> dict:
+        return runtime.invoke(self.host_method, dict(arguments))
+
+
+__all__ = [
+    "ActivateDynamicToolVersion",
+    "DefineDynamicTool",
+    "ListDynamicTools",
+    "ListDynamicToolVersions",
+    "PromoteDynamicTool",
+    "RollbackDynamicToolVersion",
+]

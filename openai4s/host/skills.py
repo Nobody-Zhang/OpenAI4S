@@ -8,13 +8,12 @@ filesystem mutation are visible in one class instead of being scattered across
 
 from __future__ import annotations
 
-import re
 import shutil
 from pathlib import Path
 from typing import Any
 
 from openai4s.config import Config
-from openai4s.skills_loader import SkillLoader
+from openai4s.skills_loader import SkillLoader, SkillVersionService
 
 
 class SkillService:
@@ -23,6 +22,9 @@ class SkillService:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.loader = SkillLoader(cfg=cfg)
+        self.versions = SkillVersionService(cfg)
+        self.project_id: str | None = None
+        self.session_id: str | None = None
 
     def set_scope(
         self,
@@ -36,6 +38,8 @@ class SkillService:
             project_id=project_id,
             session_id=session_id,
         )
+        self.project_id = str(project_id or "").strip() or None
+        self.session_id = str(session_id or "").strip() or None
 
     def load(self, name: str | dict) -> dict:
         """Load full guidance, with the historical fuzzy-name fallback."""
@@ -107,33 +111,37 @@ class SkillService:
             root = existing.root
         else:
             user_directory = self.loader.user_skills_dir()
+            if user_directory.is_symlink():
+                raise ValueError("unsafe user skill directory")
             user_directory.mkdir(parents=True, exist_ok=True)
             user_directory = user_directory.resolve()
-            candidate = user_directory / name
+            candidate = user_directory / self.versions.slug(name)
             if candidate.is_symlink():
                 raise ValueError(f"unsafe skill path: {name!r}")
             root = candidate.resolve()
             if root == user_directory or not root.is_relative_to(user_directory):
                 raise ValueError(f"unsafe skill name: {name!r}")
-            root.mkdir(parents=True, exist_ok=True)
-            skill_md = root / "SKILL.md"
-            if not skill_md.exists() and relative != "SKILL.md":
-                skill_md.write_text(
-                    f"---\nname: {name}\ndescription: (draft)\norigin: draft\n---\n"
-                    f"# Skill: {name}\n",
-                    "utf-8",
-                )
 
         target = self._safe_path(root, relative)
+        files = (
+            self.versions.read_package(root)
+            if (root / "SKILL.md").exists()
+            else {}
+        )
+        if "SKILL.md" not in files and relative != "SKILL.md":
+            files["SKILL.md"] = (
+                f"---\nname: {name}\ndescription: (draft)\norigin: draft\n---\n"
+                f"# Skill: {name}\n"
+            ).encode("utf-8")
         if old_string is None:
             updated_content = content
             mode = "overwrite"
         else:
-            if not target.exists():
+            if relative not in files:
                 raise FileNotFoundError(
                     f"{relative} does not exist for str_replace"
                 )
-            current = target.read_text("utf-8")
+            current = files[relative].decode("utf-8")
             if old_string not in current:
                 raise ValueError("old_string not found in file")
             updated_content = current.replace(old_string, content, 1)
@@ -144,7 +152,15 @@ class SkillService:
                 updated_content,
                 fallback=existing.name if existing is not None else name,
             )
-        target.write_text(updated_content, "utf-8")
+        files[relative] = updated_content.encode("utf-8")
+        self.versions.install(
+            existing.name if existing is not None else name,
+            files,
+            event="upgraded" if existing is not None else "installed",
+            slug=root.name,
+            require_sidecar_gate=False,
+            metadata={"source": "host_skills_edit", "path": relative},
+        )
 
         result: dict[str, Any] = {
             "ok": True,
@@ -168,15 +184,7 @@ class SkillService:
             raise KeyError(f"no such skill: {name!r}")
         if skill.read_only:
             raise PermissionError(f"skill {name!r} is read-only")
-        skill_md = skill.root / "SKILL.md"
-        text = skill_md.read_text("utf-8")
-        if text.startswith("---"):
-            updated = re.sub(r"(?m)^origin:.*$", "origin: personal", text, count=1)
-            if "origin:" not in text:
-                updated = text.replace("---", "---\norigin: personal", 1)
-        else:
-            updated = f"---\nname: {name}\norigin: personal\n---\n" + text
-        skill_md.write_text(updated, "utf-8")
+        self.versions.publish(name, slug=skill.root.name)
         return {"ok": True, "origin": "personal"}
 
     def delete(self, name: str) -> dict:
@@ -186,8 +194,113 @@ class SkillService:
             raise KeyError(f"no such skill: {name!r}")
         if skill.read_only:
             raise PermissionError(f"skill {name!r} is read-only")
-        shutil.rmtree(skill.root)
+        installation = self.versions.repository.get_installation(
+            skill.name,
+            scope="personal",
+            scope_id="",
+        )
+        if installation is not None and installation.get("active_version_id"):
+            self.versions.delete(skill.name)
+        else:
+            shutil.rmtree(skill.root)
         return {"ok": True, "deleted": name}
+
+    def _version_request(self, spec: str | dict) -> tuple[str, str, str | None, int]:
+        if isinstance(spec, dict):
+            name = str(spec.get("name") or "").strip()
+            scope = str(spec.get("scope") or "personal").strip().lower()
+            requested_project = str(spec.get("project_id") or "").strip() or None
+            limit = int(spec.get("limit") or 200)
+        else:
+            name = str(spec or "").strip()
+            scope = "personal"
+            requested_project = None
+            limit = 200
+        if not name:
+            raise ValueError("skill name is required")
+        if scope not in {"personal", "project"}:
+            raise ValueError("skill scope must be 'personal' or 'project'")
+        if scope == "personal":
+            if requested_project:
+                raise ValueError("personal Skill scope cannot have project_id")
+            project_id = None
+        else:
+            project_id = requested_project or self.project_id
+            if not project_id:
+                raise PermissionError("project Skill scope requires an active project")
+            if self.project_id and project_id != self.project_id:
+                raise PermissionError("project Skill scope cannot cross projects")
+        return name, scope, project_id, max(1, min(limit, 200))
+
+    def status(self, spec: str | dict) -> dict:
+        """Return safe active-version metadata for one exact writable scope."""
+
+        name, scope, project_id, _limit = self._version_request(spec)
+        bundled = self.loader.bundled_name_collision(name)
+        if bundled is not None:
+            return {
+                "name": bundled.name,
+                "scope": "bundled",
+                "scope_id": "",
+                "installed": True,
+                "active": True,
+                "active_version_id": None,
+                "manifest": {
+                    "origin": bundled.origin,
+                    "document_sha256": bundled.document_sha256,
+                    "sidecar": {
+                        "present": bundled.has_kernel,
+                        "sha256": bundled.sidecar_sha256,
+                        "gate": bundled.sidecar_gate(),
+                    },
+                },
+                "read_only": True,
+                "rollback_available": False,
+            }
+        return {
+            **self.versions.status(
+                name,
+                scope=scope,
+                project_id=project_id,
+            ),
+            "read_only": False,
+        }
+
+    def history(self, name: str | dict, *, limit: int = 200) -> dict:
+        """Expose immutable lifecycle records to trusted orchestration code."""
+
+        spec = name if isinstance(name, dict) else {"name": name, "limit": limit}
+        skill_name, scope, project_id, resolved_limit = self._version_request(spec)
+        if self.loader.bundled_name_collision(skill_name) is not None:
+            raise PermissionError(f"skill {skill_name!r} is bundled and read-only")
+        return self.versions.history(
+            skill_name,
+            scope=scope,
+            project_id=project_id,
+            limit=resolved_limit,
+        )
+
+    def rollback(self, name: str | dict, version_id: str | None = None) -> dict:
+        spec = (
+            name
+            if isinstance(name, dict)
+            else {"name": name, "version_id": version_id, "scope": "personal"}
+        )
+        skill_name, scope, project_id, _limit = self._version_request(spec)
+        target_version = str(spec.get("version_id") or "").strip()
+        if not target_version:
+            raise ValueError("skill version_id is required")
+        if self.loader.bundled_name_collision(skill_name) is not None:
+            raise PermissionError(f"skill {skill_name!r} is bundled and read-only")
+        self.loader.discover()
+        result = self.versions.rollback(
+            skill_name,
+            target_version,
+            scope=scope,
+            project_id=project_id,
+        )
+        self.loader.discover()
+        return result
 
     def _reject_bundled_name_collision(self, content: str, *, fallback: str) -> None:
         metadata, _body = self.loader.parse_document(content)

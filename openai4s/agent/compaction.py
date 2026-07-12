@@ -24,7 +24,7 @@ import re
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from openai4s.config import Config
 from openai4s.llm import chat
@@ -62,12 +62,23 @@ class ContextEstimate:
 
     text: int = 0
     images: int = 0
+    tool_schemas: int = 0
     tool_calls: int = 0
+    tool_results: int = 0
+    artifact_refs: int = 0
     wire_state: int = 0
 
     @property
     def total(self) -> int:
-        return self.text + self.images + self.tool_calls + self.wire_state
+        return (
+            self.text
+            + self.images
+            + self.tool_schemas
+            + self.tool_calls
+            + self.tool_results
+            + self.artifact_refs
+            + self.wire_state
+        )
 
     def as_dict(self) -> dict[str, int]:
         return {**asdict(self), "total": self.total}
@@ -224,20 +235,58 @@ def _content_estimate(content: Any) -> tuple[int, int]:
     return _chars_to_tokens(_json_text(content)), 0
 
 
-def estimate_context(messages: Iterable[Mapping[str, Any]]) -> ContextEstimate:
+def _artifact_reference_tokens(message: Mapping[str, Any]) -> int:
+    refs: list[Any] = []
+    for key in ("artifact_ref", "artifact_refs", "artifacts"):
+        value = message.get(key)
+        if value not in (None, "", [], {}):
+            refs.append(value)
+    content = message.get("content")
+    if isinstance(content, Sequence) and not isinstance(
+        content, (str, bytes, bytearray)
+    ):
+        refs.extend(
+            block
+            for block in content
+            if isinstance(block, Mapping)
+            and str(block.get("type") or "").lower()
+            in {"artifact", "artifact_ref", "file", "input_file"}
+        )
+    return _chars_to_tokens(_json_text(refs)) if refs else 0
+
+
+def estimate_context(
+    messages: Iterable[Mapping[str, Any]],
+    tool_schemas: Iterable[Mapping[str, Any]] = (),
+) -> ContextEstimate:
     """Estimate context by text/image/tool-call/provider-state components."""
-    text = images = tool_calls = wire_state = 0
+    text = images = tool_calls = tool_results = artifact_refs = wire_state = 0
     for message in messages:
         content_text, content_images = _content_estimate(message.get("content"))
         # Eight framing tokens preserves the old API's conservative per-message
         # overhead and is accounted as text rather than a fifth hidden bucket.
-        text += content_text + 8
+        if message.get("role") == "tool":
+            tool_results += content_text + 8
+        else:
+            text += content_text + 8
         images += content_images
+        artifact_refs += _artifact_reference_tokens(message)
         if message.get("tool_calls"):
             tool_calls += _chars_to_tokens(_json_text(message["tool_calls"])) + 4
         if message.get("wire_state"):
             wire_state += _chars_to_tokens(_json_text(message["wire_state"])) + 4
-    return ContextEstimate(text, images, tool_calls, wire_state)
+    schema_tokens = sum(
+        _chars_to_tokens(_json_text(schema)) + 4 for schema in tool_schemas
+    )
+    return ContextEstimate(
+        text=text,
+        images=images,
+        tool_schemas=schema_tokens,
+        tool_calls=tool_calls,
+        tool_results=tool_results,
+        artifact_refs=artifact_refs,
+        wire_state=wire_state,
+    )
 
 
 def estimate_tokens(messages: list[dict]) -> int:
@@ -245,10 +294,17 @@ def estimate_tokens(messages: list[dict]) -> int:
     return estimate_context(messages).total
 
 
-def should_compact(messages: list[dict], cfg: Config) -> bool:
+def should_compact(
+    messages: list[dict],
+    cfg: Config,
+    *,
+    tool_schemas: Iterable[Mapping[str, Any]] = (),
+    context_budget: int | None = None,
+) -> bool:
     """True once estimated provider input crosses trigger ratio * window."""
-    budget = int(cfg.context_window_tokens * cfg.compaction_trigger_ratio)
-    return estimate_context(messages).total > budget
+    window = int(context_budget or cfg.context_window_tokens)
+    budget = int(window * cfg.compaction_trigger_ratio)
+    return estimate_context(messages, tool_schemas).total > budget
 
 
 def _has_code_action(message: Mapping[str, Any]) -> bool:
@@ -394,6 +450,8 @@ def externalize_large_outputs(
     threshold_chars: int = DEFAULT_LARGE_OUTPUT_CHARS,
     preview_chars: int = DEFAULT_PREVIEW_CHARS,
     archive_metadata: Mapping[str, Any] | CompactionArchiveMetadata | None = None,
+    artifact_archiver: Callable[[Any, Mapping[str, Any], dict[str, Any]], Mapping[str, Any]]
+    | None = None,
 ) -> list[dict]:
     """Archive oversized outputs and return context-safe message copies.
 
@@ -406,9 +464,9 @@ def externalize_large_outputs(
     if preview_chars < 0:
         raise ValueError("preview_chars must be non-negative")
     result = [dict(message) for message in messages]
-    if archive_dir is None:
+    if archive_dir is None and artifact_archiver is None:
         return messages if isinstance(messages, list) else result
-    root = Path(archive_dir)
+    root = Path(archive_dir) if archive_dir is not None else None
     metadata = CompactionArchiveMetadata.from_mapping(archive_metadata)
     changed = False
     for index, message in enumerate(messages):
@@ -419,19 +477,57 @@ def externalize_large_outputs(
             or _content_chars(content) <= threshold_chars
         ):
             continue
-        digest, relative_path = _write_content_blob(root, content, message, metadata)
-        result[index]["content"] = (
-            "[Large output archived]\n"
-            f"sha256: {digest}\n"
-            f"archive_ref: {relative_path}\n"
-            f"original_chars: {_content_chars(content)}\n"
-            f"preview: {_preview(content, preview_chars)}"
-        )
-        result[index]["content_archive"] = {
-            "sha256": digest,
-            "archive_ref": relative_path,
-            "original_chars": _content_chars(content),
-        }
+        canonical = _json_text(_json_safe(content)).encode("utf-8")
+        digest = hashlib.sha256(canonical).hexdigest()
+        if artifact_archiver is not None:
+            archived = dict(
+                artifact_archiver(
+                    content,
+                    message,
+                    {
+                        "sha256": digest,
+                        "original_chars": _content_chars(content),
+                        "metadata": metadata.as_dict(),
+                    },
+                )
+            )
+            artifact_id = str(archived.get("artifact_id") or "")
+            version_id = str(archived.get("version_id") or "")
+            if not artifact_id or not version_id:
+                raise ValueError("artifact archiver must return artifact_id/version_id")
+            result[index]["content"] = (
+                "[Large output archived as Artifact]\n"
+                f"artifact_id: {artifact_id}\n"
+                f"version_id: {version_id}\n"
+                f"sha256: {digest}\n"
+                f"original_chars: {_content_chars(content)}\n"
+                f"preview: {_preview(content, preview_chars)}"
+            )
+            artifact_ref = {
+                "artifact_id": artifact_id,
+                "version_id": version_id,
+                "sha256": digest,
+                "original_chars": _content_chars(content),
+            }
+            result[index]["artifact_refs"] = [artifact_ref]
+            result[index]["content_archive"] = artifact_ref
+        else:
+            assert root is not None
+            digest, relative_path = _write_content_blob(
+                root, content, message, metadata
+            )
+            result[index]["content"] = (
+                "[Large output archived]\n"
+                f"sha256: {digest}\n"
+                f"archive_ref: {relative_path}\n"
+                f"original_chars: {_content_chars(content)}\n"
+                f"preview: {_preview(content, preview_chars)}"
+            )
+            result[index]["content_archive"] = {
+                "sha256": digest,
+                "archive_ref": relative_path,
+                "original_chars": _content_chars(content),
+            }
         changed = True
     if changed:
         return result
@@ -528,6 +624,10 @@ def compact(
     archive_dir: Path | str | None = None,
     archive_metadata: Mapping[str, Any] | CompactionArchiveMetadata | None = None,
     large_output_chars: int = DEFAULT_LARGE_OUTPUT_CHARS,
+    artifact_archiver: Callable[[Any, Mapping[str, Any], dict[str, Any]], Mapping[str, Any]]
+    | None = None,
+    archive_sink: Callable[[Mapping[str, Any]], Any] | None = None,
+    tool_schemas: Iterable[Mapping[str, Any]] = (),
 ) -> list[dict]:
     """Return a shorter, replay-safe message list or a no-op projection."""
     metadata = CompactionArchiveMetadata.from_mapping(archive_metadata)
@@ -536,6 +636,7 @@ def compact(
         archive_dir,
         threshold_chars=large_output_chars,
         archive_metadata=metadata,
+        artifact_archiver=artifact_archiver,
     )
     atomic_keep = safe_keep_recent(projected, keep_recent)
     tail_start = len(projected) - atomic_keep
@@ -575,8 +676,9 @@ def compact(
             raw_summary,
             handoff,
             metadata,
-            estimate_context(projected),
-            estimate_context(result),
+            estimate_context(projected, tool_schemas),
+            estimate_context(result, tool_schemas),
+            archive_sink=archive_sink,
         )
     return result
 
@@ -589,6 +691,8 @@ def _archive(
     metadata: CompactionArchiveMetadata | None = None,
     before: ContextEstimate | None = None,
     after: ContextEstimate | None = None,
+    *,
+    archive_sink: Callable[[Mapping[str, Any]], Any] | None = None,
 ) -> Path:
     """Write one raw compaction archive and return its path.
 
@@ -616,6 +720,8 @@ def _archive(
         "compacted_messages": safe_middle,
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), "utf-8")
+    if archive_sink is not None:
+        archive_sink(payload)
     return path
 
 

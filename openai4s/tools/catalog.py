@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import re
 import threading
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from openai4s.tools.base import Tool
 from openai4s.tools.dynamic import DynamicToolManifest, DynamicToolRegistry
@@ -11,6 +12,12 @@ from openai4s.tools.native import ToolSpec, control_tool_specs
 from openai4s.tools.registry import all_tools
 
 _GROUPS: tuple[dict[str, Any], ...] = (
+    {
+        "id": "capabilities",
+        "always": True,
+        "description": "Active discovery for progressively disclosed tools.",
+        "keywords": (),
+    },
     {
         "id": "core",
         "always": True,
@@ -136,6 +143,27 @@ _GROUPS: tuple[dict[str, Any], ...] = (
         ),
     },
     {
+        "id": "session",
+        "always": False,
+        "description": "Session status, checkpoints, branches, and approvals.",
+        "keywords": (
+            "session status",
+            "checkpoint",
+            "branch",
+            "fork session",
+            "revert preview",
+            "pending permission",
+            "human approval",
+            "会话状态",
+            "检查点",
+            "分支",
+            "派生会话",
+            "回退预览",
+            "待审批",
+            "人工审批",
+        ),
+    },
+    {
         "id": "mcp",
         "always": False,
         "description": "MCP connector discovery and calls.",
@@ -174,11 +202,17 @@ _GROUPS: tuple[dict[str, Any], ...] = (
     {
         "id": "remote",
         "always": False,
-        "description": "Remote GPU capability inspection and registration.",
+        "description": (
+            "Remote GPU capability inspection, registration, and job lifecycle."
+        ),
         "keywords": (
             "gpu",
             "remote",
             "ssh",
+            "remote compute",
+            "compute job",
+            "job result",
+            "cancel job",
             "protein structure",
             "protein",
             "sequence",
@@ -196,6 +230,7 @@ _GROUPS: tuple[dict[str, Any], ...] = (
 )
 _GROUP_BY_ID = {group["id"]: group for group in _GROUPS}
 _TOOL_GROUP = {
+    "search_capabilities": "capabilities",
     **{
         name: "core"
         for name in (
@@ -214,8 +249,14 @@ _TOOL_GROUP = {
     },
     "search_skills": "skills",
     "load_skill": "skills",
+    "skill_status": "skills",
+    "skill_history": "skills",
+    "rollback_skill_version": "skills",
     "list_artifacts": "artifacts",
+    "get_artifact_metadata": "artifacts",
+    "list_artifact_versions": "artifacts",
     "save_artifact": "artifacts",
+    "restore_artifact_version": "artifacts",
     "query_schema": "data",
     "query": "data",
     "frames": "data",
@@ -224,7 +265,13 @@ _TOOL_GROUP = {
     "read_todos": "workflow",
     "write_todos": "workflow",
     "read_plan": "workflow",
+    "review_status": "workflow",
     "update_plan_step": "workflow",
+    "session_status": "session",
+    "create_checkpoint": "session",
+    "fork_session": "session",
+    "revert_preview": "session",
+    "pending_permissions": "session",
     "delegate_task": "delegation",
     "list_children": "delegation",
     "collect_children": "delegation",
@@ -236,13 +283,25 @@ _TOOL_GROUP = {
     "exec_interrupt": "background",
     "list_mcp_servers": "mcp",
     "list_mcp_tools": "mcp",
+    "list_mcp_resources": "mcp",
+    "read_mcp_resource": "mcp",
+    "list_mcp_prompts": "mcp",
+    "get_mcp_prompt": "mcp",
     "call_mcp_tool": "mcp",
     "request_network_access": "network",
     "remote_gpu_status": "remote",
     "register_remote_capability": "remote",
+    "compute_submit": "remote",
+    "compute_status": "remote",
+    "compute_result": "remote",
+    "compute_cancel": "remote",
+    "compute_close": "remote",
     "define_dynamic_tool": "dynamic",
     "list_dynamic_tools": "dynamic",
     "promote_dynamic_tool": "dynamic",
+    "list_dynamic_tool_versions": "dynamic",
+    "activate_dynamic_tool_version": "dynamic",
+    "rollback_dynamic_tool_version": "dynamic",
 }
 
 
@@ -259,9 +318,11 @@ class SessionToolCatalog:
         dynamic_registry: DynamicToolRegistry | None = None,
         *,
         builtins: Iterable[Tool] | None = None,
+        tool_filter: Callable[[Tool], bool] | None = None,
     ) -> None:
         self.dynamic_registry = dynamic_registry
         self._builtins = tuple(all_tools() if builtins is None else builtins)
+        self._tool_filter = tool_filter
         self._lock = threading.RLock()
         self._active_groups = {
             str(group["id"]) for group in _GROUPS if bool(group["always"])
@@ -286,7 +347,10 @@ class SessionToolCatalog:
                 if self.dynamic_registry is not None
                 else ()
             )
-            return (*self._builtins, *dynamic)
+            tools = (*self._builtins, *dynamic)
+            if self._tool_filter is not None:
+                tools = tuple(tool for tool in tools if self._tool_filter(tool))
+            return tools
 
     def specs(self) -> tuple[ToolSpec, ...]:
         return control_tool_specs(self.tools())
@@ -330,12 +394,80 @@ class SessionToolCatalog:
                 "always": bool(group["always"]),
                 "active": group["id"] in self._active_groups,
                 "description": group["description"],
+                "keywords": list(group["keywords"]),
                 "tools": [
                     tool.name for tool in tools if self._group_for(tool) == group["id"]
                 ],
             }
             for group in _GROUPS
         )
+
+    def search_capabilities(self, query: str) -> dict[str, Any]:
+        """Find and monotonically activate matching progressive groups."""
+
+        normalized = str(query or "").strip().casefold()
+        if not normalized:
+            raise ValueError("capability query must be a non-empty string")
+        terms = tuple(
+            dict.fromkeys(
+                part
+                for part in re.findall(r"[\w-]+", normalized, flags=re.UNICODE)
+                if part
+            )
+        )
+        matches: list[tuple[int, dict[str, Any]]] = []
+        with self._lock:
+            tools = self.tools()
+            for group in _GROUPS:
+                group_tools = [
+                    tool.name for tool in tools if self._group_for(tool) == group["id"]
+                ]
+                fields = (
+                    str(group["id"]),
+                    str(group["description"]),
+                    *(str(keyword) for keyword in group["keywords"]),
+                    *group_tools,
+                )
+                haystack = "\n".join(fields).casefold()
+                term_hits = sum(term in haystack for term in terms)
+                exact = normalized == str(group["id"]).casefold()
+                phrase = normalized in haystack
+                if not (exact or phrase or term_hits):
+                    continue
+                score = (100 if exact else 0) + (20 if phrase else 0) + term_hits
+                matches.append(
+                    (
+                        score,
+                        {
+                            "id": group["id"],
+                            "description": group["description"],
+                            "keywords": list(group["keywords"]),
+                            "tools": group_tools,
+                        },
+                    )
+                )
+            matches.sort(key=lambda item: (-item[0], str(item[1]["id"])))
+            before = set(self._active_groups)
+            self._active_groups.update(str(item[1]["id"]) for item in matches)
+            active = [
+                str(group["id"])
+                for group in _GROUPS
+                if str(group["id"]) in self._active_groups
+            ]
+            visible_tools = [
+                tool.name
+                for tool in tools
+                if self._group_for(tool) in self._active_groups
+            ]
+        return {
+            "query": normalized,
+            "matched_groups": [item[1] for item in matches],
+            "activated_group_ids": [
+                item[1]["id"] for item in matches if item[1]["id"] not in before
+            ],
+            "active_group_ids": active,
+            "visible_tools": visible_tools,
+        }
 
     def get(self, name: str) -> Tool | None:
         return next((tool for tool in self.tools() if tool.name == name), None)
@@ -356,8 +488,10 @@ class SessionToolCatalog:
         if not approved:
             raise PermissionError("dynamic tool definition requires Host approval")
         name = str(spec.get("name") or "")
-        if self.get(name) is not None:
-            raise ValueError(f"tool name already exists in this session: {name!r}")
+        if any(tool.name == name for tool in self._builtins):
+            raise ValueError(f"tool name conflicts with a built-in: {name!r}")
+        if registry.session_manifest(name) is not None:
+            raise ValueError(f"session dynamic tool already exists: {name!r}")
         with self._lock:
             manifest = registry.define(spec)
         return self._public_manifest(manifest)
@@ -380,7 +514,65 @@ class SessionToolCatalog:
             raise PermissionError("dynamic tool promotion requires Host approval")
         with self._lock:
             manifest = registry.promote(name, scope, approved=True)
-        return self._public_manifest(manifest)
+        return {
+            **self._public_manifest(manifest),
+            "audit": registry.last_audit_event,
+        }
+
+    def list_dynamic_versions(
+        self,
+        *,
+        name: str | None = None,
+        scope: str | None = None,
+    ) -> dict[str, Any]:
+        registry = self._required_dynamic_registry()
+        with self._lock:
+            result = registry.versions(name=name, scope=scope)
+        return {
+            "count": len(result["versions"]),
+            "versions": result["versions"],
+            "audit": result["events"],
+        }
+
+    def activate_dynamic_version(
+        self,
+        name: str,
+        scope: str,
+        manifest_id: str,
+        *,
+        approved: bool = False,
+    ) -> dict[str, Any]:
+        registry = self._required_dynamic_registry()
+        if not approved:
+            raise PermissionError("dynamic tool activation requires Host approval")
+        with self._lock:
+            manifest = registry.activate(
+                name,
+                scope,
+                manifest_id,
+                approved=True,
+            )
+        return {
+            **self._public_manifest(manifest),
+            "audit": registry.last_audit_event,
+        }
+
+    def rollback_dynamic_version(
+        self,
+        name: str,
+        scope: str,
+        *,
+        approved: bool = False,
+    ) -> dict[str, Any]:
+        registry = self._required_dynamic_registry()
+        if not approved:
+            raise PermissionError("dynamic tool rollback requires Host approval")
+        with self._lock:
+            manifest = registry.rollback(name, scope, approved=True)
+        return {
+            **self._public_manifest(manifest),
+            "audit": registry.last_audit_event,
+        }
 
     def execute(self, name: str, context: Any, arguments: Mapping[str, Any]) -> Any:
         """Execute one resolved tool after the caller's Host policy envelope."""
@@ -432,11 +624,15 @@ class SessionToolCatalog:
             "output_schema": dict(manifest.output_schema),
             "imports": list(manifest.imports),
             "scope": manifest.scope,
+            "scope_id": manifest.scope_id,
             "session_id": manifest.session_id,
             "ttl_s": manifest.ttl_s,
             "created_at": manifest.created_at,
             "expires_at": manifest.expires_at,
             "manifest_id": manifest.manifest_id,
+            "source_manifest_id": manifest.source_manifest_id,
+            "source_project_id": manifest.source_project_id,
+            "source_root_frame_id": manifest.source_root_frame_id,
         }
 
 

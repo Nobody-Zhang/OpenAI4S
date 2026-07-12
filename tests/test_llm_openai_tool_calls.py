@@ -148,6 +148,7 @@ def test_openai_chat_blocking_tools_and_lossless_call_normalization(monkeypatch)
             },
         }
     ]
+    assert cap.payload["parallel_tool_calls"] is True
     calls = [
         _call(
             "call-openai-1",

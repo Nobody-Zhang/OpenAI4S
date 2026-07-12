@@ -29,7 +29,12 @@ def _call(index: int, *, token: str = "live-secret") -> NativeToolCall:
     )
 
 
-def _reply(calls=(), *, content: str = "I will inspect the evidence.") -> ModelReply:
+def _reply(
+    calls=(),
+    *,
+    content: str = "I will inspect the evidence.",
+    usage: dict | None = None,
+) -> ModelReply:
     calls = tuple(calls)
     return ModelReply(
         content=content,
@@ -47,6 +52,7 @@ def _reply(calls=(), *, content: str = "I will inspect the evidence.") -> ModelR
                 ]
             }
         },
+        usage=usage or {},
     )
 
 
@@ -72,6 +78,13 @@ def test_runtime_writer_roundtrips_native_group_and_redacts_arguments(tmp_path):
             "I will inspect the evidence password=assistant-secret "
             "Bearer assistant-bearer"
         ),
+        usage={
+            "input_tokens": 120,
+            "output_tokens": 30,
+            "prompt_tokens": 120,
+            "completion_tokens": 30,
+            "total_tokens": 150,
+        },
     )
     ledger.emit(ReplyReceived(reply, 0))
     ledger.emit(ActionRouted(NativeToolBatch((call,)), 0))
@@ -107,6 +120,8 @@ def test_runtime_writer_roundtrips_native_group_and_redacts_arguments(tmp_path):
     tools = groups[1]
     assert tools["provider"] == "ark"
     assert tools["model"] == "science-model"
+    assert tools["usage"]["total_tokens"] == 150
+    assert tools["cost_usd"] is None
     serialized = repr(tools)
     assert "live-secret" not in serialized
     assert "result-secret" not in serialized
@@ -127,6 +142,47 @@ def test_runtime_writer_roundtrips_native_group_and_redacts_arguments(tmp_path):
     ]
     assert history[-1]["tool_call_id"] == "call-0"
     assert history[-1]["is_error"] is False
+    store.close()
+
+
+def test_branch_history_inherits_only_the_checkpointed_parent_prefix(tmp_path):
+    store = Store(tmp_path / "branch-history.db")
+    root = store.new_frame(project_id="default", status="ready")
+    before = RuntimeActionLedger(store, root, "turn-before")
+    before.append_user({"role": "user", "content": "before fork"})
+    checkpoint = store.create_session_checkpoint(
+        root_frame_id=root,
+        branch_id=root,
+        reason="fork base",
+        workspace_tree_id="a" * 64,
+        action_cursor=0,
+    )
+    store.fork_session_branch(
+        root_frame_id=root,
+        from_checkpoint_id=checkpoint["checkpoint_id"],
+        branch_id="branch-alt",
+    )
+    later = RuntimeActionLedger(store, root, "turn-parent-later")
+    later.append_user({"role": "user", "content": "parent only"})
+    child = RuntimeActionLedger(
+        store,
+        root,
+        "turn-child",
+        branch_id="branch-alt",
+    )
+    child.append_user({"role": "user", "content": "child only"})
+
+    root_history = restore_action_history(store, root, branch_id=root)
+    child_history = restore_action_history(store, root, branch_id="branch-alt")
+
+    assert [item["content"] for item in root_history] == [
+        "before fork",
+        "parent only",
+    ]
+    assert [item["content"] for item in child_history] == [
+        "before fork",
+        "child only",
+    ]
     store.close()
 
 

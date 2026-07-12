@@ -33,10 +33,24 @@ class FakeManager:
     def __init__(self) -> None:
         self.list_result = [{"name": "search"}]
         self.call_result = {"text": "done"}
+        self.resources_result = {"resources": [{"uri": "science://dataset"}]}
+        self.resource_result = {
+            "contents": [{"uri": "science://dataset", "text": "measurements"}]
+        }
+        self.prompts_result = {"prompts": [{"name": "analyze"}]}
+        self.prompt_result = {
+            "messages": [{"role": "user", "content": {"type": "text"}}]
+        }
         self.list_calls: list[tuple] = []
         self.tool_calls: list[tuple] = []
+        self.resource_list_calls: list[tuple] = []
+        self.resource_read_calls: list[tuple] = []
+        self.prompt_list_calls: list[tuple] = []
+        self.prompt_get_calls: list[tuple] = []
         self.list_error: Exception | None = None
         self.call_error: Exception | None = None
+        self.resource_error: Exception | None = None
+        self.prompt_error: Exception | None = None
 
     def list_tools(self, connector_id, config):
         self.list_calls.append((connector_id, config))
@@ -49,6 +63,30 @@ class FakeManager:
         if self.call_error is not None:
             raise self.call_error
         return self.call_result
+
+    def list_resources(self, connector_id, config, cursor):
+        self.resource_list_calls.append((connector_id, config, cursor))
+        if self.resource_error is not None:
+            raise self.resource_error
+        return self.resources_result
+
+    def read_resource(self, connector_id, config, uri):
+        self.resource_read_calls.append((connector_id, config, uri))
+        if self.resource_error is not None:
+            raise self.resource_error
+        return self.resource_result
+
+    def list_prompts(self, connector_id, config, cursor):
+        self.prompt_list_calls.append((connector_id, config, cursor))
+        if self.prompt_error is not None:
+            raise self.prompt_error
+        return self.prompts_result
+
+    def get_prompt(self, connector_id, config, name, arguments):
+        self.prompt_get_calls.append((connector_id, config, name, arguments))
+        if self.prompt_error is not None:
+            raise self.prompt_error
+        return self.prompt_result
 
 
 def _connector(
@@ -174,9 +212,9 @@ def test_call_rejects_disabled_and_preserves_lookup_and_argument_contracts():
     }
     assert factory_calls == []
 
-    assert service.call(
-        {"server": "Enabled", "tool": "search", "args": None}
-    ) == {"text": "done"}
+    assert service.call({"server": "Enabled", "tool": "search", "args": None}) == {
+        "text": "done"
+    }
     assert manager.tool_calls == [
         (
             "enabled-id",
@@ -197,9 +235,9 @@ def test_call_preserves_exception_text_and_command_keyerror_boundary():
     manager.call_error = ValueError("bad payload")
     service = MCPService(store, manager_factory=lambda: manager)
 
-    assert service.call(
-        {"server": "srv", "tool": "lookup", "args": {"q": "x"}}
-    ) == {"error": "mcp_call(srv.lookup) failed: bad payload"}
+    assert service.call({"server": "srv", "tool": "lookup", "args": {"q": "x"}}) == {
+        "error": "mcp_call(srv.lookup) failed: bad payload"
+    }
 
     store.connectors = [
         {
@@ -210,3 +248,87 @@ def test_call_preserves_exception_text_and_command_keyerror_boundary():
     ]
     with pytest.raises(KeyError, match="command"):
         service.call({"server": "broken", "tool": "lookup"})
+
+
+def test_resource_and_prompt_discovery_preserve_cursor_and_disabled_introspection():
+    connector = _connector("srv", "Server", enabled=False)
+    store = FakeStore([connector])
+    manager = FakeManager()
+    service = MCPService(store, manager_factory=lambda: manager)
+    config = {
+        "command": ["python", "server.py"],
+        "args": ["--stdio"],
+        "env": {"TOKEN": "test"},
+    }
+
+    assert service.resources({"server": "Server", "cursor": "resources-2"}) == (
+        manager.resources_result
+    )
+    assert manager.resource_list_calls == [("srv", config, "resources-2")]
+    assert service.prompts({"server": "srv", "cursor": "prompts-2"}) == (
+        manager.prompts_result
+    )
+    assert manager.prompt_list_calls == [("srv", config, "prompts-2")]
+
+
+def test_resource_read_and_prompt_get_require_enabled_connector_and_route_payloads():
+    disabled = _connector("off", "Off", enabled=False)
+    enabled = _connector("srv", "Server")
+    store = FakeStore([disabled, enabled])
+    manager = FakeManager()
+    service = MCPService(store, manager_factory=lambda: manager)
+
+    assert service.read_resource({"server": "missing", "uri": "science://dataset"}) == {
+        "error": "connector 'missing' not found"
+    }
+    assert service.read_resource({"server": "Off", "uri": "science://dataset"}) == {
+        "error": "connector 'Off' is disabled"
+    }
+    assert service.get_prompt({"server": "Off", "name": "analyze"}) == {
+        "error": "connector 'Off' is disabled"
+    }
+
+    assert (
+        service.read_resource({"server": "Server", "uri": "science://dataset"})
+        == manager.resource_result
+    )
+    assert (
+        service.get_prompt(
+            {
+                "server": "srv",
+                "name": "analyze",
+                "arguments": {"dataset": "science://dataset"},
+            }
+        )
+        == manager.prompt_result
+    )
+    assert manager.resource_read_calls[0][2] == "science://dataset"
+    assert manager.prompt_get_calls[0][2:] == (
+        "analyze",
+        {"dataset": "science://dataset"},
+    )
+
+
+def test_resource_and_prompt_failures_use_soft_error_contract():
+    store = FakeStore([_connector("srv", "Server")])
+    manager = FakeManager()
+    service = MCPService(store, manager_factory=lambda: manager)
+
+    manager.resource_error = RuntimeError("resource transport down")
+    assert service.resources({"server": "srv"}) == {
+        "error": "mcp resources failed: resource transport down"
+    }
+    assert service.read_resource({"server": "srv", "uri": "science://dataset"}) == {
+        "error": (
+            "mcp resource read(srv:science://dataset) failed: "
+            "resource transport down"
+        )
+    }
+
+    manager.prompt_error = RuntimeError("prompt transport down")
+    assert service.prompts({"server": "srv"}) == {
+        "error": "mcp prompts failed: prompt transport down"
+    }
+    assert service.get_prompt({"server": "srv", "name": "analyze"}) == {
+        "error": "mcp prompt get(srv.analyze) failed: prompt transport down"
+    }

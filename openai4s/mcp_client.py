@@ -1,27 +1,96 @@
 """Minimal MCP (Model Context Protocol) stdio client — pure stdlib.
 
 Speaks newline-delimited JSON-RPC 2.0 to a spawned MCP server process, enough to
-power the Connectors feature: handshake (initialize + initialized), tools/list,
-tools/call. A process-wide MCPManager caches one live connection per connector id
-so repeated tool calls reuse the same server.
+power the Connectors control plane: handshake (initialize + initialized), tools,
+resources, and prompts. A process-wide MCPManager caches one live connection per
+connector id so repeated calls reuse the same server.
 
-Not a full MCP implementation (no resources/prompts/sampling), but interoperable
-with any standard stdio MCP server for the tools surface the agent uses.
+Sampling and server-initiated requests are deliberately outside this client.
 """
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import threading
+from collections.abc import Mapping
 from typing import Any
 
 PROTOCOL_VERSION = "2024-11-05"
 _DEFAULT_TIMEOUT = 30.0
 
+# A connector is third-party code.  Never copy the daemon's complete environment
+# into it: that would silently expose provider keys, cloud credentials, and
+# unrelated application secrets.  These variables are the small cross-platform
+# runtime substrate needed to locate a command, create temporary files, select a
+# locale, and use the host trust store.  Connector-specific credentials must be
+# supplied explicitly in the persisted connector ``env`` mapping.
+_CONNECTOR_RUNTIME_ENV = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "USERPROFILE",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "LANG",
+        "LANGUAGE",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TZ",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "NODE_EXTRA_CA_CERTS",
+    }
+)
+
 
 class MCPError(RuntimeError):
     pass
+
+
+def _connector_environment(
+    explicit: Mapping[str, Any] | None = None,
+    *,
+    source: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Return a fresh least-privilege environment for one MCP subprocess.
+
+    ``source`` exists for deterministic tests.  Explicit connector values are
+    intentionally allowed to contain credentials: they are the connector's
+    declared secret boundary, unlike arbitrary variables inherited by the
+    daemon from the user's shell.
+    """
+
+    host = os.environ if source is None else source
+    env = {
+        name: str(host[name])
+        for name in _CONNECTOR_RUNTIME_ENV
+        if name in host and host[name] is not None
+    }
+    env.setdefault("PATH", os.defpath)
+    env["PYTHONUNBUFFERED"] = "1"
+    if explicit is None:
+        return env
+    if not isinstance(explicit, Mapping):
+        raise MCPError("connector env must be an object")
+    for raw_name, raw_value in explicit.items():
+        if not isinstance(raw_name, str) or not raw_name:
+            raise MCPError("connector env names must be non-empty strings")
+        if "=" in raw_name or "\x00" in raw_name:
+            raise MCPError(f"invalid connector env name: {raw_name!r}")
+        if raw_value is None:
+            raise MCPError(f"connector env value for {raw_name!r} cannot be null")
+        value = str(raw_value)
+        if "\x00" in value:
+            raise MCPError(f"connector env value for {raw_name!r} contains NUL")
+        env[raw_name] = value
+    return env
 
 
 class MCPConnection:
@@ -133,6 +202,37 @@ class MCPConnection:
             "raw": res,
         }
 
+    # -- resources -----------------------------------------------------------
+    def list_resources(self, cursor: str | None = None) -> dict:
+        params = {"cursor": cursor} if cursor is not None else None
+        res = self._request("resources/list", params)
+        if not isinstance(res, dict):
+            raise MCPError("resources/list returned a non-object result")
+        return res
+
+    def read_resource(self, uri: str) -> dict:
+        res = self._request("resources/read", {"uri": uri})
+        if not isinstance(res, dict):
+            raise MCPError("resources/read returned a non-object result")
+        return res
+
+    # -- prompts -------------------------------------------------------------
+    def list_prompts(self, cursor: str | None = None) -> dict:
+        params = {"cursor": cursor} if cursor is not None else None
+        res = self._request("prompts/list", params)
+        if not isinstance(res, dict):
+            raise MCPError("prompts/list returned a non-object result")
+        return res
+
+    def get_prompt(self, name: str, arguments: dict | None = None) -> dict:
+        params: dict[str, Any] = {"name": name}
+        if arguments is not None:
+            params["arguments"] = arguments
+        res = self._request("prompts/get", params)
+        if not isinstance(res, dict):
+            raise MCPError("prompts/get returned a non-object result")
+        return res
+
 
 class MCPManager:
     """One live connection per connector id (lazily connected, cached)."""
@@ -154,10 +254,7 @@ class MCPManager:
         return argv
 
     def _connect(self, config: dict) -> MCPConnection:
-        import os
-
-        env = dict(os.environ)
-        env.update(config.get("env") or {})
+        env = _connector_environment(config.get("env"))
         return MCPConnection(self._argv(config), env=env, cwd=config.get("cwd"))
 
     def get(self, connector_id: str, config: dict) -> MCPConnection:
@@ -192,6 +289,34 @@ class MCPManager:
         self, connector_id: str, config: dict, tool: str, arguments: dict | None = None
     ) -> dict:
         return self.get(connector_id, config).call_tool(tool, arguments)
+
+    def list_resources(
+        self,
+        connector_id: str,
+        config: dict,
+        cursor: str | None = None,
+    ) -> dict:
+        return self.get(connector_id, config).list_resources(cursor)
+
+    def read_resource(self, connector_id: str, config: dict, uri: str) -> dict:
+        return self.get(connector_id, config).read_resource(uri)
+
+    def list_prompts(
+        self,
+        connector_id: str,
+        config: dict,
+        cursor: str | None = None,
+    ) -> dict:
+        return self.get(connector_id, config).list_prompts(cursor)
+
+    def get_prompt(
+        self,
+        connector_id: str,
+        config: dict,
+        name: str,
+        arguments: dict | None = None,
+    ) -> dict:
+        return self.get(connector_id, config).get_prompt(name, arguments)
 
     def disconnect(self, connector_id: str) -> None:
         with self._lock:

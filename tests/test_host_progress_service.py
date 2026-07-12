@@ -216,3 +216,58 @@ def test_dispatcher_progress_wrappers_keep_late_bound_wiring(tmp_path):
     assert events[0]["plan_id"] == plan["plan_id"]
     assert dispatcher._m_plan_read("ignored")["plan_id"] == plan["plan_id"]
     assert dispatcher._PLAN_STEP_STATUS == PLAN_STEP_STATUSES
+
+
+def test_review_status_is_bounded_public_read_only_projection(tmp_path):
+    store = _store(tmp_path)
+    frame_id = store.new_frame(project_id="science")
+    state = {"frame_id": frame_id, "sink": None}
+    service = _service(store, state)
+    store.set_setting(f"review:auto:{frame_id}", "1")
+    store.set_setting(f"review:model:{frame_id}", "review-model")
+    store.add_step(
+        step_id="review-1",
+        frame_id=frame_id,
+        kind="review",
+        title="Evidence review",
+        input={"private_evidence": "must not be returned"},
+        status="running",
+    )
+    store.update_step(
+        "review-1",
+        status="done",
+        output={
+            "verdict": "issues",
+            "summary": "One caveat",
+            "issues": [{"detail": "bounded"}],
+            "reviewed_artifacts": ["a-1"],
+            "raw_provider_payload": "must not be returned",
+        },
+        summary="One caveat",
+    )
+
+    status = service.review_status()
+
+    assert status == {
+        "enabled": True,
+        "reviewer_model": "review-model",
+        "reviews": [
+            {
+                "step_id": "review-1",
+                "status": "done",
+                "title": "Evidence review",
+                "summary": "One caveat",
+                "verdict": "issues",
+                "issues_count": 1,
+                "reviewed_artifacts": ["a-1"],
+                "created_at": status["reviews"][0]["created_at"],
+            }
+        ],
+    }
+    assert "private_evidence" not in repr(status)
+    assert "raw_provider_payload" not in repr(status)
+    dispatcher = HostDispatcher(Config(data_dir=tmp_path / "dispatcher"), frame_id=None)
+    assert dispatcher._m_review_status("ignored") == {
+        "enabled": False,
+        "reviews": [],
+    }

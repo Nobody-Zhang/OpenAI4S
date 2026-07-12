@@ -16,7 +16,13 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from openai4s.tools.artifacts import ListArtifactsTool, SaveArtifactTool
+from openai4s.tools.artifacts import (
+    GetArtifactMetadataTool,
+    ListArtifactsTool,
+    ListArtifactVersionsTool,
+    RestoreArtifactVersionTool,
+    SaveArtifactTool,
+)
 from openai4s.tools.background import (
     InterruptBackgroundExecTool,
     ListBackgroundExecsTool,
@@ -24,6 +30,7 @@ from openai4s.tools.background import (
     SubmitBackgroundExecTool,
 )
 from openai4s.tools.base import Tool
+from openai4s.tools.capabilities import SearchCapabilitiesTool
 from openai4s.tools.content_search import ContentSearchTool
 from openai4s.tools.data import (
     FramesTool,
@@ -40,9 +47,12 @@ from openai4s.tools.delegation import (
     StopChildTool,
 )
 from openai4s.tools.dynamic_control import (
+    ActivateDynamicToolVersion,
     DefineDynamicTool,
     ListDynamicTools,
+    ListDynamicToolVersions,
     PromoteDynamicTool,
+    RollbackDynamicToolVersion,
 )
 from openai4s.tools.edit import EditFileTool
 from openai4s.tools.env_create import EnvCreateTool
@@ -50,11 +60,20 @@ from openai4s.tools.env_list import EnvListTool
 from openai4s.tools.env_use import EnvUseTool
 from openai4s.tools.glob_files import GlobFilesTool
 from openai4s.tools.list_directory import ListDirectoryTool
-from openai4s.tools.mcp import CallMCPTool, ListMCPServersTool, ListMCPToolsTool
+from openai4s.tools.mcp import (
+    CallMCPTool,
+    GetMCPPromptTool,
+    ListMCPPromptsTool,
+    ListMCPResourcesTool,
+    ListMCPServersTool,
+    ListMCPToolsTool,
+    ReadMCPResourceTool,
+)
 from openai4s.tools.network_access import RequestNetworkAccessTool
 from openai4s.tools.progress import (
     ReadPlanTool,
     ReadTodosTool,
+    ReviewStatusTool,
     UpdatePlanStepTool,
     WriteTodosTool,
 )
@@ -63,8 +82,28 @@ from openai4s.tools.remote_capabilities import (
     RegisterRemoteCapabilityTool,
     RemoteGPUStatusTool,
 )
+from openai4s.tools.remote_compute import (
+    CancelRemoteComputeJobTool,
+    CloseRemoteComputeTool,
+    GetRemoteComputeJobResultTool,
+    RemoteComputeStatusTool,
+    SubmitRemoteComputeJobTool,
+)
 from openai4s.tools.schema import SchemaDefinitionError
-from openai4s.tools.skills import LoadSkillTool, SearchSkillsTool
+from openai4s.tools.session import (
+    CreateCheckpointTool,
+    ForkSessionTool,
+    PendingPermissionsTool,
+    RevertPreviewTool,
+    SessionStatusTool,
+)
+from openai4s.tools.skills import (
+    LoadSkillTool,
+    RollbackSkillVersionTool,
+    SearchSkillsTool,
+    SkillHistoryTool,
+    SkillStatusTool,
+)
 from openai4s.tools.taxonomy import READ_ONLY, SIDE_EFFECT_CLASSES
 from openai4s.tools.web_fetch import WebFetchTool
 from openai4s.tools.web_search import WebSearchTool
@@ -86,10 +125,17 @@ TOOL_TYPES: tuple[type[Tool], ...] = (
     EnvCreateTool,
     WebSearchTool,
     WebFetchTool,
+    SearchCapabilitiesTool,
     SearchSkillsTool,
     LoadSkillTool,
+    SkillStatusTool,
+    SkillHistoryTool,
+    RollbackSkillVersionTool,
     ListArtifactsTool,
+    GetArtifactMetadataTool,
+    ListArtifactVersionsTool,
     SaveArtifactTool,
+    RestoreArtifactVersionTool,
     QuerySchemaTool,
     ReadOnlyQueryTool,
     FramesTool,
@@ -98,7 +144,13 @@ TOOL_TYPES: tuple[type[Tool], ...] = (
     ReadTodosTool,
     WriteTodosTool,
     ReadPlanTool,
+    ReviewStatusTool,
     UpdatePlanStepTool,
+    SessionStatusTool,
+    CreateCheckpointTool,
+    ForkSessionTool,
+    RevertPreviewTool,
+    PendingPermissionsTool,
     DelegateTaskTool,
     ListChildrenTool,
     CollectChildrenTool,
@@ -110,13 +162,25 @@ TOOL_TYPES: tuple[type[Tool], ...] = (
     InterruptBackgroundExecTool,
     ListMCPServersTool,
     ListMCPToolsTool,
+    ListMCPResourcesTool,
+    ReadMCPResourceTool,
+    ListMCPPromptsTool,
+    GetMCPPromptTool,
     CallMCPTool,
     RequestNetworkAccessTool,
     RemoteGPUStatusTool,
     RegisterRemoteCapabilityTool,
+    SubmitRemoteComputeJobTool,
+    RemoteComputeStatusTool,
+    GetRemoteComputeJobResultTool,
+    CancelRemoteComputeJobTool,
+    CloseRemoteComputeTool,
     DefineDynamicTool,
     ListDynamicTools,
     PromoteDynamicTool,
+    ListDynamicToolVersions,
+    ActivateDynamicToolVersion,
+    RollbackDynamicToolVersion,
 )
 FILE_TOOL_TYPES = TOOL_TYPES[:6]
 
@@ -170,8 +234,10 @@ def register_tool(tool: Tool) -> Tool:
         raise ValueError(
             f"tool {tool.name!r} could not derive resource keys: {error}"
         ) from error
-    if not isinstance(keys, tuple) or not keys or not all(
-        isinstance(key, str) and ":" in key for key in keys
+    if (
+        not isinstance(keys, tuple)
+        or not keys
+        or not all(isinstance(key, str) and ":" in key for key in keys)
     ):
         raise ValueError(
             f"tool {tool.name!r} resource_keys() must return non-empty namespaced "
@@ -195,9 +261,7 @@ def _unregister_tool(name: str) -> None:
 for _tool_type in TOOL_TYPES:
     register_tool(_tool_type())
 
-BUILTIN_CONTROL_HOST_METHODS = frozenset(
-    tool.host_method for tool in REGISTRY
-)
+BUILTIN_CONTROL_HOST_METHODS = frozenset(tool.host_method for tool in REGISTRY)
 
 
 def get_tool(name: str) -> Tool | None:

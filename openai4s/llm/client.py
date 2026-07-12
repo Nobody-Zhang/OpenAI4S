@@ -11,6 +11,7 @@ from .capabilities import (
     get_model_capabilities,
     legacy_provider_specs,
     normalize_usage,
+    validate_model_request,
 )
 from .messages import _is_parts
 from .models import LLMError
@@ -101,9 +102,37 @@ def chat(
             f"See .env.example."
         )
     _guard_vision(cfg.provider, messages, capabilities=capabilities)
+    validate_model_request(
+        cfg.provider,
+        model,
+        base_url=base,
+        parallel_tool_calls=bool(parallel_tool_calls),
+        vision=any(
+            _is_parts(message.get("content"))
+            and any(part.get("type") == "image" for part in message["content"])
+            for message in messages
+        ),
+        streaming=on_delta is not None,
+        max_output_tokens=max_tokens,
+    )
     wire = spec["wire"]
     caller = _WIRE_DISPATCH[wire]
-    canonical_tools = _canonical_tool_specs(tools)
+    # Local auto-discovery establishes only OpenAI wire compatibility. Until a
+    # deployment/model capability override explicitly enables tool calling,
+    # keep that request on the Code-as-Action path instead of sending an
+    # unsupported schema and failing the whole turn.
+    canonical_tools = (
+        _canonical_tool_specs(tools) if capabilities.tool_calling else []
+    )
+    if canonical_tools and not capabilities.strict_tool_schema:
+        canonical_tools = [
+            {**declaration, "strict": False} for declaration in canonical_tools
+        ]
+    effective_parallel = parallel_tool_calls
+    if canonical_tools and effective_parallel is None:
+        effective_parallel = capabilities.parallel_tool_calls
+    if not canonical_tools:
+        effective_parallel = None
     transport_args = {"post_sse": post_sse}
     if wire == "openai":
         transport_args["post_json"] = post_json
@@ -120,7 +149,7 @@ def chat(
         on_delta=on_delta,
         tools=canonical_tools,
         tool_choice=tool_choice,
-        parallel_tool_calls=parallel_tool_calls,
+        parallel_tool_calls=effective_parallel,
         **transport_args,
     )
     reply["usage"] = normalize_usage(

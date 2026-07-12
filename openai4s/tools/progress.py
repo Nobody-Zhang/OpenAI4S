@@ -96,8 +96,26 @@ class UpdatePlanStepTool(Tool):
         return runtime.invoke(self.host_method, dict(arguments))
 
 
+class ReviewStatusTool(Tool):
+    name = "review_status"
+    host_method = "review_status"
+    description = (
+        "Read the current session's evidence-review configuration and bounded "
+        "review verdict history."
+    )
+    parameters = {"properties": {}, "required": []}
+    requires_approval = False
+    resource_key_prefix = "workflow"
+    resource_target_default = "review"
+
+    def execute(self, runtime: ControlToolContext, arguments: dict) -> dict:
+        del arguments
+        return runtime.invoke(self.host_method)
+
+
 __all__ = [
     "ReadPlanTool",
+    "ReviewStatusTool",
     "ReadTodosTool",
     "UpdatePlanStepTool",
     "WriteTodosTool",

@@ -155,6 +155,29 @@ def test_loopback_openai_endpoint_can_run_without_fake_api_key(cap):
     assert "Authorization" not in cap.headers
 
 
+def test_loopback_endpoint_does_not_inherit_unverified_vendor_tool_support(cap):
+    c = LLMConfig(
+        provider="chatgpt",
+        api_key="",
+        base_url="http://127.0.0.1:1234/v1",
+        model="local-model",
+    )
+    tools = [
+        {
+            "name": "external_write",
+            "description": "must not be sent without a capability override",
+            "parameters": {"type": "object", "properties": {}},
+        }
+    ]
+
+    llm.chat([{"role": "user", "content": "hi"}], c, tools=tools)
+
+    assert "tools" not in cap.payload
+    assert llm.get_model_capabilities(
+        "chatgpt", "local-model", base_url=c.base_url
+    ).tool_calling is False
+
+
 # --- wire selection + auth headers ---------------------------------------
 
 

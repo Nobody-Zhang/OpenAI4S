@@ -44,6 +44,42 @@ def test_credential_service_preserves_key_errors_and_session_isolation():
     assert second.list() == []
 
 
+def test_credential_leases_are_action_bound_single_use_and_expiring():
+    now = [100.0]
+    service = CredentialService(clock=lambda: now[0])
+    service.set({"name": "TOKEN", "value": "private"})
+
+    lease = service.issue(
+        "TOKEN", purpose="upload checkpoint", binding="action-a", ttl_seconds=5
+    )
+    assert lease["single_use"] is True
+    assert "private" not in repr(lease)
+    assert service.redeem(lease["token"], binding="action-a")["value"] == "private"
+    with pytest.raises(KeyError, match="consumed"):
+        service.redeem(lease["token"], binding="action-a")
+
+    wrong = service.issue("TOKEN", binding="action-a")
+    with pytest.raises(PermissionError, match="another action"):
+        service.redeem(wrong["token"], binding="action-b")
+    with pytest.raises(KeyError, match="consumed"):
+        service.redeem(wrong["token"], binding="action-a")
+
+    expired = service.issue("TOKEN", binding="action-a", ttl_seconds=1)
+    now[0] += 2
+    with pytest.raises(KeyError, match="expired"):
+        service.redeem(expired["token"], binding="action-a")
+
+
+def test_rotating_credential_revokes_outstanding_leases():
+    service = CredentialService()
+    service.set({"name": "TOKEN", "value": "old"})
+    lease = service.issue("TOKEN")
+    service.set({"name": "TOKEN", "value": "new"})
+    with pytest.raises(KeyError, match="consumed"):
+        service.redeem(lease["token"])
+    assert service.get("TOKEN")["value"] == "new"
+
+
 def test_host_dispatcher_credentials_wrappers_share_one_service(tmp_path):
     dispatcher = HostDispatcher(Config(data_dir=tmp_path))
 
@@ -56,6 +92,13 @@ def test_host_dispatcher_credentials_wrappers_share_one_service(tmp_path):
     }
     assert dispatcher._m_credentials_list() == ["HF_TOKEN"]
     assert dispatcher._credential_service.list() == ["HF_TOKEN"]
+
+    lease = dispatcher._m_credentials_issue(
+        {"name": "HF_TOKEN", "purpose": "one request", "ttl_seconds": 30}
+    )
+    assert dispatcher._m_credentials_redeem(lease["token"])["value"] == "test-secret"
+    with pytest.raises(KeyError, match="consumed"):
+        dispatcher._m_credentials_redeem(lease["token"])
 
 
 def test_host_dispatchers_do_not_share_credentials(tmp_path):
@@ -109,11 +152,18 @@ def test_replay_excludes_all_credential_methods_and_values(tmp_path):
 
     dispatcher("credentials_set", [{"name": "TOKEN", "value": secret}])
     assert dispatcher("credentials_get", ["TOKEN"])["value"] == secret
+    lease = dispatcher(
+        "credentials_issue",
+        [{"name": "TOKEN", "purpose": "single use"}],
+    )
+    assert dispatcher("credentials_redeem", [lease["token"]])["value"] == secret
     assert dispatcher("credentials_list", []) == ["TOKEN"]
 
     assert not {
         "credentials_set",
         "credentials_get",
+        "credentials_issue",
+        "credentials_redeem",
         "credentials_list",
     } & {record["method"] for record in recorder.records}
     assert secret not in repr(recorder.records)

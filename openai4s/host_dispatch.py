@@ -13,6 +13,7 @@ exceptions are also converted to {"error":...} on the wire by the manager.
 """
 from __future__ import annotations
 
+import json
 import re
 import threading
 import time
@@ -28,6 +29,7 @@ from openai4s.host.completion import CompletionService
 from openai4s.host.credentials import CredentialService
 from openai4s.host.data import HostDataService
 from openai4s.host.delegation import DelegationService
+from openai4s.host.delegation_policy import ChildExecutionPolicy
 from openai4s.host.endpoints import EndpointService
 from openai4s.host.endpoints import endpoint_fingerprint as _endpoint_fingerprint
 from openai4s.host.endpoints import fallback_port as _fallback_port
@@ -43,8 +45,10 @@ from openai4s.host.remote_capabilities import (
     normalize_remote_capability_probe as _normalize_remote_capability_probe,
 )
 from openai4s.host.remote_science import RemoteScienceService
+from openai4s.host.session import SessionControlService
 from openai4s.host.skills import SkillService
 from openai4s.llm import chat
+from openai4s.storage.metadata import DERIVABLE_HOST_CALLS
 from openai4s.store import SECRET_ARG_HOST_CALLS, get_store
 from openai4s.tools.catalog import SessionToolCatalog
 from openai4s.tools.contexts import ControlToolContext
@@ -164,6 +168,22 @@ def _step_begin(method: str, args: list) -> tuple[str, str, dict] | None:
     if method == "load_skill":
         name = args[0] if args and isinstance(args[0], str) else a.get("name", "")
         return ("skill", f"Loading {name} skill guidance", {"name": name})
+    if method in {"skills_status", "skills_history", "skills_rollback"}:
+        name = a.get("name", "")
+        verb = {
+            "skills_status": "Inspecting",
+            "skills_history": "Reading history for",
+            "skills_rollback": "Rolling back",
+        }[method]
+        return (
+            "skill",
+            f"{verb} {name} Skill",
+            {
+                "name": name,
+                "scope": a.get("scope"),
+                "version_id": a.get("version_id"),
+            },
+        )
     if method == "env_list":
         return (
             "env",
@@ -186,6 +206,30 @@ def _step_begin(method: str, args: list) -> tuple[str, str, dict] | None:
     if method == "save_artifact":
         fn = a.get("filename") or Path(a.get("path", "")).name
         return ("artifact", f"Saving {fn}", {"filename": fn})
+    if method == "get_artifact_metadata":
+        return (
+            "artifact",
+            f"Inspecting {a.get('artifact_id') or 'artifact'}",
+            {
+                "artifact_id": a.get("artifact_id"),
+                "version_id": a.get("version_id"),
+            },
+        )
+    if method == "list_artifact_versions":
+        return (
+            "artifact",
+            f"Listing versions of {a.get('artifact_id') or 'artifact'}",
+            {"artifact_id": a.get("artifact_id")},
+        )
+    if method == "restore_artifact_version":
+        return (
+            "artifact",
+            f"Restoring {a.get('artifact_id') or 'artifact'}",
+            {
+                "artifact_id": a.get("artifact_id"),
+                "version_id": a.get("version_id"),
+            },
+        )
     if method == "delegate":
         name = a.get("specialist") or a.get("name") or "sub-agent"
         return (
@@ -229,8 +273,54 @@ def _step_begin(method: str, args: list) -> tuple[str, str, dict] | None:
             f"Promoting dynamic tool {a.get('name') or ''}",
             {"name": a.get("name"), "scope": a.get("scope")},
         )
+    if method == "dynamic_tool_activate":
+        return (
+            "tool",
+            f"Activating dynamic tool {a.get('name') or ''}",
+            {
+                "name": a.get("name"),
+                "scope": a.get("scope"),
+                "manifest_id": a.get("manifest_id"),
+            },
+        )
+    if method == "dynamic_tool_rollback":
+        return (
+            "tool",
+            f"Rolling back dynamic tool {a.get('name') or ''}",
+            {"name": a.get("name"), "scope": a.get("scope")},
+        )
     if method.startswith("dynamic:"):
         return ("tool", "Running a session dynamic tool", {})
+    if method in {"mcp_tools", "mcp_resources", "mcp_prompts"}:
+        server = a.get("server") or (
+            args[0] if args and isinstance(args[0], str) else ""
+        )
+        noun = {
+            "mcp_tools": "tools",
+            "mcp_resources": "resources",
+            "mcp_prompts": "prompts",
+        }[method]
+        return (
+            "mcp",
+            f"Discovering {noun} via {server}",
+            {"server": server, "cursor": a.get("cursor")},
+        )
+    if method == "mcp_resource_read":
+        return (
+            "mcp",
+            f"Reading a resource via {a.get('server')}",
+            {"server": a.get("server"), "uri": a.get("uri")},
+        )
+    if method == "mcp_prompt_get":
+        return (
+            "mcp",
+            f"Loading {a.get('name')} via {a.get('server')}",
+            {
+                "server": a.get("server"),
+                "name": a.get("name"),
+                "arguments": a.get("arguments", {}),
+            },
+        )
     if method == "mcp_call":
         return (
             "mcp",
@@ -396,6 +486,27 @@ def _step_end(method: str, kind: str, result: Any, ok: bool) -> tuple[dict, str]
                 {"skills": names},
                 ", ".join(n for n in names[:4] if n) or "no match",
             )
+        if method == "skills_status":
+            return (
+                {
+                    "name": r.get("name"),
+                    "scope": r.get("scope"),
+                    "active_version_id": r.get("active_version_id"),
+                    "read_only": r.get("read_only"),
+                },
+                "active" if r.get("active") else "not installed",
+            )
+        if method == "skills_history":
+            versions = r.get("versions") or []
+            return (
+                {"name": (r.get("installation") or {}).get("name"), "versions": versions},
+                _plural(len(versions), "version"),
+            )
+        if method == "skills_rollback":
+            return (
+                {"name": r.get("name"), "version_id": r.get("version_id")},
+                "rolled back",
+            )
         return (
             {
                 "name": r.get("name"),
@@ -420,6 +531,35 @@ def _step_end(method: str, kind: str, result: Any, ok: bool) -> tuple[dict, str]
         installed = r.get("installed") or []
         return (r, ("installed " + ", ".join(installed[:4])) if installed else "ready")
     if kind == "artifact":
+        if method == "list_artifact_versions":
+            versions = r.get("versions") or []
+            return (
+                {
+                    "artifact_id": r.get("artifact_id"),
+                    "versions": versions,
+                },
+                _plural(int(r.get("count") or len(versions)), "version"),
+            )
+        if method == "get_artifact_metadata":
+            version = r.get("version") or {}
+            return (
+                {
+                    "artifact": r.get("artifact"),
+                    "version": version,
+                },
+                str(version.get("version_id") or "inspected"),
+            )
+        if method == "restore_artifact_version":
+            return (
+                {
+                    "artifact_id": r.get("artifact_id"),
+                    "version_id": r.get("version_id"),
+                    "restored_from_version_id": r.get(
+                        "restored_from_version_id"
+                    ),
+                },
+                "restored as new version",
+            )
         return (
             {"filename": r.get("filename"), "version_id": r.get("version_id")},
             "saved",
@@ -492,6 +632,11 @@ class HostDispatcher:
         # it is populated.
         self._bash_generation_local = threading.local()
         self._bash_generation_default: str | int | None = None
+        # Canonical action attribution is bound by the engine/kernel manager
+        # at the actual invocation boundary.  Thread-local storage matters for
+        # parallel read-only native tools: each approval must point back to its
+        # own provider tool call rather than merely to the surrounding turn.
+        self._action_context_local = threading.local()
         self._bash_authorization = BashAuthorizationService(
             workspace=lambda: self._files.workspace(),
             frame_id=lambda: self.frame_id,
@@ -543,8 +688,9 @@ class HostDispatcher:
         self.recorder: Any | None = None
         # remote-compute transport, built lazily on first compute_* call.
         self._compute: Any = None
+        self._child_execution_policy: ChildExecutionPolicy | None = None
         self._session_tool_catalog: SessionToolCatalog | None = None
-        self._session_tool_scope: tuple[str, str] | None = None
+        self._session_tool_scope: tuple[str, str, str] | None = None
         # optional sink for semantic activity steps (wired by the web gateway):
         # on_step({"phase":"begin"|"end", "step_id", "kind", "title",
         #          "input"|"output", "status", "summary"}). None = headless/CLI.
@@ -557,6 +703,10 @@ class HostDispatcher:
             self.store,
             get_frame_id=lambda: self.frame_id,
             get_plan_sink=lambda: self.on_plan,
+        )
+        self._session_service = SessionControlService(
+            self.store,
+            frame_id=lambda: self.frame_id,
         )
         # prebuilt-environment integration (wired by the web gateway):
         #  - active_env_bin: `<env>/bin` of the kernel's conda env (the kernel
@@ -634,6 +784,28 @@ class HostDispatcher:
             else:
                 self._bash_generation_local.generation = previous
 
+    @contextmanager
+    def bind_action_context(self, context: dict[str, Any] | None):
+        """Attribute Host calls to one immutable action-ledger declaration."""
+
+        marker = object()
+        previous = getattr(self._action_context_local, "value", marker)
+        self._action_context_local.value = dict(context or {})
+        try:
+            yield
+        finally:
+            if previous is marker:
+                try:
+                    del self._action_context_local.value
+                except AttributeError:
+                    pass
+            else:
+                self._action_context_local.value = previous
+
+    def _current_action_context(self) -> dict[str, Any]:
+        value = getattr(self._action_context_local, "value", None)
+        return dict(value) if isinstance(value, dict) else {}
+
     @last_output.setter
     def last_output(self, value: dict | None) -> None:
         self._completion_service.last_output = value
@@ -641,6 +813,20 @@ class HostDispatcher:
     def set_workspace(self, path: str | Path) -> None:
         """Bind host-side file operations to the kernel's actual cwd."""
         self.workspace_path = Path(path).resolve()
+
+    def set_session_domain(self, domain: Any | None) -> None:
+        """Attach the Web runtime's shared filesystem-aware session service."""
+
+        self._session_service.set_domain(domain)
+
+    def set_child_execution_policy(
+        self, policy: ChildExecutionPolicy | None
+    ) -> None:
+        """Bind one additional fail-closed policy for a delegated child."""
+
+        self._child_execution_policy = policy
+        self._session_tool_catalog = None
+        self._session_tool_scope = None
 
     def tool_catalog(self) -> SessionToolCatalog:
         """Return the dynamic, session-local model/execution catalog."""
@@ -650,21 +836,37 @@ class HostDispatcher:
         if not session_id:
             # Built-ins remain usable for lightweight dispatcher tests, but a
             # model cannot define code without a durable session identity.
-            if self._session_tool_scope != ("", ""):
-                self._session_tool_catalog = SessionToolCatalog()
-                self._session_tool_scope = ("", "")
+            if self._session_tool_scope != ("", "", ""):
+                self._session_tool_catalog = SessionToolCatalog(
+                    tool_filter=(
+                        self._child_execution_policy.visible
+                        if self._child_execution_policy is not None
+                        else None
+                    )
+                )
+                self._session_tool_scope = ("", "", "")
             assert self._session_tool_catalog is not None
             return self._session_tool_catalog
         workspace = str(self._files.workspace())
-        identity = (session_id, workspace)
+        project_id = str(scope.get("project_id") or session_id).strip()
+        identity = (session_id, project_id, workspace)
         if self._session_tool_catalog is None or self._session_tool_scope != identity:
             safe_session = re.sub(r"[^A-Za-z0-9._-]+", "_", session_id)
             registry = DynamicToolRegistry(
                 session_id,
                 workspace,
                 self.cfg.data_dir / "dynamic-tools" / safe_session,
+                project_id=project_id,
+                scope_storage_dir=self.cfg.data_dir / "dynamic-tools" / "_scoped",
             )
-            self._session_tool_catalog = SessionToolCatalog(registry)
+            self._session_tool_catalog = SessionToolCatalog(
+                registry,
+                tool_filter=(
+                    self._child_execution_policy.visible
+                    if self._child_execution_policy is not None
+                    else None
+                ),
+            )
             self._session_tool_scope = identity
         return self._session_tool_catalog
 
@@ -736,6 +938,20 @@ class HostDispatcher:
         from openai4s.sdk.host import decode_args
 
         args = decode_args(args)
+        action_context = self._current_action_context()
+        try:
+            audit_resources = (
+                list(control_tool.resource_keys(args[0] if args else {}))
+                if control_tool is not None
+                else [f"host:{method}"]
+            )
+        except Exception:  # noqa: BLE001 - audit metadata stays total
+            audit_resources = [f"host:{method}"]
+        audit_side_effect = (
+            control_tool.side_effect_class
+            if control_tool is not None
+            else "runtime_mutation"
+        )
         # Project a visible tool call into a semantic activity step (begin) so the
         # UI shows "Searching the web" / "Editing report.md" / … rather than raw
         # Python. The matching "end" is emitted in the finally with the result.
@@ -763,7 +979,27 @@ class HostDispatcher:
         ok = True
         result = None
         deferred_step = False
+        permission_decision_id = None
         try:
+            child_decision = None
+            if self._child_execution_policy is not None:
+                if not self._child_execution_policy.allows(method, control_tool):
+                    result = {
+                        "error": "Capability denied by delegated child policy: "
+                        f"{method}"
+                    }
+                    ok = False
+                    return result
+                child_decision = self._child_execution_policy.decision(
+                    method, control_tool
+                )
+                if child_decision == "deny":
+                    result = {
+                        "error": "Permission denied by delegated child policy: "
+                        f"{method}"
+                    }
+                    ok = False
+                    return result
             # opencode-style permission gate: block on user approval for
             # risk-bearing tools. Covers this dispatcher (foreground + background
             # cells) and, via the process-wide broker keyed by root_frame_id,
@@ -774,7 +1010,7 @@ class HostDispatcher:
                 control_tool.requires_approval
                 if control_tool is not None
                 else method in GATEABLE_TOOLS
-            )
+            ) or child_decision == "ask"
             secret_target = (
                 control_tool.secret_path(args[0] if args else {})
                 if control_tool is not None
@@ -803,6 +1039,14 @@ class HostDispatcher:
                     method=permission_method,
                     target=target,
                     view=view,
+                    action_group_id=action_context.get("action_group_id"),
+                    action_id=action_context.get("action_id"),
+                    tool_call_id=action_context.get("tool_call_id"),
+                    side_effect_class=audit_side_effect,
+                    resource_keys=audit_resources,
+                )
+                permission_decision_id = gate.get("decision_id") or gate.get(
+                    "continuation_decision_id"
                 )
                 if not gate.get("allow", True):
                     msg = gate.get("message") or "denied by user"
@@ -826,7 +1070,16 @@ class HostDispatcher:
             raise
         finally:
             self.store.log_host_call(
-                method=method, args=args, ok=ok, frame_id=self.frame_id
+                method=method,
+                args=args,
+                ok=ok,
+                frame_id=self.frame_id,
+                result=result,
+                action_group_id=action_context.get("action_group_id"),
+                action_id=action_context.get("action_id"),
+                permission_decision_id=permission_decision_id,
+                side_effect_class=audit_side_effect,
+                resource_keys=audit_resources,
             )
             if step_id is not None and self.on_step is not None and not deferred_step:
                 try:
@@ -846,7 +1099,12 @@ class HostDispatcher:
             # produce a reproducible value to replay). Secret-bearing args
             # (credentials_set) are never taped — an exported notebook must not
             # carry a plaintext credential.
-            if self.recorder is not None and ok and method not in SECRET_ARG_HOST_CALLS:
+            if (
+                self.recorder is not None
+                and ok
+                and method not in SECRET_ARG_HOST_CALLS
+                and method not in DERIVABLE_HOST_CALLS
+            ):
                 try:
                     self.recorder.record(method, args, result)
                 except Exception:  # noqa: BLE001 - taping must never break a run
@@ -1003,6 +1261,27 @@ class HostDispatcher:
     def _m_register_remote_capability(self, spec: dict) -> dict:
         return self._remote_capability_service.register(spec)
 
+    def _m_search_capabilities(self, spec: dict) -> dict:
+        return self.tool_catalog().search_capabilities(
+            str(spec.get("query") or "")
+        )
+
+    # --- current-session orchestration ---------------------------------
+    def _m_session_status(self, spec: dict | None = None) -> dict:
+        return self._session_service.status(spec or {})
+
+    def _m_session_create_checkpoint(self, spec: dict) -> dict:
+        return self._session_service.create_checkpoint(spec)
+
+    def _m_session_fork(self, spec: dict) -> dict:
+        return self._session_service.fork_session(spec)
+
+    def _m_session_revert_preview(self, spec: dict) -> dict:
+        return self._session_service.revert_preview(spec)
+
+    def _m_session_pending_permissions(self, spec: dict | None = None) -> dict:
+        return self._session_service.pending_permissions(spec or {})
+
     # --- session dynamic tools -------------------------------------------
     def _m_dynamic_tool_define(self, spec: dict) -> dict:
         return self.tool_catalog().define(spec, approved=True)
@@ -1015,6 +1294,30 @@ class HostDispatcher:
         # Reaching this method means the class-based lifecycle Tool has already
         # passed HostDispatcher's permission/approval envelope.
         return self.tool_catalog().promote(
+            str(spec.get("name") or ""),
+            str(spec.get("scope") or ""),
+            approved=True,
+        )
+
+    def _m_dynamic_tool_versions(self, spec: dict | None = None) -> dict:
+        value = spec or {}
+        return self.tool_catalog().list_dynamic_versions(
+            name=(str(value["name"]) if value.get("name") else None),
+            scope=(str(value["scope"]) if value.get("scope") else None),
+        )
+
+    def _m_dynamic_tool_activate(self, spec: dict) -> dict:
+        # The concrete class owns schema/policy; reaching this adapter means the
+        # Host permission envelope approved the exact scope/name/version target.
+        return self.tool_catalog().activate_dynamic_version(
+            str(spec.get("name") or ""),
+            str(spec.get("scope") or ""),
+            str(spec.get("manifest_id") or ""),
+            approved=True,
+        )
+
+    def _m_dynamic_tool_rollback(self, spec: dict) -> dict:
+        return self.tool_catalog().rollback_dynamic_version(
             str(spec.get("name") or ""),
             str(spec.get("scope") or ""),
             approved=True,
@@ -1041,7 +1344,7 @@ class HostDispatcher:
     def _m_capabilities(self) -> dict:
         from openai4s import webtools
 
-        return {
+        result = {
             "llm": True,
             "query": True,
             "artifacts": True,
@@ -1067,6 +1370,36 @@ class HostDispatcher:
             "model": self.cfg.llm.model,
             "context_window": self.cfg.context_window_tokens,
         }
+        policy = self._child_execution_policy
+        if policy is not None and policy.restricted:
+            aliases = {
+                "llm": "llm",
+                "query": "data",
+                "artifacts": "artifacts",
+                "lineage": "artifacts",
+                "delegate": "delegation",
+                "skills": "skills",
+                "mcp": "mcp",
+                "credentials": "credentials",
+                "compute": "compute",
+                "remote_gpu": "remote",
+                "bash": "bash",
+                "files": "files",
+                "grep": "read_file",
+                "glob": "read_file",
+                "todo": "workflow",
+                "web_search": "web",
+                "web_fetch": "web",
+                "network": "network",
+            }
+            for key, alias in aliases.items():
+                if (
+                    not policy.allows_alias(alias)
+                    or policy.decision(alias) == "deny"
+                ):
+                    result[key] = False
+            result["delegated_policy"] = policy.public()
+        return result
 
     # --- opencode-parity harness tools -----------------------------------
     # read_file / write_file / edit_file / glob / grep / list_dir / web_fetch /
@@ -1218,6 +1551,9 @@ class HostDispatcher:
     def _m_plan_read(self, *_a: Any) -> dict:
         return self._progress_service.plan_read()
 
+    def _m_review_status(self, *_a: Any) -> dict:
+        return self._progress_service.review_status()
+
     # --- environments / dependencies (reference 'list/create env' steps) -----
     def _current_env_name(self) -> str:
         """Best-effort compatibility helper for the active Python env name."""
@@ -1321,6 +1657,15 @@ class HostDispatcher:
     def _m_save_artifact(self, spec: dict) -> dict:
         return self._data_service.save_artifact(spec)
 
+    def _m_get_artifact_metadata(self, spec: dict) -> dict:
+        return self._data_service.artifact_metadata(spec)
+
+    def _m_list_artifact_versions(self, spec: dict) -> dict:
+        return self._data_service.artifact_versions(spec)
+
+    def _m_restore_artifact_version(self, spec: dict) -> dict:
+        return self._data_service.restore_artifact_version(spec)
+
     def _m_view_image(self, spec: dict) -> dict:
         return self._data_service.view_image(spec)
 
@@ -1384,11 +1729,40 @@ class HostDispatcher:
         return self._endpoint_service.probe(name)
 
     # --- credentials (never persisted) ----------------------------
+    def _credential_binding(self) -> str:
+        context = self._current_action_context()
+        binding = {
+            key: value
+            for key, value in (
+                ("frame_id", self.frame_id),
+                ("generation", self._current_bash_generation()),
+                ("action_group_id", context.get("action_group_id")),
+                ("action_id", context.get("action_id")),
+                ("tool_call_id", context.get("tool_call_id")),
+            )
+            if value is not None
+        }
+        return json.dumps(binding, sort_keys=True, separators=(",", ":"))
+
     def _m_credentials_set(self, spec: dict) -> dict:
         return self._credential_service.set(spec)
 
     def _m_credentials_get(self, name: str) -> dict:
-        return self._credential_service.get(name)
+        return self._credential_service.get(name, binding=self._credential_binding())
+
+    def _m_credentials_issue(self, spec: dict) -> dict:
+        return self._credential_service.issue(
+            str(spec.get("name") or ""),
+            purpose=str(spec.get("purpose") or "host credential access"),
+            binding=self._credential_binding(),
+            ttl_seconds=float(spec.get("ttl_seconds") or 30.0),
+        )
+
+    def _m_credentials_redeem(self, token: str) -> dict:
+        return self._credential_service.redeem(
+            token,
+            binding=self._credential_binding(),
+        )
 
     def _m_credentials_list(self, *_a: Any) -> list:
         return self._credential_service.list()
@@ -1402,6 +1776,18 @@ class HostDispatcher:
 
     def _m_mcp_tools(self, server: str) -> Any:
         return self._mcp_service.tools(server)
+
+    def _m_mcp_resources(self, spec: dict) -> Any:
+        return self._mcp_service.resources(spec)
+
+    def _m_mcp_resource_read(self, spec: dict) -> Any:
+        return self._mcp_service.read_resource(spec)
+
+    def _m_mcp_prompts(self, spec: dict) -> Any:
+        return self._mcp_service.prompts(spec)
+
+    def _m_mcp_prompt_get(self, spec: dict) -> Any:
+        return self._mcp_service.get_prompt(spec)
 
     def _m_mcp_call(self, spec: dict) -> Any:
         return self._mcp_service.call(spec)
@@ -1479,6 +1865,15 @@ class HostDispatcher:
 
     def _m_skills_delete(self, name: str) -> dict:
         return self._skill_service.delete(name)
+
+    def _m_skills_status(self, spec: dict) -> dict:
+        return self._skill_service.status(spec)
+
+    def _m_skills_history(self, spec: dict) -> dict:
+        return self._skill_service.history(spec)
+
+    def _m_skills_rollback(self, spec: dict) -> dict:
+        return self._skill_service.rollback(spec)
 
 
 def build_dispatcher(

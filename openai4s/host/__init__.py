@@ -11,6 +11,7 @@ from openai4s.host.mcp import MCPService
 from openai4s.host.progress import ProgressService
 from openai4s.host.remote_capabilities import RemoteCapabilityService
 from openai4s.host.remote_science import RemoteScienceService
+from openai4s.host.session import SessionControlService
 from openai4s.host.skills import SkillService
 
 __all__ = [
@@ -24,6 +25,7 @@ __all__ = [
     "ProgressService",
     "RemoteCapabilityService",
     "RemoteScienceService",
+    "SessionControlService",
     "SkillService",
     "WorkspaceFileService",
     "is_secret_path",

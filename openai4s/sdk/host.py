@@ -22,6 +22,12 @@ from openai4s.sdk.compute import (
     _relativize_local,
 )
 
+# Version of the worker-side Host RPC capability contract recorded in every
+# Kernel bootstrap manifest.  Bump this only for a compatibility-affecting
+# surface change; recovery compares the value observed inside the candidate
+# worker with the frozen checkpoint value.
+HOST_CAPABILITY_VERSION = "1"
+
 # --- wire codec: SDK snake_case <-> wire camelCase (strict) -----
 #
 # openai4s's SDK layer speaks snake_case, but the host-side schema validator
@@ -156,6 +162,32 @@ class _Skills:
         """Delete a skill dir. Read-only origins (openai4s) are rejected."""
         return self._call("skills_delete", [name])
 
+    def status(self, name: str, scope: str = "personal") -> dict:
+        """Inspect the active version for a personal/current-project Skill."""
+
+        return self._call("skills_status", [{"name": name, "scope": scope}])
+
+    def history(
+        self,
+        name: str,
+        scope: str = "personal",
+        limit: int = 50,
+    ) -> dict:
+        """List immutable manifests and lifecycle events without source bytes."""
+
+        return self._call(
+            "skills_history",
+            [{"name": name, "scope": scope, "limit": int(limit)}],
+        )
+
+    def rollback(self, name: str, version_id: str, scope: str = "personal") -> dict:
+        """Request approval, then activate an exact retained writable version."""
+
+        return self._call(
+            "skills_rollback",
+            [{"name": name, "scope": scope, "version_id": version_id}],
+        )
+
 
 class _Query:
     """host.query — read-only SQL over the SQLite data model.
@@ -275,7 +307,23 @@ class _Credentials:
         return self._call("credentials_set", [{"name": name, "value": value}])
 
     def get(self, name: str) -> str:
-        return self._call("credentials_get", [name])["value"]
+        lease = self.issue(name)
+        return self.redeem(lease["token"])["value"]
+
+    def issue(
+        self,
+        name: str,
+        *,
+        purpose: str = "host credential access",
+        ttl_seconds: float = 30.0,
+    ) -> dict:
+        return self._call(
+            "credentials_issue",
+            [{"name": name, "purpose": purpose, "ttl_seconds": ttl_seconds}],
+        )
+
+    def redeem(self, token: str) -> dict:
+        return self._call("credentials_redeem", [token])
 
     def list(self) -> list[str]:
         return self._call("credentials_list", [])
@@ -294,6 +342,39 @@ class _Mcp:
     def tools(self, server: str) -> Any:
         """Discover a connector's tools: {tools: [{name, description, inputSchema}]}."""
         return self._call("mcp_tools", [server])
+
+    def resources(self, server: str, *, cursor: str | None = None) -> dict:
+        """Discover URI-addressed resources and an optional nextCursor."""
+        return self._call(
+            "mcp_resources",
+            [{"server": server, "cursor": cursor}],
+        )
+
+    def read_resource(self, server: str, uri: str) -> dict:
+        """Read one MCP resource as its standard ``contents`` blocks."""
+        return self._call(
+            "mcp_resource_read",
+            [{"server": server, "uri": uri}],
+        )
+
+    def prompts(self, server: str, *, cursor: str | None = None) -> dict:
+        """Discover reusable prompts and an optional nextCursor."""
+        return self._call(
+            "mcp_prompts",
+            [{"server": server, "cursor": cursor}],
+        )
+
+    def get_prompt(
+        self,
+        server: str,
+        name: str,
+        arguments: dict[str, str] | None = None,
+    ) -> dict:
+        """Render one MCP prompt into its standard message blocks."""
+        return self._call(
+            "mcp_prompt_get",
+            [{"server": server, "name": name, "arguments": arguments or {}}],
+        )
 
     def call(self, server: str, tool: str, args: dict | None = None) -> Any:
         """Invoke a connector tool → {is_error, text, raw}."""
@@ -362,7 +443,6 @@ class _App:
 # provisions a bring-your-own-compute sandbox (e.g. "byoc:nvidia").
 # Every method routes through host_call("compute_<op>", [kw])
 # back to the host-side dispatcher, which owns the real remote work.
-
 
 
 class _Host:
@@ -612,6 +692,12 @@ class _Host:
         name: str | None = None,
         context_summary: str | None = None,
         output_schema: dict | None = None,
+        steps: int | None = None,
+        max_steps: int | None = None,
+        max_turns: int | None = None,
+        permissions: dict[str, str] | None = None,
+        capabilities: list[str] | None = None,
+        unrestricted: bool | None = None,
         wait: bool = True,
     ) -> Any:
         """Spawn sub-agent(s). str/dict -> single; list -> list of results.
@@ -629,6 +715,12 @@ class _Host:
                     "name": name,
                     "context_summary": context_summary,
                     "output_schema": output_schema,
+                    "steps": steps,
+                    "max_steps": max_steps,
+                    "max_turns": max_turns,
+                    "permissions": permissions,
+                    "capabilities": capabilities,
+                    "unrestricted": unrestricted,
                     "wait": wait,
                 }
             ],
@@ -943,6 +1035,10 @@ class _Host:
     def plan_read(self) -> dict:
         """Read the current session's approved plan (steps + live status)."""
         return self._call("plan_read", [])
+
+    def review_status(self) -> dict:
+        """Read evidence-review configuration and recent bounded verdicts."""
+        return self._call("review_status", [])
 
     def remember(self, content: str, *, block: str = "general") -> dict:
         """Persist a durable fact the daemon re-injects into future sessions

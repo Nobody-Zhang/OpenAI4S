@@ -214,12 +214,32 @@ def count_code_blocks(text: str) -> int:
     return n
 
 
+def has_incomplete_code_block(text: str) -> bool:
+    """Return whether the reply ended inside a Python/R action fence."""
+
+    return any(
+        not block.closed
+        and block.fence_char == "`"
+        and (block.info in PYTHON_INFOS or block.info in R_INFOS)
+        for block in scan_fenced_blocks(text)
+    )
+
+
 # Fed back when a working turn contains neither a cell nor a tool call.
 NO_CODE_NUDGE = (
     "[system] No executable action found. For a completed conversational or "
     "tool-only answer, call finalize_response as the ONLY tool call. For "
     "scientific work, reply with a ```python cell (or ```r for R) and call "
     "host.submit_output(...) from a python cell when that work is done."
+)
+
+NO_NATIVE_COMPLETION_NUDGE = (
+    "[system] Prose is not a completion signal, and this model endpoint is "
+    "configured without native tool calling. If the task is complete, use one "
+    "small, complete ```python cell that calls host.submit_output(...) directly "
+    "(the compatibility path will start Python). If scientific work remains, "
+    "continue with one complete ```python or ```r cell and submit only after "
+    "the real result is ready."
 )
 
 # Appended to the observation when a reply batched several cells (only the
@@ -230,4 +250,11 @@ MULTI_CELL_NOTE = (
     "results you described for them are not real. Do not assume they "
     "succeeded: continue with the NEXT single cell based on the real "
     "observation above."
+)
+
+INCOMPLETE_CELL_NUDGE = (
+    "[system] The previous model reply ended inside an incomplete code cell, "
+    "so NOTHING from that cell was executed. Send one smaller, complete "
+    "```python or ```r cell beginning before its first required dependency. "
+    "Do not continue from or paste only the truncated tail."
 )

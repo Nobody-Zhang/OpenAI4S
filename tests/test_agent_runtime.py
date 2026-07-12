@@ -262,6 +262,26 @@ def test_code_observation_notes_extra_cells_and_only_submit_sets_completion():
     assert second.stop_reason is None
 
 
+def test_code_observation_notes_an_incomplete_tail_after_the_executed_cell():
+    kernel = FakeKernel(
+        {"stdout": "first\n", "stderr": "", "error": None, "usage": {}}
+    )
+    executor = _executor(kernel=kernel, dispatcher=FakeDispatcher())
+    reply = ModelReply(
+        content=(
+            "```python\nprint('first')\n```\n"
+            "```r\nresult <- unfinished(\n"
+        )
+    )
+
+    outcome = executor.execute(
+        CodeCell("python", "print('first')\n"), reply, RunState([])
+    )
+
+    assert kernel.calls == [("print('first')\n", "agent")]
+    assert runtime.MULTI_CELL_NOTE in outcome.observation
+
+
 def test_none_action_keeps_legacy_tool_fallback_as_user_history(monkeypatch):
     calls = []
 
@@ -292,6 +312,39 @@ def test_none_action_keeps_legacy_tool_fallback_as_user_history(monkeypatch):
     )
 
 
+def test_none_action_can_fall_back_to_code_when_native_tools_are_unavailable():
+    executor = LocalActionExecutor(
+        FakeKernel(),
+        FakeDispatcher(),
+        lambda code, messages: None,
+        lambda code: {"stdout": "R", "error": None},
+        prose_nudge=runtime.NO_NATIVE_COMPLETION_NUDGE,
+    )
+
+    outcome = executor.execute(
+        None, ModelReply(content="plain prose"), RunState([])
+    )
+
+    assert outcome.observation == runtime.NO_NATIVE_COMPLETION_NUDGE
+    assert "host.submit_output" in outcome.observation
+    assert "finalize_response" not in outcome.observation
+
+
+def test_incomplete_cell_is_not_executed_and_requests_a_full_replacement():
+    kernel = FakeKernel()
+    executor = _executor(kernel=kernel, dispatcher=FakeDispatcher())
+
+    outcome = executor.execute(
+        None,
+        ModelReply(content="```python\nvalue = compute(\n"),
+        RunState([]),
+    )
+
+    assert outcome.observation == runtime.INCOMPLETE_CELL_NUDGE
+    assert "NOTHING" in outcome.observation
+    assert kernel.calls == []
+
+
 def test_compaction_expands_tail_to_keep_assistant_tool_group_atomic(monkeypatch):
     assistant = {
         "role": "assistant",
@@ -312,7 +365,9 @@ def test_compaction_expands_tail_to_keep_assistant_tool_group_atomic(monkeypatch
     ]
     captured = {}
 
-    monkeypatch.setattr(runtime, "should_compact", lambda messages, cfg: True)
+    monkeypatch.setattr(
+        runtime, "should_compact", lambda messages, cfg, **kwargs: True
+    )
 
     def fake_compact(
         messages,
@@ -322,6 +377,7 @@ def test_compaction_expands_tail_to_keep_assistant_tool_group_atomic(monkeypatch
         archive_dir,
         archive_metadata,
         large_output_chars,
+        **_kwargs,
     ):
         captured.update(
             keep_recent=keep_recent,
@@ -354,7 +410,9 @@ def test_compaction_circuit_breaker_stops_repeated_low_yield_calls(monkeypatch):
         {"role": "assistant", "content": "recent"},
     ]
     attempts = []
-    monkeypatch.setattr(runtime, "should_compact", lambda messages, cfg: True)
+    monkeypatch.setattr(
+        runtime, "should_compact", lambda messages, cfg, **kwargs: True
+    )
 
     def no_yield(messages, cfg, **kwargs):
         attempts.append(kwargs)
@@ -427,5 +485,17 @@ def test_format_observation_preserves_stable_error_and_usage_protocol():
         "stdout:\nvalue\n"
         "stderr:\nwarning\n"
         "ERROR (cell line 3):\nboom\n"
+        "[system] The cell stopped at the first exception. Statements after "
+        "that line did not run, and their variables/files must not be assumed "
+        "to exist. Repair with one complete cell beginning before the failed "
+        "dependency; never send only a continuation fragment.\n"
         "[usage wall=1.0s cpu=0.5s rss=64kb]"
     )
+
+
+def test_format_observation_reminds_models_that_host_is_injected():
+    observation = format_observation(
+        {"error": "ModuleNotFoundError: No module named 'host'"}
+    )
+
+    assert "never `import host`" in observation

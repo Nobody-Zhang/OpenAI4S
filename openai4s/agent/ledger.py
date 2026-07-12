@@ -20,6 +20,11 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
+from openai4s.llm.capabilities import (
+    calculate_usage_cost_usd,
+    get_model_capabilities,
+)
+from openai4s.storage.branch_projection import project_branch_records
 from openai4s.tools import get_tool
 
 from .actions import (
@@ -346,6 +351,7 @@ class RuntimeActionLedger:
             raise RuntimeError("ActionRouted arrived before ReplyReceived")
         reply = self._reply
         message, wire_state = _sanitize_reply(reply, self.tool_resolver)
+        usage, cost_usd = self._reply_accounting(reply)
         self._action = action
         if isinstance(action, FinalizeAction):
             call = action.call
@@ -364,6 +370,8 @@ class RuntimeActionLedger:
                     else _redact_free_text(reply.content, frozenset())
                 ),
                 assistant_message=message,
+                usage=usage,
+                cost_usd=cost_usd,
             )
             self.store.append_action_event(
                 group_id=group["group_id"],
@@ -411,6 +419,8 @@ class RuntimeActionLedger:
                     else _redact_free_text(reply.content, frozenset())
                 ),
                 assistant_message=message,
+                usage=usage,
+                cost_usd=cost_usd,
                 events=events,
             )
         else:
@@ -429,6 +439,8 @@ class RuntimeActionLedger:
                     else _redact_free_text(reply.content, frozenset())
                 ),
                 assistant_message=message,
+                usage=usage,
+                cost_usd=cost_usd,
             )
             proposed = (
                 {"language": action.language, "code": action.code}
@@ -447,6 +459,46 @@ class RuntimeActionLedger:
                 ),
             )
         self.current_group_id = group["group_id"]
+
+    def _reply_accounting(
+        self, reply: ModelReply
+    ) -> tuple[dict[str, int] | None, float | None]:
+        """Return canonical counters and a price-derived charge, if known."""
+
+        allowed = (
+            "input_tokens",
+            "output_tokens",
+            "cache_read",
+            "cache_write",
+            "reasoning_tokens",
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+        )
+        usage: dict[str, int] = {}
+        source = reply.usage if isinstance(reply.usage, Mapping) else {}
+        for key in allowed:
+            value = source.get(key)
+            if value is None or isinstance(value, bool):
+                continue
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if parsed >= 0:
+                usage[key] = parsed
+        if not usage:
+            return None, None
+        if not self.provider:
+            return usage, None
+        try:
+            capabilities = get_model_capabilities(self.provider, self.model)
+            cost_usd = calculate_usage_cost_usd(usage, capabilities.cost)
+        except (LookupError, TypeError, ValueError):
+            # Accounting metadata must never make an otherwise valid action
+            # fail. Unknown provider/model pricing remains visibly unknown.
+            cost_usd = None
+        return usage, cost_usd
 
     def _append_outcome(self, event: OutcomeProduced) -> None:
         group_id = self.current_group_id
@@ -718,9 +770,50 @@ def reduce_action_groups(groups: Sequence[Mapping[str, Any]]) -> list[dict[str, 
     return history
 
 
-def restore_action_history(store: LedgerStore, root_frame_id: str) -> list[dict[str, Any]]:
-    """Load and reduce the canonical main branch for one Web session."""
-    return reduce_action_groups(store.list_action_groups(root_frame_id))
+def branch_action_groups(
+    store: LedgerStore,
+    root_frame_id: str,
+    *,
+    branch_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return one branch's inherited prefix plus its local append-only groups.
+
+    A fork does not copy provider wire history.  Its immutable base checkpoint
+    instead freezes the parent branch's local ``action_cursor``.  Recursively
+    reducing that prefix and then the child-local groups restores exactly the
+    context visible at the fork without admitting later parent actions.
+    """
+
+    get_branch = getattr(store, "get_session_branch", None)
+    get_checkpoint = getattr(store, "get_session_checkpoint", None)
+    if not callable(get_branch) or not callable(get_checkpoint):
+        if (branch_id or root_frame_id) != root_frame_id:
+            raise ValueError("branch history requires checkpoint repository access")
+        return store.list_action_groups(root_frame_id, branch_id=root_frame_id)
+    return project_branch_records(
+        store,
+        root_frame_id,
+        branch_id or root_frame_id,
+        list_local=lambda selected: store.list_action_groups(
+            root_frame_id,
+            branch_id=selected,
+        ),
+        record_position=lambda group: int(group.get("ordinal") or 0),
+        cursor_key="action_cursor",
+    )
+
+
+def restore_action_history(
+    store: LedgerStore,
+    root_frame_id: str,
+    *,
+    branch_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Load and reduce the canonical provider history for one branch."""
+
+    return reduce_action_groups(
+        branch_action_groups(store, root_frame_id, branch_id=branch_id)
+    )
 
 
 def new_turn_id() -> str:
@@ -730,6 +823,7 @@ def new_turn_id() -> str:
 __all__ = [
     "REDACTED",
     "RuntimeActionLedger",
+    "branch_action_groups",
     "new_turn_id",
     "redact_tool_call",
     "reduce_action_groups",

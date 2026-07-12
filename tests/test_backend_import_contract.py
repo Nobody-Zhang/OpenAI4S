@@ -36,7 +36,14 @@ FACADE_EXPORTS: dict[str, frozenset[str]] = {
         {"SECRET_ARG_HOST_CALLS", "Store", "get_store"}
     ),
     "openai4s.llm": frozenset(
-        {"ARK_PLAN_MODELS", "LLMError", "PROVIDERS", "chat", "supports_vision"}
+        {
+            "ARK_PLAN_MODELS",
+            "LLMError",
+            "PROVIDERS",
+            "chat",
+            "get_model_capabilities",
+            "supports_vision",
+        }
     ),
     "openai4s.webtools": frozenset(
         {"NetworkDisabled", "network_allowed", "web_fetch", "web_search"}

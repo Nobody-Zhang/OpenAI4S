@@ -259,6 +259,11 @@ class PermissionBroker:
         target: str = "",
         view: tuple | None = None,
         project_id: str | None = None,
+        action_group_id: str | None = None,
+        action_id: str | None = None,
+        tool_call_id: str | None = None,
+        side_effect_class: str | None = None,
+        resource_keys: list[str] | tuple[str, ...] | None = None,
         timeout: float | None = None,
     ) -> dict:
         # Resolve the conversation identity + project from the dispatcher's frame
@@ -331,6 +336,11 @@ class PermissionBroker:
             "suggested_patterns": suggest_patterns(method, target),
             "scopes": list(_SCOPES),
             "sub_agent": bool(frame_id and root and frame_id != root),
+            "action_group_id": action_group_id,
+            "action_id": action_id,
+            "tool_call_id": tool_call_id,
+            "side_effect_class": side_effect_class,
+            "resource_keys": list(resource_keys or ()),
         }
         wait_seconds = timeout if timeout is not None else self.DEFAULT_TIMEOUT
         try:
@@ -339,6 +349,11 @@ class PermissionBroker:
                 root_frame_id=root,
                 frame_id=frame_id,
                 project_id=proj or "default",
+                action_group_id=action_group_id,
+                action_id=action_id,
+                tool_call_id=tool_call_id,
+                side_effect_class=side_effect_class,
+                resource_keys=resource_keys,
                 tool=method,
                 target=target,
                 payload=payload,
@@ -376,7 +391,11 @@ class PermissionBroker:
             except Exception:  # noqa: BLE001
                 allowed = False
                 message = "approval persistence failed closed"
-            return {"allow": allowed, **({} if allowed else {"message": message})}
+            return {
+                "allow": allowed,
+                "decision_id": did,
+                **({} if allowed else {"message": message}),
+            }
 
         cancel_ev = chan.get("cancel")
         if cancel_ev is not None and cancel_ev.is_set():
@@ -475,8 +494,12 @@ class PermissionBroker:
             except Exception:  # noqa: BLE001
                 pass
         if pend.allow:
-            return {"allow": True}
-        return {"allow": False, "message": pend.message or "denied by user"}
+            return {"allow": True, "decision_id": did}
+        return {
+            "allow": False,
+            "decision_id": did,
+            "message": pend.message or "denied by user",
+        }
 
     # --- decision + cancel (called by the web gateway / HTTP thread) ------
     def resolve(

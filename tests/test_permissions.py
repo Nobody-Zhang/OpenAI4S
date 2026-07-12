@@ -685,6 +685,82 @@ def test_dispatcher_gate_allows_and_runs_write_file(tmp_path):
         broker().unregister_channel(frame)
 
 
+def test_dispatcher_permission_carries_exact_action_attribution(tmp_path):
+    disp, frame, st = _dispatcher(tmp_path)
+    st.set_permission_rule(
+        scope="conversation",
+        scope_id=frame,
+        tool="write_file",
+        pattern="*",
+        decision="ask",
+    )
+    group = st.append_action_group(
+        root_frame_id=frame,
+        turn_id="turn-attributed",
+        kind="native_tools",
+    )
+    st.append_action_event(
+        group_id=group["group_id"],
+        type="proposed",
+        action_id="call-write",
+        tool_call_id="call-write",
+        side_effect_class="workspace_write",
+        resource_keys=["workspace:attributed.txt"],
+    )
+    events = []
+    broker().register_channel(frame, lambda event: events.append(event))
+    try:
+        out = {}
+
+        def run():
+            with disp.bind_action_context(
+                {
+                    "action_group_id": group["group_id"],
+                    "action_id": "call-write",
+                    "tool_call_id": "call-write",
+                }
+            ):
+                out["result"] = disp(
+                    "write_file",
+                    [{"path": "attributed.txt", "content": "ok"}],
+                )
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        ask = _wait_ask(events)
+        assert ask["action_group_id"] == group["group_id"]
+        assert ask["action_id"] == "call-write"
+        assert ask["resource_keys"] == ["workspace:attributed.txt"]
+        broker().resolve(ask["decision_id"], allow=True, scope="once")
+        thread.join(timeout=8)
+        assert out["result"].get("path")
+
+        request = st.get_permission_request(ask["decision_id"])
+        assert request["action_group_id"] == group["group_id"]
+        assert request["tool_call_id"] == "call-write"
+        assert request["side_effect_class"] == "workspace_write"
+        assert request["resource_keys"] == ["workspace:attributed.txt"]
+        assert [
+            event["type"]
+            for event in st.get_action_group(group["group_id"])["events"]
+        ] == ["proposed", "permission_pending", "permission_resolved"]
+        audit = st._conn.execute(
+            "SELECT action_group_id,action_id,permission_decision_id,"
+            "side_effect_class,resource_keys,result_preview,result_digest "
+            "FROM host_call_log WHERE method='write_file' "
+            "ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        assert audit["action_group_id"] == group["group_id"]
+        assert audit["action_id"] == "call-write"
+        assert audit["permission_decision_id"] == ask["decision_id"]
+        assert audit["side_effect_class"] == "workspace_write"
+        assert json.loads(audit["resource_keys"]) == ["workspace:attributed.txt"]
+        assert json.loads(audit["result_preview"])["type"] == "object"
+        assert len(audit["result_digest"]) == 64
+    finally:
+        broker().unregister_channel(frame)
+
+
 def test_new_control_tool_class_auto_routes_and_defaults_to_approval(tmp_path):
     from openai4s.tools import registry as registry_mod
     from openai4s.tools.base import Tool

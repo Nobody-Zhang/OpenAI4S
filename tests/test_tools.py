@@ -110,9 +110,7 @@ def test_concrete_tool_instances_do_not_share_mutable_schemas():
 
 
 def test_control_tool_classes_own_their_security_policy():
-    approval_methods = {
-        tool.host_method for tool in REGISTRY if tool.requires_approval
-    }
+    approval_methods = {tool.host_method for tool in REGISTRY if tool.requires_approval}
     assert approval_methods == {
         "list_dir",
         "read_file",
@@ -124,20 +122,28 @@ def test_control_tool_classes_own_their_security_policy():
         "web_search",
         "web_fetch",
         "save_artifact",
+        "restore_artifact_version",
         "delegate",
+        "mcp_resource_read",
+        "mcp_prompt_get",
         "mcp_call",
         "request_network_access",
         "register_remote_capability",
+        "compute_submit",
         "dynamic_tool_define",
         "dynamic_tool_promote",
+        "dynamic_tool_activate",
+        "dynamic_tool_rollback",
+        "skills_rollback",
         "exec_background",
     }
     assert get_tool("read_text_file").secret_path({"path": "config/.env"}) == (
         "config/.env"
     )
-    assert get_tool("web_fetch").permission_target(
-        {"url": "https://www.example.org/a"}
-    ) == "example.org"
+    assert (
+        get_tool("web_fetch").permission_target({"url": "https://www.example.org/a"})
+        == "example.org"
+    )
     assert get_tool("write_file").side_effect_class == "workspace_write"
     assert get_tool("env_use").side_effect_class == "runtime_mutation"
     assert get_tool("read_text_file").resource_keys({"path": "data/a.csv"}) == (

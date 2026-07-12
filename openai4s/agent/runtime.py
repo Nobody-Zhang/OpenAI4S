@@ -19,13 +19,16 @@ from openai4s.tools import (
 )
 
 from .actions import (
+    INCOMPLETE_CELL_NUDGE,
     MULTI_CELL_NOTE,
     NO_CODE_NUDGE,
+    NO_NATIVE_COMPLETION_NUDGE,
     Action,
     CodeCell,
     FinalizeAction,
     NativeToolBatch,
     count_code_blocks,
+    has_incomplete_code_block,
 )
 from .compaction import (
     DEFAULT_LARGE_OUTPUT_CHARS,
@@ -104,6 +107,12 @@ class CompactionPolicy:
     cfg: Any
     log: LogFn = _null_log
     metadata_provider: Callable[[RunState], Mapping[str, Any] | None] | None = None
+    tool_schema_provider: Callable[[RunState], Sequence[Mapping[str, Any]]] | None = None
+    context_budget_provider: Callable[[RunState], int | None] | None = None
+    artifact_archiver: Callable[
+        [Any, Mapping[str, Any], dict[str, Any]], Mapping[str, Any]
+    ] | None = None
+    archive_sink: Callable[[Mapping[str, Any]], Any] | None = None
     minimum_yield_ratio: float = 0.10
     max_low_yield_attempts: int = 2
     large_output_chars: int = DEFAULT_LARGE_OUTPUT_CHARS
@@ -117,16 +126,43 @@ class CompactionPolicy:
             raise ValueError("max_low_yield_attempts must be positive")
 
         metadata = self._metadata(state)
-        messages = externalize_large_outputs(
-            state.messages,
-            self.cfg.compaction_dir,
-            threshold_chars=self.large_output_chars,
-            archive_metadata=metadata,
-        )
-        before = estimate_context(messages)
+        try:
+            tool_schemas = tuple(
+                self.tool_schema_provider(state)
+                if self.tool_schema_provider is not None
+                else ()
+            )
+        except Exception:  # noqa: BLE001 - schema accounting is fail-soft
+            tool_schemas = ()
+        try:
+            context_budget = (
+                self.context_budget_provider(state)
+                if self.context_budget_provider is not None
+                else None
+            )
+        except Exception:  # noqa: BLE001 - config fallback remains available
+            context_budget = None
+        try:
+            messages = externalize_large_outputs(
+                state.messages,
+                self.cfg.compaction_dir,
+                threshold_chars=self.large_output_chars,
+                archive_metadata=metadata,
+                artifact_archiver=self.artifact_archiver,
+            )
+        except Exception as error:  # noqa: BLE001 - preserve the live context
+            state.metadata["last_externalization_error"] = str(error)[:500]
+            self.log(f"[context output kept inline] Artifact archive failed: {error}")
+            messages = state.messages
+        before = estimate_context(messages, tool_schemas)
         state.metadata["context_estimate"] = before.as_dict()
 
-        if not should_compact(messages, self.cfg):
+        if not should_compact(
+            messages,
+            self.cfg,
+            tool_schemas=tool_schemas,
+            context_budget=context_budget,
+        ):
             return messages
         if self.circuit_open:
             self.log(
@@ -135,15 +171,23 @@ class CompactionPolicy:
             )
             return messages
 
-        prepared = compact(
-            messages,
-            self.cfg,
-            keep_recent=safe_keep_recent(messages),
-            archive_dir=self.cfg.compaction_dir,
-            archive_metadata=metadata,
-            large_output_chars=self.large_output_chars,
-        )
-        after = estimate_context(prepared)
+        try:
+            prepared = compact(
+                messages,
+                self.cfg,
+                keep_recent=safe_keep_recent(messages),
+                archive_dir=self.cfg.compaction_dir,
+                archive_metadata=metadata,
+                large_output_chars=self.large_output_chars,
+                artifact_archiver=self.artifact_archiver,
+                archive_sink=self.archive_sink,
+                tool_schemas=tool_schemas,
+            )
+        except Exception as error:  # noqa: BLE001 - compaction cannot kill a run
+            state.metadata["last_compaction_error"] = str(error)[:500]
+            self.log(f"[compaction skipped] durable archive failed: {error}")
+            return messages
+        after = estimate_context(prepared, tool_schemas)
         gain = max(0, before.total - after.total)
         ratio = gain / max(1, before.total)
         state.metadata["context_estimate"] = after.as_dict()
@@ -193,6 +237,8 @@ class LocalActionExecutor:
     execute_r: Callable[[str], dict]
     log: LogFn = _null_log
     tool_catalog: Any = None
+    prose_nudge: str = NO_CODE_NUDGE
+    action_ledger: Any = None
 
     def execute(
         self, action: Action | None, reply: ModelReply, state: RunState
@@ -208,9 +254,26 @@ class LocalActionExecutor:
     def _execute_native(self, batch: NativeToolBatch) -> ExecutionOutcome:
         def invoke(call):
             payload = {"name": call.name, "arguments": call.arguments}
-            if self.tool_catalog is None:
-                return execute_tool_call(self.dispatcher, payload)
-            return execute_tool_call(self.dispatcher, payload, self.tool_catalog)
+            binder = getattr(self.dispatcher, "bind_action_context", None)
+
+            def execute():
+                if self.tool_catalog is None:
+                    return execute_tool_call(self.dispatcher, payload)
+                return execute_tool_call(
+                    self.dispatcher, payload, self.tool_catalog
+                )
+
+            if not callable(binder):
+                return execute()
+            group_id = getattr(self.action_ledger, "current_group_id", None)
+            with binder(
+                {
+                    "action_group_id": group_id,
+                    "action_id": call.id,
+                    "tool_call_id": call.id,
+                }
+            ):
+                return execute()
 
         if self.tool_catalog is None:
             return execute_native_batch(
@@ -239,10 +302,28 @@ class LocalActionExecutor:
         if action.language == "r":
             result = self.execute_r(action.code)
         else:
-            result = self.kernel.execute(action.code, origin="agent")
+            group_id = getattr(self.action_ledger, "current_group_id", None)
+            context = (
+                {
+                    "action_group_id": group_id,
+                    "action_id": f"{group_id}:action",
+                    "tool_call_id": None,
+                }
+                if group_id
+                else None
+            )
+            binder = getattr(self.kernel, "bind_action_context", None)
+            if callable(binder):
+                with binder(context):
+                    result = self.kernel.execute(action.code, origin="agent")
+            else:
+                result = self.kernel.execute(action.code, origin="agent")
             self._record_kernel_generation(state)
         observation = format_observation(result)
-        if count_code_blocks(reply.content) > 1:
+        if (
+            count_code_blocks(reply.content) > 1
+            or has_incomplete_code_block(reply.content)
+        ):
             observation += MULTI_CELL_NOTE
         completion = getattr(self.dispatcher, "last_output", None)
         return self._user_observation(observation, completion=completion)
@@ -273,8 +354,10 @@ class LocalActionExecutor:
                     errors,
                     self.tool_catalog,
                 )
+        elif has_incomplete_code_block(reply.content):
+            observation = INCOMPLETE_CELL_NUDGE
         else:
-            observation = NO_CODE_NUDGE
+            observation = self.prose_nudge
         return self._user_observation(observation)
 
     @staticmethod
@@ -325,6 +408,18 @@ def format_observation(result: dict) -> str:
         line = trace.get("error_lineno")
         location = f" (cell line {line})" if line else ""
         parts.append(f"ERROR{location}:\n{error.rstrip()}")
+        parts.append(
+            "[system] The cell stopped at the first exception. Statements "
+            "after that line did not run, and their variables/files must not "
+            "be assumed to exist. Repair with one complete cell beginning "
+            "before the failed dependency; never send only a continuation "
+            "fragment."
+        )
+        if "No module named 'host'" in str(error) or 'No module named "host"' in str(error):
+            parts.append(
+                "[system] `host` is a pre-injected Python singleton. Use it "
+                "directly; never `import host` or `from host import ...`."
+            )
     if not out and not err and not error:
         parts.append("(no output)")
     usage = result.get("usage") or {}

@@ -407,16 +407,34 @@ def test_context_estimate_accounts_for_structured_components_independently():
                 "tool_calls": [{"id": "c1", "name": "lookup", "arguments": {}}],
                 "wire_state": {"response_id": "resp-1", "cursor": 9},
             }
-        ]
+        ],
+        tool_schemas=[{"name": "lookup", "parameters": {"type": "object"}}],
     )
 
     assert estimate.text > 0
     assert estimate.images >= comp_mod.IMAGE_TOKEN_ESTIMATE
     assert estimate.tool_calls > 0
+    assert estimate.tool_schemas > 0
     assert estimate.wire_state > 0
-    assert estimate.total == sum(
-        (estimate.text, estimate.images, estimate.tool_calls, estimate.wire_state)
+    components = estimate.as_dict()
+    assert components.pop("total") == sum(components.values())
+
+
+def test_context_estimate_separates_tool_results_and_artifact_refs():
+    estimate = comp_mod.estimate_context(
+        [
+            {
+                "role": "tool",
+                "content": "large structured result",
+                "artifact_refs": [
+                    {"artifact_id": "a-1", "version_id": "v-1"}
+                ],
+            }
+        ]
     )
+    assert estimate.tool_results > 0
+    assert estimate.artifact_refs > 0
+    assert estimate.text == 0
 
 
 def test_large_tool_result_is_content_addressed_and_recoverable(tmp_path):
@@ -448,6 +466,24 @@ def test_large_tool_result_is_content_addressed_and_recoverable(tmp_path):
     blob = json.loads((tmp_path / reference["archive_ref"]).read_text("utf-8"))
     assert blob["metadata"]["branch"] == "branch-a"
     assert blob["metadata"]["ledger_cursor"] == 41
+
+
+def test_large_tool_result_can_become_a_versioned_artifact_reference():
+    calls = []
+
+    def archive(content, message, metadata):
+        calls.append((content, message, metadata))
+        return {"artifact_id": "a-context", "version_id": "v-context"}
+
+    projected = comp_mod.externalize_large_outputs(
+        [{"role": "tool", "content": "x" * 100}],
+        None,
+        threshold_chars=20,
+        artifact_archiver=archive,
+    )
+    assert calls and calls[0][2]["original_chars"] == 100
+    assert projected[0]["artifact_refs"][0]["artifact_id"] == "a-context"
+    assert "version_id: v-context" in projected[0]["content"]
 
 
 def test_code_and_observation_are_one_atomic_compaction_segment():
@@ -509,6 +545,7 @@ def test_compact_handoff_is_structured_and_never_invents_kernel_continuity(
         {"role": "assistant", "content": "recent"},
     ]
 
+    archives = []
     out = comp_mod.compact(
         messages,
         get_config(),
@@ -519,6 +556,7 @@ def test_compact_handoff_is_structured_and_never_invents_kernel_continuity(
             "ledger_cursor": 73,
             "recovery_pointer": {"checkpoint": "cp-4"},
         },
+        archive_sink=archives.append,
     )
 
     handoff = out[2]["content"]
@@ -535,6 +573,8 @@ def test_compact_handoff_is_structured_and_never_invents_kernel_continuity(
     assert archive["metadata"]["branch"] == "experiment-b"
     assert archive["metadata"]["ledger_cursor"] == 73
     assert archive["metadata"]["recovery_pointer"] == {"checkpoint": "cp-4"}
+    assert archives[0]["archive_id"] == archive["archive_id"]
+    assert archives[0]["context_estimate_before"]["total"] > 0
 
 
 def test_compact_handoff_marks_restarted_generation_as_non_persistent(monkeypatch):

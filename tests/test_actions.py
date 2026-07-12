@@ -8,6 +8,7 @@ the fence-collision guarantees the dual loop depends on.
 from typing import get_args
 
 from openai4s.agent.actions import (
+    INCOMPLETE_CELL_NUDGE,
     MULTI_CELL_NOTE,
     NO_CODE_NUDGE,
     Action,
@@ -17,6 +18,7 @@ from openai4s.agent.actions import (
     NativeToolCall,
     count_code_blocks,
     extract_action,
+    has_incomplete_code_block,
     is_completion_only_cell,
     route_action,
 )
@@ -56,6 +58,10 @@ def test_non_action_fences_are_ignored():
 def test_unclosed_fence_is_never_executable():
     assert extract_action(f"{_F}python\nx = 1\n") is None
     assert extract_action(f"{_F}r\nx <- 1\n") is None
+    assert has_incomplete_code_block(f"{_F}python\nx = 1\n") is True
+    assert has_incomplete_code_block(f"{_F}r\nx <- 1\n") is True
+    assert has_incomplete_code_block(f"{_F}json\n{{}}\n") is False
+    assert "NOTHING" in INCOMPLETE_CELL_NUDGE
 
 
 def test_nested_tool_example_stays_inside_the_cell():

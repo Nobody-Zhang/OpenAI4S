@@ -30,6 +30,7 @@ from pathlib import Path
 
 from openai4s.capabilities import CapabilityStateService
 from openai4s.config import Config, get_config
+from openai4s.skills_loader.versions import project_skills_root
 
 _VALID_ORIGINS = ("openai4s", "organization", "personal", "draft", "unknown")
 _WORD = re.compile(r"[a-z0-9]+")
@@ -267,6 +268,7 @@ class Skill:
             "name": self.name,
             "directory": self.root.name,
             "origin": self.origin,
+            "distribution_scope": self.source,
             "enabled": bool(state.get("enabled", True)),
             "state_scope": state.get("scope", "default"),
             "state_scope_id": state.get("scope_id", ""),
@@ -298,6 +300,8 @@ def _bootstrap_runtime_code(manifest: dict, roots: list[str]) -> str:
     # Keep this generated snippet self-contained: a scientific kernel may not
     # import openai4s internals from its selected environment.
     return (
+        "import base64 as _o4s_base64\n"
+        "import hashlib as _o4s_hashlib\n"
         "import importlib.abc as _o4s_abc\n"
         "import importlib.machinery as _o4s_machinery\n"
         "import sys as _o4s_sys\n"
@@ -331,15 +335,48 @@ def _bootstrap_runtime_code(manifest: dict, roots: list[str]) -> str:
         "        create = getattr(self._delegate, 'create_module', None)\n"
         "        return create(spec) if create else None\n"
         "    def exec_module(self, module):\n"
-        "        self._delegate.exec_module(module)\n"
+        "        spec = getattr(module, '__spec__', None)\n"
+        "        source_path = getattr(spec, 'origin', None)\n"
+        "        get_data = getattr(self._delegate, 'get_data', None)\n"
+        "        if not source_path or not callable(get_data):\n"
+        "            raise ImportError('Skill sidecar source cannot be frozen')\n"
+        "        source = get_data(source_path)\n"
+        "        if not isinstance(source, bytes):\n"
+        "            raise ImportError('Skill sidecar loader returned non-bytes')\n"
+        "        if len(source) > 2_000_000:\n"
+        "            raise ImportError('Skill sidecar exceeds 2MB capture limit')\n"
+        "        captured = sum(\n"
+        "            len(item.get('source_b64'))\n"
+        "            for item in __openai4s_skill_load_events__\n"
+        "            if isinstance(item, dict)\n"
+        "            and isinstance(item.get('source_b64'), str)\n"
+        "        )\n"
+        "        if captured + ((len(source) + 2) // 3 * 4) > 10_000_000:\n"
+        "            raise ImportError('Skill sidecar capture budget exceeded')\n"
         "        sidecar = self._entry.get('sidecar') or {}\n"
+        "        expected_sha256 = sidecar.get('sha256')\n"
+        "        actual_sha256 = _o4s_hashlib.sha256(source).hexdigest()\n"
+        "        if not expected_sha256 or actual_sha256 != expected_sha256:\n"
+        "            raise ImportError(\n"
+        "                'Skill sidecar changed after bootstrap; restart the '\n"
+        "                'kernel to accept a new capability manifest'\n"
+        "            )\n"
+        "        code = compile(source, source_path, 'exec')\n"
+        "        exec(code, module.__dict__)\n"
         "        sidecar['loaded'] = True\n"
+        "        sidecar['loaded_sha256'] = actual_sha256\n"
         "        event = {\n"
         "            'event': 'sidecar_loaded',\n"
-        "            'name': self._entry.get('name') or self._skill_name,\n"
+        "            'skill_name': self._entry.get('name') or self._skill_name,\n"
         "            'module': module.__name__,\n"
         "            'version': self._entry.get('version'),\n"
-        "            'sidecar_sha256': sidecar.get('sha256'),\n"
+        "            'expected_sha256': sidecar.get('sha256'),\n"
+        "            'sha256': actual_sha256,\n"
+        "            'source_b64': _o4s_base64.b64encode(source).decode('ascii'),\n"
+        "            'source_path': source_path,\n"
+        "            'order': len(__openai4s_skill_load_events__),\n"
+        "            'exports': [],\n"
+        "            'import_mode': 'module',\n"
         "            'loaded_at_ns': _o4s_time.time_ns(),\n"
         "        }\n"
         "        __openai4s_skill_load_events__.append(event)\n"
@@ -393,6 +430,8 @@ class SkillLoader:
                 session_id=session_id,
             )
         self.capabilities = capabilities
+        self.project_id = project_id or getattr(capabilities, "project_id", None)
+        self.session_id = session_id or getattr(capabilities, "session_id", None)
         self._skills: dict[str, Skill] = {}
         self._last_manifest: dict | None = None
 
@@ -409,12 +448,21 @@ class SkillLoader:
                 project_id=project_id,
                 session_id=session_id,
             ),
+            project_id=(self.project_id if project_id is None else project_id),
+            session_id=(self.session_id if session_id is None else session_id),
         )
 
     def user_skills_dir(self) -> Path:
         """Writable dir for user-authored skills (kept separate from the bundled
         read-only skills). Discovered alongside the bundled ones."""
         return self.cfg.data_dir / "user-skills"
+
+    def project_skills_dir(self) -> Path | None:
+        """Writable project overlay, isolated by a hashed project identity."""
+
+        if not self.project_id:
+            return None
+        return project_skills_root(self.cfg, self.project_id)
 
     @staticmethod
     def parse_document(content: str) -> tuple[dict, str]:
@@ -429,26 +477,27 @@ class SkillLoader:
         # canonical name. Bundled wins on collision, otherwise the agent could
         # load untrusted content under a trusted capability identity.
         claimed_names: set[str] = set()
-        roots = (
-            ("bundled", self.skills_dir),
-            ("user", self.user_skills_dir()),
-        )
+        roots = [("bundled", self.skills_dir)]
+        project_root = self.project_skills_dir()
+        if project_root is not None:
+            roots.append(("project", project_root))
+        roots.append(("user", self.user_skills_dir()))
         for source, base in roots:
             if not base or not base.exists():
                 continue
-            is_user = source == "user"
+            is_writable = source in {"user", "project"}
             for child in sorted(base.iterdir()):
                 if not child.is_dir():
                     continue
                 md = child / "SKILL.md"
                 if not md.exists():
                     continue
-                if is_user and child.name in self._skills:
+                if is_writable and child.name in self._skills:
                     continue  # bundled skill already claimed this name — keep it
                 raw = md.read_text("utf-8")
                 meta, body = _parse_frontmatter(raw)
                 origin = (meta.get("origin") or "unknown").lower()
-                if is_user:
+                if is_writable:
                     # User-space files cannot claim a trusted bundled origin.
                     # Preserve the host lifecycle's draft -> personal states;
                     # Web-authored documents use the separate ``user`` state.
@@ -601,7 +650,11 @@ class SkillLoader:
         """Return a scoped sidecar import path, deny gate, and truthful tracker."""
 
         manifest = self.bootstrap_manifest()
-        roots = [str(self.skills_dir), str(self.user_skills_dir())]
+        roots = [str(self.skills_dir)]
+        project_root = self.project_skills_dir()
+        if project_root is not None:
+            roots.append(str(project_root))
+        roots.append(str(self.user_skills_dir()))
         return _bootstrap_runtime_code(manifest, roots)
 
     def record_sidecar_loaded(
@@ -673,6 +726,7 @@ class SkillLoader:
                 "name": s.name,
                 "description": s.description,
                 "origin": s.origin,
+                "distribution_scope": s.source,
                 "has_kernel": s.has_kernel,
                 "enabled": self.is_enabled(s.name),
                 "version": s.version,

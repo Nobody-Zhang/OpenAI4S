@@ -29,6 +29,22 @@ class DelegateTaskTool(Tool):
             },
             "context_summary": {"type": "string", "maxLength": 20000},
             "output_schema": {"type": "object", "additionalProperties": True},
+            "steps": {"type": "integer", "minimum": 1, "maximum": 1000},
+            "max_steps": {"type": "integer", "minimum": 1, "maximum": 1000},
+            "max_turns": {"type": "integer", "minimum": 1, "maximum": 1000},
+            "permissions": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "string",
+                    "enum": ["allow", "ask", "deny"],
+                },
+            },
+            "capabilities": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "maxItems": 100,
+            },
+            "unrestricted": {"type": "boolean"},
             "wait": {
                 "type": "boolean",
                 "description": "Wait for completion (default true).",

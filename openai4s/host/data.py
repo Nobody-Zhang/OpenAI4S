@@ -14,6 +14,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
+from openai4s.artifact_restore import ArtifactRestoreService
+
 
 class HostDataStore(Protocol):
     """Persistence surface required by :class:`HostDataService`."""
@@ -24,9 +26,17 @@ class HostDataStore(Protocol):
 
     def list_artifacts(self, filters: dict | None = None) -> list[dict]: ...
 
+    def get_artifact(self, artifact_id: str) -> dict | None: ...
+
+    def list_versions(self, artifact_id: str) -> list[dict]: ...
+
+    def resolve_frame_scope(self, frame_id: str | None) -> dict: ...
+
     def resolve_artifact_path(self, ident: str) -> str | None: ...
 
     def record_cell_artifact(self, **fields: Any) -> dict: ...
+
+    def record_artifact_restore(self, **fields: Any) -> dict: ...
 
     def version_meta(self, version_id: str) -> dict | None: ...
 
@@ -148,6 +158,138 @@ class HostDataService:
         if search:
             items = rank_artifacts(items, str(search))
         return {"count": len(items), "artifacts": items}
+
+    def _scoped_artifact(self, artifact_id: str) -> dict:
+        """Resolve one Artifact without allowing cross-session enumeration."""
+        store = self._store()
+        artifact = store.get_artifact(artifact_id)
+        if artifact is None:
+            raise KeyError(f"no artifact {artifact_id!r} in the current session")
+        frame_id = self._frame_id()
+        scope = store.resolve_frame_scope(frame_id)
+        if (
+            frame_id is None
+            or artifact.get("root_frame_id") != scope.get("root_frame_id")
+            or artifact.get("project_id") != scope.get("project_id")
+        ):
+            raise PermissionError(
+                f"artifact {artifact_id!r} is outside the current session scope"
+            )
+        return artifact
+
+    @staticmethod
+    def _artifact_metadata_projection(artifact: dict) -> dict:
+        fields = (
+            "artifact_id",
+            "project_id",
+            "root_frame_id",
+            "filename",
+            "content_type",
+            "is_user_upload",
+            "priority",
+            "latest_version_id",
+            "created_at",
+            "updated_at",
+        )
+        return {field: artifact.get(field) for field in fields}
+
+    @staticmethod
+    def _version_metadata_projection(
+        version: dict,
+        *,
+        latest_version_id: str | None,
+    ) -> dict:
+        fields = (
+            "version_id",
+            "artifact_id",
+            "filename",
+            "content_type",
+            "size_bytes",
+            "checksum",
+            "producing_cell_id",
+            "frame_id",
+            "created_at",
+            "env_snapshot_id",
+            "ordinal",
+        )
+        projected = {
+            field: version.get(field)
+            for field in fields
+            if field in version or field != "ordinal"
+        }
+        projected["is_latest"] = (
+            version.get("version_id") == latest_version_id
+        )
+        projected["snapshot_available"] = bool(version.get("snapshot_path"))
+        return projected
+
+    def artifact_metadata(self, spec: dict) -> dict:
+        """Return exact safe metadata for one Artifact and one of its versions."""
+        artifact_id = str(spec.get("artifact_id") or "")
+        artifact = self._scoped_artifact(artifact_id)
+        version_id = str(
+            spec.get("version_id") or artifact.get("latest_version_id") or ""
+        )
+        version = self._store().version_meta(version_id) if version_id else None
+        if version is None or version.get("artifact_id") != artifact_id:
+            raise KeyError(
+                f"version {version_id!r} does not belong to artifact {artifact_id!r}"
+            )
+        return {
+            "artifact": self._artifact_metadata_projection(artifact),
+            "version": self._version_metadata_projection(
+                version,
+                latest_version_id=artifact.get("latest_version_id"),
+            ),
+        }
+
+    def artifact_versions(self, spec: dict) -> dict:
+        """List immutable version identities for one session-owned Artifact."""
+        artifact_id = str(spec.get("artifact_id") or "")
+        artifact = self._scoped_artifact(artifact_id)
+        latest_version_id = artifact.get("latest_version_id")
+        versions = []
+        for item in self._store().list_versions(artifact_id):
+            metadata = self._store().version_meta(item["version_id"]) or item
+            metadata = {**metadata, "ordinal": item.get("ordinal")}
+            versions.append(
+                self._version_metadata_projection(
+                    metadata,
+                    latest_version_id=latest_version_id,
+                )
+            )
+        return {
+            "artifact_id": artifact_id,
+            "latest_version_id": latest_version_id,
+            "count": len(versions),
+            "versions": versions,
+        }
+
+    def restore_artifact_version(self, spec: dict) -> dict:
+        """Restore verified historical bytes as a new immutable version."""
+        artifact_id = str(spec.get("artifact_id") or "")
+        source_version_id = str(spec.get("version_id") or "")
+        artifact = self._scoped_artifact(artifact_id)
+        store = self._store()
+        config = self._config()
+        legacy_versions = (
+            (Path(config.data_dir) / "artifact-versions")
+            if getattr(config, "data_dir", None) is not None
+            else Path(config.artifacts_dir)
+        )
+        service = ArtifactRestoreService(
+            store=store,
+            primary_snapshot_dir=Path(config.artifacts_dir),
+            trusted_snapshot_dirs=(legacy_versions,),
+            resolve_live_path=lambda current_artifact, current: self._resolve_path(
+                str(current.get("path") or current_artifact.get("filename"))
+            ),
+        )
+        return service.restore(
+            artifact=artifact,
+            source_version_id=source_version_id,
+            frame_id=self._frame_id(),
+        )
 
     def artifact_path(self, version_id: str) -> str:
         path = self._store().resolve_artifact_path(version_id)

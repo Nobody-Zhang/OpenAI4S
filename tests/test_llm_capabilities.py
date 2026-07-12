@@ -47,6 +47,13 @@ def test_model_resolution_marks_custom_and_local_endpoints():
     assert local.endpoint == "http://127.0.0.1:11434/v1"
     assert local.custom_endpoint is True
     assert local.local_endpoint is True
+    assert local.context_window_tokens is None
+    assert local.max_output_tokens is None
+    assert local.tool_calling is False
+    assert local.parallel_tool_calls is False
+    assert local.strict_tool_schema is False
+    assert local.vision is False
+    assert local.cost.source == "local endpoint; capabilities unknown"
 
 
 def test_legacy_registry_edits_and_new_provider_are_reflected(monkeypatch):
@@ -124,6 +131,20 @@ def test_provider_override_validation_and_request_validation():
     assert resolved.provider == "chatgpt"
 
 
+def test_chat_enforces_output_limit_before_transport():
+    cfg = llm.LLMConfig(
+        provider="gemini",
+        api_key="test",
+        model="gemini-2.5-pro",
+    )
+    with pytest.raises(llm.CapabilityError, match="exceeds model limit"):
+        llm.chat(
+            [{"role": "user", "content": "hello"}],
+            cfg,
+            max_tokens=100_000,
+        )
+
+
 @pytest.mark.parametrize(
     "provider,raw,expected",
     [
@@ -191,3 +212,32 @@ def test_usage_normalization_tolerates_missing_and_invalid_counters():
         "completion_tokens": 0,
         "total_tokens": 0,
     }
+
+
+def test_usage_cost_uses_only_explicit_prices_and_replaces_cache_subsets():
+    usage = {
+        "input_tokens": 1_000_000,
+        "output_tokens": 100_000,
+        "cache_read": 200_000,
+        "cache_write": 100_000,
+    }
+    priced = llm.CostMetadata(
+        input_per_million=2.0,
+        output_per_million=8.0,
+        cache_read_per_million=0.5,
+        cache_write_per_million=3.0,
+        source="deployment price table",
+    )
+    assert llm.calculate_usage_cost_usd(usage, priced) == 2.6
+    assert llm.calculate_usage_cost_usd(usage, llm.CostMetadata()) is None
+    assert (
+        llm.calculate_usage_cost_usd(
+            usage,
+            llm.CostMetadata(
+                currency="EUR",
+                input_per_million=2.0,
+                output_per_million=8.0,
+            ),
+        )
+        is None
+    )

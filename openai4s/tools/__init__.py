@@ -11,7 +11,13 @@ This package is pure stdlib and imports nothing from the engine (no
 host_dispatch / loop / gateway) at module load, so it stays importable with
 zero side effects. Wiring into the agent loops happens elsewhere.
 """
-from openai4s.tools.artifacts import ListArtifactsTool, SaveArtifactTool
+from openai4s.tools.artifacts import (
+    GetArtifactMetadataTool,
+    ListArtifactsTool,
+    ListArtifactVersionsTool,
+    RestoreArtifactVersionTool,
+    SaveArtifactTool,
+)
 from openai4s.tools.background import (
     InterruptBackgroundExecTool,
     ListBackgroundExecsTool,
@@ -19,6 +25,7 @@ from openai4s.tools.background import (
     SubmitBackgroundExecTool,
 )
 from openai4s.tools.base import Tool
+from openai4s.tools.capabilities import SearchCapabilitiesTool
 from openai4s.tools.catalog import SessionToolCatalog
 from openai4s.tools.content_search import ContentSearchTool
 from openai4s.tools.contexts import (
@@ -56,12 +63,21 @@ from openai4s.tools.env_list import EnvListTool
 from openai4s.tools.env_use import EnvUseTool
 from openai4s.tools.glob_files import GlobFilesTool
 from openai4s.tools.list_directory import ListDirectoryTool
-from openai4s.tools.mcp import CallMCPTool, ListMCPServersTool, ListMCPToolsTool
+from openai4s.tools.mcp import (
+    CallMCPTool,
+    GetMCPPromptTool,
+    ListMCPPromptsTool,
+    ListMCPResourcesTool,
+    ListMCPServersTool,
+    ListMCPToolsTool,
+    ReadMCPResourceTool,
+)
 from openai4s.tools.native import ToolSpec, control_tool_specs
 from openai4s.tools.network_access import RequestNetworkAccessTool
 from openai4s.tools.progress import (
     ReadPlanTool,
     ReadTodosTool,
+    ReviewStatusTool,
     UpdatePlanStepTool,
     WriteTodosTool,
 )
@@ -90,6 +106,13 @@ from openai4s.tools.remote_capabilities import (
     RegisterRemoteCapabilityTool,
     RemoteGPUStatusTool,
 )
+from openai4s.tools.remote_compute import (
+    CancelRemoteComputeJobTool,
+    CloseRemoteComputeTool,
+    GetRemoteComputeJobResultTool,
+    RemoteComputeStatusTool,
+    SubmitRemoteComputeJobTool,
+)
 from openai4s.tools.schema import (
     SchemaDefinitionError,
     ValidationIssue,
@@ -98,7 +121,20 @@ from openai4s.tools.schema import (
     validate_json_schema,
     validate_schema_definition,
 )
-from openai4s.tools.skills import LoadSkillTool, SearchSkillsTool
+from openai4s.tools.session import (
+    CreateCheckpointTool,
+    ForkSessionTool,
+    PendingPermissionsTool,
+    RevertPreviewTool,
+    SessionStatusTool,
+)
+from openai4s.tools.skills import (
+    LoadSkillTool,
+    RollbackSkillVersionTool,
+    SearchSkillsTool,
+    SkillHistoryTool,
+    SkillStatusTool,
+)
 from openai4s.tools.taxonomy import SIDE_EFFECT_CLASSES
 from openai4s.tools.web_fetch import WebFetchTool
 from openai4s.tools.web_search import WebSearchTool
@@ -131,14 +167,27 @@ __all__ = [
     "EnvCreateTool",
     "WebSearchTool",
     "WebFetchTool",
+    "SearchCapabilitiesTool",
     "SearchSkillsTool",
     "LoadSkillTool",
+    "SkillStatusTool",
+    "SkillHistoryTool",
+    "RollbackSkillVersionTool",
     "ListArtifactsTool",
+    "GetArtifactMetadataTool",
+    "ListArtifactVersionsTool",
     "SaveArtifactTool",
+    "RestoreArtifactVersionTool",
     "ReadTodosTool",
     "WriteTodosTool",
     "ReadPlanTool",
+    "ReviewStatusTool",
     "UpdatePlanStepTool",
+    "SessionStatusTool",
+    "CreateCheckpointTool",
+    "ForkSessionTool",
+    "RevertPreviewTool",
+    "PendingPermissionsTool",
     "DelegateTaskTool",
     "ListChildrenTool",
     "CollectChildrenTool",
@@ -146,10 +195,19 @@ __all__ = [
     "SendChildMessageTool",
     "ListMCPServersTool",
     "ListMCPToolsTool",
+    "ListMCPResourcesTool",
+    "ReadMCPResourceTool",
+    "ListMCPPromptsTool",
+    "GetMCPPromptTool",
     "CallMCPTool",
     "RequestNetworkAccessTool",
     "RemoteGPUStatusTool",
     "RegisterRemoteCapabilityTool",
+    "SubmitRemoteComputeJobTool",
+    "RemoteComputeStatusTool",
+    "GetRemoteComputeJobResultTool",
+    "CancelRemoteComputeJobTool",
+    "CloseRemoteComputeTool",
     "DefineDynamicTool",
     "ListDynamicTools",
     "PromoteDynamicTool",

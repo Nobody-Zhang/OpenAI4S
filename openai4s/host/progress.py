@@ -23,6 +23,12 @@ class ProgressStore(Protocol):
         note: str | None = None,
     ) -> dict | None: ...
 
+    def list_steps(
+        self, frame_id: str, *, start: int = 0, limit: int = 800
+    ) -> list[dict]: ...
+
+    def get_setting(self, key: str, default: str | None = None) -> str | None: ...
+
 
 class ProgressService:
     """Own one dispatcher's transient todos and persisted plan-step ticks."""
@@ -101,6 +107,51 @@ class ProgressService:
         frame_id = self.get_frame_id()
         plan = self.store.get_plan_by_frame(frame_id) if frame_id else None
         return plan or {"plan": None}
+
+    def review_status(self) -> dict:
+        """Return a bounded public projection of evidence-review state."""
+
+        frame_id = self.get_frame_id()
+        if not frame_id:
+            return {"enabled": False, "reviews": []}
+        local_auto = self.store.get_setting(f"review:auto:{frame_id}")
+        if local_auto is None:
+            local_auto = self.store.get_setting("auto_review_enabled", "0")
+        reviewer_model = self.store.get_setting(f"review:model:{frame_id}")
+        if reviewer_model in (None, ""):
+            reviewer_model = self.store.get_setting("reviewer_model")
+        reviews: list[dict] = []
+        for step in self.store.list_steps(frame_id, limit=800):
+            if str(step.get("kind") or "").casefold() != "review":
+                continue
+            output = step.get("output")
+            output = output if isinstance(output, dict) else {}
+            issues = output.get("issues")
+            reviewed = output.get("reviewed_artifacts")
+            reviews.append(
+                {
+                    "step_id": step.get("step_id"),
+                    "status": step.get("status"),
+                    "title": step.get("title"),
+                    "summary": step.get("summary") or output.get("summary"),
+                    "verdict": output.get("verdict"),
+                    "issues_count": len(issues) if isinstance(issues, list) else 0,
+                    "reviewed_artifacts": (
+                        [str(item) for item in reviewed[:100]]
+                        if isinstance(reviewed, list)
+                        else []
+                    ),
+                    "created_at": step.get("created_at"),
+                }
+            )
+        return {
+            "enabled": str(local_auto or "").casefold()
+            in {"1", "true", "yes", "on"},
+            "reviewer_model": (
+                None if reviewer_model in (None, "", "__agent__") else reviewer_model
+            ),
+            "reviews": reviews[-20:],
+        }
 
 
 __all__ = ["PLAN_STEP_STATUSES", "ProgressService"]

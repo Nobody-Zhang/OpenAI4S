@@ -569,13 +569,33 @@ def get_provider_capabilities(
         effective = replace(base, **_PROVIDER_OVERRIDES.get(name, {}))
         endpoint = endpoint_arg or _normalize_endpoint(effective.default_base_url)
         default_endpoint = _normalize_endpoint(effective.default_base_url)
+        local = _is_local_endpoint(endpoint)
+        if local and name in _BUILTIN_PROVIDERS:
+            # A loopback OpenAI-compatible URL proves transport shape only. It
+            # does not prove the loaded model supports tools, vision, reasoning,
+            # a vendor-sized context window, or the vendor's pricing. Keep the
+            # automatic discovery path conservative; explicit provider/model
+            # capability overrides remain authoritative below/at model lookup.
+            conservative = {
+                "context_window_tokens": None,
+                "max_output_tokens": None,
+                "tool_calling": False,
+                "parallel_tool_calls": False,
+                "strict_tool_schema": False,
+                "vision": False,
+                "audio": False,
+                "reasoning": False,
+                "cost": CostMetadata(source="local endpoint; capabilities unknown"),
+            }
+            conservative.update(_PROVIDER_OVERRIDES.get(name, {}))
+            effective = replace(effective, **conservative)
         effective = replace(
             effective,
             custom_endpoint=bool(
                 effective.custom_endpoint
                 or (endpoint_arg and endpoint != default_endpoint)
             ),
-            local_endpoint=_is_local_endpoint(endpoint),
+            local_endpoint=local,
         )
         _PROVIDER_CACHE[cache_key] = effective
         _CACHE_MISSES += 1
@@ -807,6 +827,63 @@ def normalize_usage(
         "total_tokens": total,
     }
     return result
+
+
+def calculate_usage_cost_usd(
+    usage: Mapping[str, Any] | None,
+    cost: CostMetadata,
+) -> float | None:
+    """Calculate an auditable USD charge from canonical token counters.
+
+    Unknown prices stay unknown: this function never substitutes a vendor
+    price table.  Cache counters are treated as subsets of input tokens.  When
+    a deployment supplies a cache-specific price it replaces the ordinary
+    input price for that subset; otherwise those tokens retain the declared
+    input price.  Reasoning tokens are not added separately because provider
+    usage normally includes them in output tokens.
+    """
+
+    if str(cost.currency or "").strip().upper() != "USD":
+        return None
+    if cost.input_per_million is None or cost.output_per_million is None:
+        return None
+    raw: Mapping[str, Any] = usage if isinstance(usage, Mapping) else {}
+
+    def counter(name: str) -> int:
+        value = raw.get(name, 0)
+        if value is None or isinstance(value, bool):
+            return 0
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return max(0, parsed)
+
+    input_tokens = counter("input_tokens") or counter("prompt_tokens")
+    output_tokens = counter("output_tokens") or counter("completion_tokens")
+    cache_read = min(input_tokens, counter("cache_read"))
+    cache_write = min(input_tokens - cache_read, counter("cache_write"))
+    regular_input = input_tokens - cache_read - cache_write
+
+    cache_read_rate = (
+        cost.cache_read_per_million
+        if cost.cache_read_per_million is not None
+        else cost.input_per_million
+    )
+    cache_write_rate = (
+        cost.cache_write_per_million
+        if cost.cache_write_per_million is not None
+        else cost.input_per_million
+    )
+    total = (
+        regular_input * cost.input_per_million
+        + cache_read * cache_read_rate
+        + cache_write * cache_write_rate
+        + output_tokens * cost.output_per_million
+    ) / 1_000_000
+    # Floating point is sufficient for UI accounting, but keep a deterministic
+    # representation so persisted timeline snapshots remain stable.
+    return round(total, 12)
 
 
 def legacy_provider_specs() -> dict[str, dict[str, Any]]:
