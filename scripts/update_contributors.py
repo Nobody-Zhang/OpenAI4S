@@ -8,17 +8,21 @@ rewrites the block between the ``CONTRIBUTORS`` markers in each README.
 Unlike a third-party image service (e.g. contrib.rocks, which calls the GitHub
 API anonymously, gets rate-limited for this repo, and rendered only a single
 avatar), this runs with the repo's own token and sees every attributed
-contributor.  GitHub markdown strips inline CSS, so a plain ``<img>`` cannot be
-round; each avatar is emitted as a small self-contained **circular SVG**
-(base64-embedded, the same circle+pattern trick contrib.rocks uses) committed
-under ``.github/contributors/`` and wrapped in a link to the person's profile.
+contributor.
+
+GitHub markdown strips inline CSS, so a plain ``<img>`` is always square, and a
+committed SVG that embeds the avatar as a ``data:`` URI is blocked by
+raw.githubusercontent's content-security-policy.  So each avatar is cropped to a
+circle with transparent corners and committed as a small PNG under
+``.github/contributors/``; a round raster image renders everywhere, and each is
+wrapped in a link to the person's GitHub profile.
 
 Run in CI via ``.github/workflows/contributors.yml``; runnable locally for a
-preview with ``GITHUB_TOKEN`` set or a ``gh auth`` session.
+preview with ``GITHUB_TOKEN`` set or a ``gh auth`` session.  Requires Pillow.
 """
 from __future__ import annotations
 
-import base64
+import io
 import json
 import os
 import re
@@ -31,6 +35,7 @@ READMES = ("README.md", "README_zh.md")
 AVATAR_DIR = os.path.join(".github", "contributors")
 START = "<!-- CONTRIBUTORS:START -->"
 END = "<!-- CONTRIBUTORS:END -->"
+SRC = 256  # source crop resolution for a crisp circle
 DISPLAY = 64  # rendered avatar size in px, close to the original wall
 # Bots and the automated co-author identity are not community members. The
 # ``noreply@anthropic.com`` co-author has no GitHub account (it shows as an
@@ -89,34 +94,20 @@ def fetch_contributors(token: str | None) -> list[dict]:
     return kept
 
 
-def _mime(data: bytes) -> str:
-    # GitHub avatars come back as JPEG, PNG, or WEBP; the data-URI MIME must
-    # match the real bytes or the browser fails to decode it (a broken-image
-    # glyph inside the circle).
-    if data[:3] == b"\xff\xd8\xff":
-        return "image/jpeg"
-    if data[:8] == b"\x89PNG\r\n\x1a\n":
-        return "image/png"
-    if data[:4] == b"GIF8":
-        return "image/gif"
-    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return "image/webp"
-    return "image/png"
+def _circular_png(raw: bytes) -> bytes:
+    from PIL import Image, ImageDraw, ImageOps
 
-
-def _circular_svg(avatar_b64: str, mime: str) -> str:
-    # A circle filled with the avatar via a pattern — the same technique
-    # contrib.rocks uses, so GitHub renders it round.
-    return (
-        '<svg xmlns="http://www.w3.org/2000/svg" '
-        'xmlns:xlink="http://www.w3.org/1999/xlink" '
-        'width="128" height="128" viewBox="0 0 128 128">'
-        '<defs><pattern id="a" patternUnits="userSpaceOnUse" '
-        'width="128" height="128">'
-        '<image width="128" height="128" preserveAspectRatio="xMidYMid slice" '
-        f'xlink:href="data:{mime};base64,{avatar_b64}"/></pattern></defs>'
-        '<circle cx="64" cy="64" r="64" fill="url(#a)"/></svg>\n'
+    im = ImageOps.fit(
+        Image.open(io.BytesIO(raw)).convert("RGBA"),
+        (SRC, SRC),
+        method=Image.LANCZOS,
     )
+    mask = Image.new("L", (SRC, SRC), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, SRC - 1, SRC - 1), fill=255)
+    im.putalpha(mask)
+    out = io.BytesIO()
+    im.save(out, format="PNG", optimize=True)
+    return out.getvalue()
 
 
 def write_avatars(people: list[dict], token: str | None) -> set[str]:
@@ -125,31 +116,30 @@ def write_avatars(people: list[dict], token: str | None) -> set[str]:
     for c in people:
         login = c["login"]
         url = c.get("avatar_url") or f"https://github.com/{login}.png"
-        url += ("&" if "?" in url else "?") + "s=128"
+        url += ("&" if "?" in url else "?") + "s=256"
         try:
-            raw = _get(url, token)
+            png = _circular_png(_get(url, token))
         except Exception as exc:  # noqa: BLE001
-            print(f"  avatar fetch failed for {login}: {exc}", file=sys.stderr)
+            print(f"  avatar failed for {login}: {exc}", file=sys.stderr)
             continue
-        b64 = base64.b64encode(raw).decode("ascii")
-        with open(os.path.join(AVATAR_DIR, f"{login}.svg"), "w", encoding="utf-8") as f:
-            f.write(_circular_svg(b64, _mime(raw)))
+        with open(os.path.join(AVATAR_DIR, f"{login}.png"), "wb") as f:
+            f.write(png)
         ok.add(login)
-    # Drop SVGs for contributors that are no longer present.
-    if os.path.isdir(AVATAR_DIR):
-        for name in os.listdir(AVATAR_DIR):
-            if name.endswith(".svg") and name[:-4] not in ok:
-                os.remove(os.path.join(AVATAR_DIR, name))
+    # Drop anything (old SVGs, departed contributors) that is not a current png.
+    keep = {f"{login}.png" for login in ok}
+    for name in os.listdir(AVATAR_DIR):
+        if name not in keep and (name.endswith(".png") or name.endswith(".svg")):
+            os.remove(os.path.join(AVATAR_DIR, name))
     return ok
 
 
-def render(people: list[dict], have_svg: set[str]) -> str:
+def render(people: list[dict], have_png: set[str]) -> str:
     rows = []
     for c in people:
         login = c["login"]
         src = (
-            f".github/contributors/{login}.svg"
-            if login in have_svg
+            f".github/contributors/{login}.png"
+            if login in have_png
             else f"https://github.com/{login}.png"
         )
         rows.append(
@@ -186,13 +176,13 @@ def main() -> int:
     if not people:
         print("no contributors fetched (rate limit or auth?)", file=sys.stderr)
         return 1
-    have_svg = write_avatars(people, token)
-    block = render(people, have_svg)
+    have_png = write_avatars(people, token)
+    block = render(people, have_png)
     changed = [p for p in READMES if os.path.exists(p) and update_readme(p, block)]
     print(
         f"{len(people)} contributors: "
         + ", ".join(c["login"] for c in people)
-        + f"\ncircular svgs: {len(have_svg)}; readmes updated: {changed or 'none'}"
+        + f"\ncircular pngs: {len(have_png)}; readmes updated: {changed or 'none'}"
     )
     return 0
 

@@ -28,11 +28,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Pillow (circular avatar crop)
+        run: python -m pip install --quiet Pillow
       - name: Regenerate contributor wall
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-        run: python3 scripts/update_contributors.py
+        run: python scripts/update_contributors.py
       - name: Commit if changed
         run: |
           if [ -n "$(git status --porcelain README.md README_zh.md)" ]; then
