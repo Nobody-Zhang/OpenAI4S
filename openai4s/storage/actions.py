@@ -279,9 +279,7 @@ class ActionLedgerRepository:
         branch_id = _required_text("branch_id", branch_id or root_frame_id)
         turn_id = _required_text("turn_id", turn_id)
         kind = _required_text("kind", kind)
-        group_id = _required_text(
-            "group_id", group_id or f"ag-{uuid.uuid4().hex[:16]}"
-        )
+        group_id = _required_text("group_id", group_id or f"ag-{uuid.uuid4().hex[:16]}")
         usage = _optional_usage(usage)
         cost_usd = _optional_cost_usd(cost_usd)
         now = self._clock_ms() if created_at is None else created_at
@@ -333,9 +331,7 @@ class ActionLedgerRepository:
     ) -> ActionEventDTO:
         group_id = _required_text("group_id", group_id)
         event_type = _required_text("type", type)
-        event_id = _required_text(
-            "event_id", event_id or f"ae-{uuid.uuid4().hex[:16]}"
-        )
+        event_id = _required_text("event_id", event_id or f"ae-{uuid.uuid4().hex[:16]}")
         now = self._clock_ms() if created_at is None else created_at
         with self._lock:
             self._require_group_locked(group_id)
@@ -397,9 +393,7 @@ class ActionLedgerRepository:
         root_frame_id = _required_text("root_frame_id", root_frame_id)
         branch_id = _required_text("branch_id", branch_id or root_frame_id)
         turn_id = _required_text("turn_id", turn_id)
-        group_id = _required_text(
-            "group_id", group_id or f"ag-{uuid.uuid4().hex[:16]}"
-        )
+        group_id = _required_text("group_id", group_id or f"ag-{uuid.uuid4().hex[:16]}")
         usage = _optional_usage(usage)
         cost_usd = _optional_cost_usd(cost_usd)
         now = self._clock_ms() if created_at is None else created_at
@@ -408,9 +402,7 @@ class ActionLedgerRepository:
             if not isinstance(source, dict):
                 raise TypeError("every tool event must be a dict")
             event = dict(source)
-            event["sequence"] = _ordinal(
-                "sequence", event.get("sequence", index)
-            )
+            event["sequence"] = _ordinal("sequence", event.get("sequence", index))
             event["type"] = _required_text("type", event.get("type", ""))
             event["event_id"] = _required_text(
                 "event_id", event.get("event_id") or f"ae-{uuid.uuid4().hex[:16]}"
@@ -535,17 +527,24 @@ class ActionLedgerRepository:
                 row["group_id"]: [] for row in rows
             }
             if include_events and rows:
-                placeholders = ",".join("?" for _ in rows)
-                event_rows = self._connection.execute(
-                    "SELECT * FROM action_events WHERE group_id IN ("
-                    + placeholders
-                    + ") ORDER BY group_id,sequence",
-                    tuple(row["group_id"] for row in rows),
-                ).fetchall()
-                for event_row in event_rows:
-                    events_by_group[event_row["group_id"]].append(
-                        self._normalize_event(event_row)
-                    )
+                group_ids = [row["group_id"] for row in rows]
+                # Chunk the IN(...) list so a long branch never exceeds
+                # SQLITE_MAX_VARIABLE_NUMBER (999 on older SQLite builds), which
+                # would otherwise raise OperationalError while a reducer rebuilds
+                # the canonical history on daemon restart.
+                for start in range(0, len(group_ids), 900):
+                    chunk = group_ids[start : start + 900]
+                    placeholders = ",".join("?" for _ in chunk)
+                    event_rows = self._connection.execute(
+                        "SELECT * FROM action_events WHERE group_id IN ("
+                        + placeholders
+                        + ") ORDER BY group_id,sequence",
+                        tuple(chunk),
+                    ).fetchall()
+                    for event_row in event_rows:
+                        events_by_group[event_row["group_id"]].append(
+                            self._normalize_event(event_row)
+                        )
         return [
             self._normalize_group(row, events=events_by_group[row["group_id"]])
             for row in rows
@@ -727,9 +726,10 @@ class ActionLedgerRepository:
                     f"execution attempt {attempt_id!r} is already finished"
                 )
             self._validate_timestamp(row, "finished_at", now)
-            if terminal_state in {"completed", "succeeded", "ok"} and row[
-                "capture_at"
-            ] is None:
+            if (
+                terminal_state in {"completed", "succeeded", "ok"}
+                and row["capture_at"] is None
+            ):
                 raise AttemptStateError(
                     "a successful execution attempt must finish artifact capture first"
                 )
@@ -820,9 +820,7 @@ class ActionLedgerRepository:
                 # Retry-safe without allowing the original timestamp to change.
                 return self._normalize_attempt(row)
             if prerequisite is not None and row[prerequisite] is None:
-                raise AttemptStateError(
-                    f"cannot set {column} before {prerequisite}"
-                )
+                raise AttemptStateError(f"cannot set {column} before {prerequisite}")
             self._validate_timestamp(row, column, now)
             cursor = self._connection.execute(
                 f"UPDATE execution_attempts SET {column}=? "
@@ -918,9 +916,12 @@ class ActionLedgerRepository:
         return int(row["n"])
 
     def _require_group_locked(self, group_id: str) -> None:
-        if self._connection.execute(
-            "SELECT 1 FROM action_groups WHERE group_id=?", (group_id,)
-        ).fetchone() is None:
+        if (
+            self._connection.execute(
+                "SELECT 1 FROM action_groups WHERE group_id=?", (group_id,)
+            ).fetchone()
+            is None
+        ):
             raise KeyError(f"unknown action group {group_id!r}")
 
     def _group_row_locked(self, group_id: str) -> Any:
@@ -949,9 +950,7 @@ class ActionLedgerRepository:
         return cast(ActionEventDTO, data)
 
     @staticmethod
-    def _normalize_group(
-        row: Any, *, events: list[ActionEventDTO]
-    ) -> ActionGroupDTO:
+    def _normalize_group(row: Any, *, events: list[ActionEventDTO]) -> ActionGroupDTO:
         data = dict(row)
         data["wire_state"] = _json_load(data.get("wire_state"))
         data["assistant_message"] = _json_load(data.get("assistant_message"))

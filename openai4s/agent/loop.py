@@ -267,9 +267,7 @@ class Agent:
             self._recorder = TapeRecorder(self.cfg.tape_path)
             self.dispatcher.recorder = self._recorder
         self.dispatcher.set_capability_scope(self.frame_id)
-        self._skill_loader = (
-            self.dispatcher.skill_loader if self.use_skills else None
-        )
+        self._skill_loader = self.dispatcher.skill_loader if self.use_skills else None
 
     def _log(self, *a: object) -> None:
         if self.verbose:
@@ -421,8 +419,7 @@ class Agent:
                         action_ledger=action_ledger,
                     ),
                     context_policy=(
-                        self.context_policy
-                        or CompactionPolicy(self.cfg, log=self._log)
+                        self.context_policy or CompactionPolicy(self.cfg, log=self._log)
                     ),
                     event_sink=event_sink,
                     cancellation=self.cancellation,
@@ -565,10 +562,21 @@ class Agent:
     def _close_run(self) -> None:
         """Release run-scoped runtimes and persist the optional replay tape."""
         self._shutdown_r_kernel()
-        if self._delegation_runner is not None and self._cancelled():
+        runner = self._delegation_runner
+        if runner is not None:
+            cancelled = self._cancelled()
+            if cancelled:
+                try:
+                    runner.cancel_all("parent agent cancelled")
+                except Exception:  # noqa: BLE001 - cancellation cleanup is best effort
+                    pass
+            # Always shut down the delegation ThreadPoolExecutor.  A per-run
+            # runner is created for every (sub-)agent, so leaving its non-daemon
+            # worker threads open leaks threads for the daemon's whole lifetime
+            # and eventually exhausts "can't start new thread".
             try:
-                self._delegation_runner.cancel_all("parent agent cancelled")
-            except Exception:  # noqa: BLE001 - cancellation cleanup is best effort
+                runner.close(cancel=cancelled)
+            except Exception:  # noqa: BLE001 - pool teardown is best effort
                 pass
         if self._recorder is not None:
             try:

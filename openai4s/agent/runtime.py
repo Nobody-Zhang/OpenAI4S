@@ -107,7 +107,9 @@ class CompactionPolicy:
     cfg: Any
     log: LogFn = _null_log
     metadata_provider: Callable[[RunState], Mapping[str, Any] | None] | None = None
-    tool_schema_provider: Callable[[RunState], Sequence[Mapping[str, Any]]] | None = None
+    tool_schema_provider: Callable[
+        [RunState], Sequence[Mapping[str, Any]]
+    ] | None = None
     context_budget_provider: Callable[[RunState], int | None] | None = None
     artifact_archiver: Callable[
         [Any, Mapping[str, Any], dict[str, Any]], Mapping[str, Any]
@@ -118,6 +120,11 @@ class CompactionPolicy:
     large_output_chars: int = DEFAULT_LARGE_OUTPUT_CHARS
     low_yield_streak: int = field(default=0, init=False)
     circuit_open: bool = field(default=False, init=False)
+    # Context size (tokens) when the breaker last tripped, so it can re-open a
+    # retry once genuinely new material has accumulated.
+    circuit_open_total: int = field(default=0, init=False)
+    # Multiple of ``circuit_open_total`` at which compaction is retried.
+    circuit_retry_growth: float = 1.5
 
     def prepare(self, state: RunState) -> Sequence[Mapping[str, Any]]:
         if self.minimum_yield_ratio < 0 or self.minimum_yield_ratio >= 1:
@@ -165,11 +172,25 @@ class CompactionPolicy:
         ):
             return messages
         if self.circuit_open:
+            # The breaker prevents *repeated futile* compaction, not compaction
+            # forever: once the context has grown materially past the size at
+            # which it tripped, there is new compactible material, so reset and
+            # retry.  Without this the breaker permanently disables compaction
+            # for the run and the context grows unbounded into a provider 4xx.
+            if before.total < self.circuit_open_total * self.circuit_retry_growth:
+                self.log(
+                    "[compaction skipped] circuit breaker open after "
+                    f"{self.low_yield_streak} low-yield attempts"
+                )
+                return messages
             self.log(
-                "[compaction skipped] circuit breaker open after "
-                f"{self.low_yield_streak} low-yield attempts"
+                "[compaction retry] context grew "
+                f"{before.total} >= {self.circuit_retry_growth}x "
+                f"{self.circuit_open_total}; reopening compaction"
             )
-            return messages
+            self.circuit_open = False
+            self.low_yield_streak = 0
+            self.circuit_open_total = 0
 
         try:
             prepared = compact(
@@ -196,6 +217,7 @@ class CompactionPolicy:
             self.low_yield_streak += 1
             if self.low_yield_streak >= self.max_low_yield_attempts:
                 self.circuit_open = True
+                self.circuit_open_total = before.total
             self.log(
                 "[compaction low-yield] "
                 f"ratio={ratio:.3f} streak={self.low_yield_streak} "
@@ -259,9 +281,7 @@ class LocalActionExecutor:
             def execute():
                 if self.tool_catalog is None:
                     return execute_tool_call(self.dispatcher, payload)
-                return execute_tool_call(
-                    self.dispatcher, payload, self.tool_catalog
-                )
+                return execute_tool_call(self.dispatcher, payload, self.tool_catalog)
 
             if not callable(binder):
                 return execute()
@@ -287,9 +307,7 @@ class LocalActionExecutor:
             validate=lambda name, arguments: tool_validation_error(
                 name, arguments, self.tool_catalog
             ),
-            parallel_policy=lambda call: tool_parallel_policy(
-                call, self.tool_catalog
-            ),
+            parallel_policy=lambda call: tool_parallel_policy(call, self.tool_catalog),
         )
 
     def _execute_code(
@@ -320,9 +338,8 @@ class LocalActionExecutor:
                 result = self.kernel.execute(action.code, origin="agent")
             self._record_kernel_generation(state)
         observation = format_observation(result)
-        if (
-            count_code_blocks(reply.content) > 1
-            or has_incomplete_code_block(reply.content)
+        if count_code_blocks(reply.content) > 1 or has_incomplete_code_block(
+            reply.content
         ):
             observation += MULTI_CELL_NOTE
         completion = getattr(self.dispatcher, "last_output", None)
@@ -381,12 +398,9 @@ class TranscriptEventSink:
     def emit(self, event: AgentEvent) -> None:
         if isinstance(event, ReplyReceived):
             self.transcript.append(TranscriptTurn("assistant", event.reply.content))
-            self.log(
-                f"\n--- turn {event.turn} (assistant) ---\n{event.reply.content}"
-            )
+            self.log(f"\n--- turn {event.turn} (assistant) ---\n{event.reply.content}")
         elif (
-            isinstance(event, OutcomeProduced)
-            and event.outcome.observation is not None
+            isinstance(event, OutcomeProduced) and event.outcome.observation is not None
         ):
             content = str(event.outcome.observation)
             self.transcript.append(TranscriptTurn("observation", content))
@@ -415,7 +429,9 @@ def format_observation(result: dict) -> str:
             "before the failed dependency; never send only a continuation "
             "fragment."
         )
-        if "No module named 'host'" in str(error) or 'No module named "host"' in str(error):
+        if "No module named 'host'" in str(error) or 'No module named "host"' in str(
+            error
+        ):
             parts.append(
                 "[system] `host` is a pre-injected Python singleton. Use it "
                 "directly; never `import host` or `from host import ...`."

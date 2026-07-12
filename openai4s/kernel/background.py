@@ -169,10 +169,15 @@ class BackgroundExecutor:
             thread = job._thread
             if thread is not None:
                 thread.join(timeout=max(0.0, timeout_per_job))
-            if thread is not None and thread.is_alive():
+            # ``thread`` is None during the launch() window between registering
+            # the job and assigning its thread; the kernel worker already exists
+            # (created before registration), so it must still be hard-killed
+            # here or it leaks a running background worker past teardown.
+            if thread is None or thread.is_alive():
                 try:
                     job._kernel.kill_worker()
                 except Exception:  # noqa: BLE001 — worker may already be dead
                     pass
-                thread.join(timeout=max(0.0, timeout_per_job))
+                if thread is not None:
+                    thread.join(timeout=max(0.0, timeout_per_job))
         return stopped
