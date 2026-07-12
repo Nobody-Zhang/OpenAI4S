@@ -1,4 +1,4 @@
-"""Tests for the outbound domain allowlist / network egress fence (report §5.1).
+"""Tests for the outbound domain allowlist / network egress fence.
 
 Covers the pure enforcement engine (mode gating, suffix matching, runtime
 grants, the host.bash static scan), the SecurityConfig surface, and the
@@ -191,23 +191,84 @@ def _wait_ask(events):
     raise AssertionError("no await_permission emitted")
 
 
+def _kernel_local_host():
+    """SDK host with a test-only capability issuer and no Host execution."""
+    from pathlib import Path
+
+    from openai4s.host.bash import BashAuthorizationService
+    from openai4s.sdk.host import build_host, decode_args
+
+    def _no_rpc(method, args):
+        raise AssertionError(f"host.bash must not RPC to the host: {method}")
+
+    service = BashAuthorizationService(
+        workspace=lambda: Path.cwd(), frame_id=lambda: None
+    )
+
+    def authorize(method, args):
+        decoded = decode_args(args)
+        if method == "authorize_bash":
+            return service.authorize(decoded[0])
+        if method == "consume_bash_authorization":
+            return service.consume(decoded[0])
+        if method == "record_bash_result":
+            return service.record_result(decoded[0])
+        raise AssertionError(f"unexpected authorization method: {method}")
+
+    return build_host(_no_rpc, bash_authorizer=authorize)
+
+
 def test_bash_blocked_domain_soft_fails_before_running(tmp_path, monkeypatch):
     _allowlist(monkeypatch)
-    disp, _frame, _ = _dispatcher(tmp_path)  # headless → gate degrades to allow
-    r = disp("bash", [{"command": "curl -s https://evil.example.com/x > out.txt"}])
-    assert set(r.keys()) == {"error"}
-    # the soft-fail error is exactly the shared blocked-message (names the host)
-    assert r["error"] == egress.blocked_message("evil.example.com")
+    monkeypatch.chdir(tmp_path)
+    host = _kernel_local_host()
+    with pytest.raises(RuntimeError) as ei:
+        host.bash("curl -s https://evil.example.com/x > out.txt")
+    # the error is exactly the shared blocked-message (names the host)
+    assert str(ei.value) == egress.blocked_message("evil.example.com")
     # the command never ran, so it wrote nothing
-    assert not (disp._workspace() / "out.txt").exists()
+    assert not (tmp_path / "out.txt").exists()
 
 
 def test_bash_allowlisted_domain_is_not_fenced(tmp_path, monkeypatch):
     _allowlist(monkeypatch)
-    disp, _frame, _ = _dispatcher(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    host = _kernel_local_host()
     # echo of an allowlisted URL passes the egress scan and runs (no network)
-    r = disp("bash", [{"command": "echo fetching https://pypi.org/simple/ done"}])
+    r = host.bash("echo fetching https://pypi.org/simple/ done")
     assert "done" in (r.get("stdout") or "")
+    assert r.get("exit_code") == 0
+
+
+def test_kernel_local_bash_sees_runtime_grants_via_host_verdict(tmp_path, monkeypatch):
+    """The request_network_access escape hatch must keep working for bash:
+    grants live only in the HOST process, so the kernel-local bash extracts
+    the domains and asks the host (egress_check) for the verdict instead of
+    trusting its own stale worker-side fence."""
+    from openai4s.sdk.host import build_host
+
+    _allowlist(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    disp, frame, store = _dispatcher(tmp_path)
+    disp.set_workspace(tmp_path)
+    store.set_permission_rule(
+        scope="conversation",
+        scope_id=frame,
+        tool="bash",
+        pattern="*",
+        decision="allow",
+    )
+    host = build_host(lambda method, args: disp(method, args))
+
+    # blocked before any grant — the verdict comes from the host
+    with pytest.raises(RuntimeError):
+        host.bash("curl -s https://data.mycorp.io/f > out.txt")
+    assert not (tmp_path / "out.txt").exists()
+
+    # the host-side grant (what _m_request_network_access performs) must be
+    # visible to the next kernel-local bash call
+    egress.grant_domain("data.mycorp.io")
+    r = host.bash("echo would fetch https://data.mycorp.io/f")
     assert r.get("exit_code") == 0
 
 
@@ -283,7 +344,14 @@ def test_request_network_access_denied_leaves_fence_closed(tmp_path, monkeypatch
 
 def test_request_network_access_requires_a_domain(tmp_path, monkeypatch):
     _allowlist(monkeypatch)
-    disp, _frame, _ = _dispatcher(tmp_path)  # headless → gate allows, handler runs
+    disp, _frame, store = _dispatcher(tmp_path)
+    store.set_permission_rule(
+        scope="global",
+        scope_id="",
+        tool="request_network_access",
+        pattern="*",
+        decision="allow",
+    )
     r = disp("request_network_access", [{"domain": ""}])
     assert set(r.keys()) == {"error"} and "domain" in r["error"]
 

@@ -11,5 +11,6 @@ each skill's SKILL.md (and the import path of its kernel.py) into the agent's
 system context, so the model imports the sidecar and calls its functions.
 """
 from openai4s.skills_loader.loader import Skill, SkillLoader, discover_skills
+from openai4s.skills_loader.versions import SkillVersionService
 
-__all__ = ["Skill", "SkillLoader", "discover_skills"]
+__all__ = ["Skill", "SkillLoader", "SkillVersionService", "discover_skills"]

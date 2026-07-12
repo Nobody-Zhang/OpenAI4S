@@ -8,6 +8,7 @@ const ICONS = {
   "plus": '<path d="M5 12h14"/><path d="M12 5v14"/>',
   "chevron-down": '<path d="m6 9 6 6 6-6"/>',
   "chevron-up": '<path d="m18 15-6-6-6 6"/>',
+  "chevron-right": '<path d="m9 18 6-6-6-6"/>',
   "arrow-left": '<path d="m12 19-7-7 7-7"/><path d="M19 12H5"/>',
   "arrow-down": '<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>',
   "x": '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
@@ -32,6 +33,8 @@ const ICONS = {
   "download": '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/>',
   "mic": '<path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/>',
   "notebook": '<path d="M2 6h4"/><path d="M2 10h4"/><path d="M2 14h4"/><path d="M2 18h4"/><rect width="16" height="20" x="4" y="2" rx="2"/><path d="M16 2v20"/>',
+  "folder": '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/>',
+  "compass": '<circle cx="12" cy="12" r="10"/><path d="m16.2 7.8-2.1 6.3-6.3 2.1 2.1-6.3Z"/>',
   "file": '<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/>',
   "file-text": '<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/>',
   "table": '<path d="M12 3v18"/><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M3 15h18"/>',
@@ -74,9 +77,18 @@ const api = async (p, o = {}) => {
   if (typeof p !== "string" || p[0] !== "/" || p[1] === "/") throw new Error("invalid api path");
   const r = await fetch("/api" + p, { headers: { "content-type": "application/json" }, ...o });
   const t = await r.text(); let j = null; try { j = t ? JSON.parse(t) : null; } catch { j = t; }
-  if (!r.ok) throw new Error((j && j.detail) || ("HTTP " + r.status)); return j;
+  if (!r.ok) throw new Error((j && (j.error || j.detail)) || ("HTTP " + r.status)); return j;
 };
-const S = { projects: [], sessions: [], project: null, currentId: null, ws: null, stream: null, running: false, models: [], defaultModel: null, sandboxOrigin: "", planMode: false, exploreMode: false, planPending: false, planReady: null, planStatus: null, artifacts: [], dock: { open: false, tab: "notebook" }, openTabs: [], activeTab: "notebook", provMode: false, provSub: "code", cells: [], kernels: [], liveCells: [], _liveCell: null, dockArtifact: null, kernelFilter: null, _titleName: "", skillsCatalog: null, _menu: null, annotations: [], _annotDraft: null, filesScope: "frame", projectArtifacts: [], _projArtFor: null };
+const S = { projects: [], sessions: [], project: null, currentId: null, ws: null, stream: null, running: false, models: [], defaultModel: null, sandboxOrigin: "", planMode: false, exploreMode: false, planPending: false, planReady: null, planStatus: null, artifacts: [], dock: { open: false, tab: "notebook" }, openTabs: [], activeTab: "notebook", provMode: false, provSub: "code", cells: [], kernels: [], liveCells: [], _liveCell: null, dockArtifact: null, kernelFilter: null, _titleName: "", skillsCatalog: null, _menu: null, annotations: [], _annotDraft: null, filesScope: "frame", projectArtifacts: [], _projArtFor: null,
+  rendererCatalog: null, _rendererCatalogPromise: null, rendererDescriptors: {},
+  // The workbench surfaces are projections only. They deliberately keep no
+  // provider wire payloads or raw tool arguments in browser state.
+  actionTimeline: null, executionQueue: null, executionIdentity: null, recoveryState: null,
+  recoveryActions: null, branchState: null, branchUndo: null, contextState: null, securityState: null,
+  delegationState: null,
+  workbenchErrors: {}, _workbenchReq: 0, _timelineHistoryReq: 0, _timelineHistoryLoading: null,
+  _recoveryActionLoading: null, _branchActionLoading: null,
+  variableInspector: { language: "python", results: {}, loading: null, error: "", request: 0 } };
 const ac = { open: false, items: [], idx: 0, trigger: "", start: 0 };
 const TOOL_LABELS = { run_python: "toolLabel.runPython", run_bash: "toolLabel.runBash", search_skills: "toolLabel.searchSkills", read_skill: "toolLabel.readSkill", write_file: "toolLabel.writeFile", read_file: "toolLabel.readFile", list_files: "toolLabel.listFiles", delegate: "toolLabel.delegate" };
 
@@ -116,6 +128,7 @@ function rerenderI18n() {
   try { renderProjMenu(); } catch {}
   try { renderSessions(); } catch {}
   try { renderDockTabs(); } catch {}
+  try { if (S.activeTab === "notebook") renderNotebook(); else if (S.activeTab === "timeline") renderActionTimeline(); } catch {}
   try { if (S._titleName) setTitle(S._titleName); } catch {}
   try { if (!$("#cust").classList.contains("hidden")) { const at = document.querySelector(".cust-tab.active"); custTab(at ? at.dataset.tab : "general"); } } catch {}
   try { const m = $("#messages"); if (m && m.children.length === 1 && m.firstChild && m.firstChild.classList && m.firstChild.classList.contains("empty-session")) { m.innerHTML = ""; renderEmptySession(); } } catch {}
@@ -174,6 +187,20 @@ Object.assign(I18N.zh, {
   "common.settings": "设置",
   "common.view": "查看",
   "composer.attach": "上传文件",
+  "composer.addToMessage": "添加到消息",
+  "composer.sessionOptions": "会话选项",
+  "composer.menu.attachFiles": "附加文件",
+  "composer.menu.contextUsage": "上下文用量",
+  "composer.menu.requestReview": "请求审核",
+  "composer.menu.saveAsSkill": "另存为技能",
+  "composer.menu.yourFiles": "你的文件",
+  "composer.option.autoReview": "自动审核",
+  "composer.option.compute": "计算环境",
+  "composer.option.delegation": "委派",
+  "composer.option.memory": "记忆",
+  "composer.option.reviewerModel": "Reviewer 模型",
+  "composer.option.sameModel": "跟随主模型",
+  "composer.option.specialist": "专家",
   "composer.model": "模型",
   "composer.placeholder": "输入任何内容 — @ 引用制品，# 引用会话，/ 使用技能，⌘K 搜索…",
   "composer.planMode": "计划模式",
@@ -289,6 +316,17 @@ Object.assign(I18N.zh, {
   "cust.models.model.placeholder": "模型 id（留空用 provider 默认）",
   "cust.models.modelPlaceholder2": "模型 id（留空用该 provider 默认）",
   "cust.models.namePlaceholder": "名称（如 DeepSeek 生产 / 本地 vLLM）",
+  "cust.models.local.title": "本地推理服务",
+  "cust.models.local.desc": "自动扫描本机固定端口上的 Ollama、LM Studio、vLLM 与 llama.cpp；扫描不会修改当前模型，未知能力默认走保守的 Code-as-Action。",
+  "cust.models.local.scan": "重新扫描",
+  "cust.models.local.scanning": "正在扫描本机…",
+  "cust.models.local.none": "没有发现可用的本地 OpenAI-compatible endpoint。",
+  "cust.models.local.models": "{0} 个模型",
+  "cust.models.local.add": "添加配置",
+  "cust.models.local.configured": "已配置",
+  "cust.models.local.added": "已添加本地模型：{0}",
+  "cust.models.local.error": "本地模型扫描失败：{0}",
+  "cust.models.local.keyless": "本机 · 无需 API Key",
   "cust.models.noKey": "⚠️ 无 Key",
   "cust.models.provider.placeholder": "provider（如 ark / chatgpt / claude / gemini）",
   "cust.models.providerPlaceholder2": "provider（如 ark / chatgpt / claude / gemini）",
@@ -368,6 +406,7 @@ Object.assign(I18N.zh, {
   "dock.notes.placeholder": "添加一条笔记…",
   "dock.tab.files": "文件",
   "dock.tab.notebook": "笔记本",
+  "dock.tab.timeline": "行动时间线",
   "edac.keyword": "关键字",
   "editor.label": "编辑 {0}",
   "empty.sub": "描述你的科研任务，智能体会写 Python、联网检索、调用技能并产出图表/报告/结构文件。可试试：",
@@ -429,8 +468,10 @@ Object.assign(I18N.zh, {
   "msgAction.thumbsUp": "赞",
   "nb.badge.idle": "Idle",
   "nb.badge.live": "Live",
+  "nb.badge.ready": "就绪",
   "nb.cell.statusOk": "ok",
   "nb.cell.statusRunning": "running",
+  "nb.kernel.shared": "与 Agent 共享",
   "nb.chips.all": "全部",
   "nb.empty": "运行任务后，这里会显示 Notebook 代码单元与输出。",
   "nb.env.placeholder": "环境…",
@@ -466,12 +507,158 @@ Object.assign(I18N.zh, {
   "nb.status.ended": "{0} · 已结束 — 仅供查看；该内核的内存命名空间已不存在。",
   "nb.status.hint": "发送消息即可继续。你的下一条消息会在此环境中恢复运行 — 工作区文件保留；内存中的变量仅在内核存活时恢复。",
   "nb.status.live": "运行中 · {0}",
+  "nb.status.ready": "就绪 · {0}",
+  "nb.revisions.summary": "共 {0} 次尝试 · 展开查看 {1} 个失败版本",
   "nb.table.rowsHidden": "… {0} 行未显示",
+  "nb.action.copy": "复制",
+  "nb.action.copied": "已复制代码",
+  "nb.action.rerun": "作为新单元运行",
+  "nb.action.fork": "从此前 Fork",
+  "nb.action.promote": "提升为 Artifact",
+  "nb.action.unavailable": "当前服务尚未提供此操作；历史单元不会被修改。",
+  "nb.action.failed": "Notebook 操作失败：{0}",
+  "nb.interrupt.noOwner": "当前没有可精确中断的 execution owner。",
+  "nb.action.queued": "已追加为新的 {0} 单元",
+  "nb.cell.current": "Current",
+  "nb.cell.drafting": "模型草稿 · 正在更新",
+  "nb.cell.stale": "Stale",
+  "nb.cell.nonReplayable": "Non-replayable",
+  "nb.cell.historical": "历史版本 · 只读",
+  "nb.repl.language": "语言",
+  "nb.repl.run": "Shift+Enter 运行",
+  "nb.repl.multilineHint": "多行 Python/R 输入只会追加新单元；已执行历史始终只读。",
+  "nb.variables.title": "Variable Inspector",
+  "nb.variables.language": "命名空间",
+  "nb.variables.refresh": "刷新变量",
+  "nb.variables.loading": "正在读取当前命名空间…",
+  "nb.variables.notLoaded": "选择 Python 或 R，然后手动刷新。读取不会运行 Cell。",
+  "nb.variables.empty": "当前命名空间没有可显示的用户变量。",
+  "nb.variables.error": "变量读取失败：{0}",
+  "nb.variables.generation": "Generation {0}",
+  "nb.variables.revision": "State revision S{0}",
+  "nb.variables.stale": "可能已过期 · 请刷新",
+  "nb.variables.truncated": "只显示前 {0} 个变量",
+  "nb.variables.length": "长度 {0}",
+  "nb.variables.fingerprint": "指纹 {0}",
+  "nb.variables.state.busy": "内核正在执行，Variable Inspector 暂不可用。",
+  "nb.variables.state.ended": "该内核 generation 已结束；不会为检查变量而重启。",
+  "nb.variables.state.not_started": "该语言内核从未启动；不会为检查变量而启动。",
+  "nb.variables.state.restoring": "内核正在恢复，完成后再刷新。",
+  "nb.variables.state.unsupported": "当前内核不支持安全变量检查。",
+  "nb.variables.state.failed": "变量检查已安全失败；命名空间未被修改。",
+  "runtime.branch": "Branch",
+  "runtime.python": "Python",
+  "runtime.r": "R",
+  "runtime.revision": "Revision",
+  "runtime.owner": "Owner",
+  "runtime.queue": "Queue",
+  "runtime.none": "—",
+  "runtime.status.live": "Live",
+  "runtime.status.busy": "Busy",
+  "runtime.status.ended": "Ended · 仅供查看",
+  "runtime.status.restoring": "Restoring",
+  "runtime.status.partial": "Partial",
+  "runtime.status.failed": "Failed",
+  "runtime.trust.quarantined": "隔离导入",
+  "runtime.trust": "信任",
+  "runtime.quarantineHint": "这是未受信任的导入会话，当前仅供查看。请在恢复面板明确确认“全新重启”后再继续。",
+  "timeline.title": "Action Timeline",
+  "timeline.subtitle": "来自持久 Action Ledger 的安全投影；不显示原始参数、wire state 或 token。",
+  "timeline.refresh": "刷新",
+  "timeline.loading": "正在读取行动记录…",
+  "timeline.loadEarlier": "加载更早记录",
+  "timeline.loadingEarlier": "正在加载更早记录…",
+  "timeline.loadEarlierFailed": "无法加载更早记录：{0}",
+  "timeline.historyLimit": "已显示最近 {0} 条记录；为保持页面流畅，不能继续向前加载。",
+  "timeline.empty": "还没有可显示的行动。Notebook 仅保留科研 cell，完整控制流程会出现在这里。",
+  "timeline.owner": "Owner",
+  "timeline.permission": "权限",
+  "timeline.resources": "资源",
+  "timeline.generation": "Generation",
+  "timeline.replay": "Replay",
+  "timeline.duration": "耗时",
+  "timeline.artifacts": "产物",
+  "timeline.tokens": "Tokens",
+  "timeline.tokensValue": "{0} 输入 · {1} 输出",
+  "timeline.cost": "成本",
+  "timeline.kind.native_tool": "Native Tool",
+  "timeline.kind.python": "Python Cell",
+  "timeline.kind.r": "R Cell",
+  "timeline.kind.dynamic_tool": "Dynamic Tool",
+  "timeline.kind.delegate": "Delegated Agent",
+  "timeline.kind.background": "Background / Remote Job",
+  "timeline.kind.permission": "Permission Pause",
+  "timeline.kind.recovery": "Recovery Event",
+  "timeline.kind.finalize": "FinalizeAction",
+  "timeline.kind.action": "Action",
+  "timeline.panel.branches": "Branch · Checkpoint",
+  "timeline.panel.context": "Context composition",
+  "timeline.panel.security": "Sandbox · Permission",
+  "timeline.panel.delegation": "子代理树",
+  "timeline.noBranch": "尚无 branch/checkpoint 投影。",
+  "timeline.noContext": "尚无 context composition 投影。",
+  "timeline.noSecurity": "尚无 sandbox/permission 状态投影。",
+  "timeline.noDelegation": "本会话尚未创建子代理。",
+  "delegation.budget": "预算 {0}/{1}",
+  "delegation.active": "活动 {0}",
+  "delegation.turns": "边界 {0}/{1}",
+  "delegation.steering": "消息：{0} 待投递 · {1} 已投递",
+  "branch.current": "当前",
+  "branch.viewOnly": "未激活 · 仅查看",
+  "branch.currentSummary": "当前分支：{0}",
+  "branch.head": "Head {0}",
+  "branch.checkpoint": "创建 checkpoint",
+  "branch.fork": "Fork",
+  "branch.forkName": "为新分支命名（可以留空）",
+  "branch.forkDefault": "Fork {0}",
+  "branch.forked": "已从 checkpoint {0} 创建分支",
+  "branch.activate": "激活",
+  "branch.activating": "正在切换…",
+  "branch.activated": "已切换到分支 {0}",
+  "branch.activatedPartial": "已切换到分支 {0}，但部分状态需要修复；请查看 Recovery。",
+  "branch.internalCheckpoints": "内部游标 checkpoint（{0}）",
+  "branch.preview": "预览回滚",
+  "branch.revert": "回滚并继续",
+  "branch.undo": "撤销上次回滚",
+  "branch.undone": "已撤销上次回滚",
+  "branch.actionFailed": "Branch 操作失败：{0}",
+  "branch.conflict": "检测到外部文件冲突，不能直接应用。",
+  "branch.previewTitle": "Revert preview",
+  "branch.diff": "消息 {0} · Notebook {1} · 文件写入 {2} / 删除 {3} · Artifact +{4}/-{5}",
+  "recovery.title": "Kernel Recovery",
+  "recovery.checkpoint": "Checkpoint {0}",
+  "recovery.action.restore": "恢复 checkpoint",
+  "recovery.action.retry": "重试恢复",
+  "recovery.action.restart_fresh": "全新重启",
+  "recovery.action.ready": "可以执行",
+  "recovery.action.loading": "正在执行…",
+  "recovery.action.unavailable": "当前服务未提供此 Recovery 操作。",
+  "recovery.action.currentOnly": "Recovery 只允许用于当前会话已激活的分支。",
+  "recovery.action.failed": "Recovery 操作失败：{0}",
+  "recovery.action.done": "Recovery 操作已完成；状态与 journal 已刷新。",
+  "recovery.freshConfirm": "全新重启会清空当前 Python/R 内存变量，不会把 checkpoint 当作已恢复的命名空间。对话、Notebook、工作区文件与 Artifact 会保留。确定继续吗？",
+  "context.tokens": "{0} tokens",
+  "context.outputReserve": "输出预留 {0}",
+  "context.messages": "{0} 条消息",
+  "context.compressed": "已压缩",
+  "context.handoff": "Handoff",
+  "context.history": "压缩历史（{0}）",
+  "context.compaction": "Compaction",
+  "context.savings": "{0} → {1} tokens",
+  "context.artifacts": "{0} 个 Artifact 引用",
+  "security.sandbox": "Sandbox",
+  "security.generation": "Generation",
+  "security.generationEnded": "{0} 已结束（{1}）",
+  "security.permission": "Permission",
+  "security.selfTest": "Self-test",
+  "security.network": "Network",
+  "security.pending": "{0} 个待审批",
   "notes.empty": "还没有笔记。",
   "notes.emptyNoProject": "在某个项目下可添加笔记。",
   "palette.action.backHome": "返回主页",
   "palette.action.customize": "自定义",
   "palette.action.newProject": "新建项目",
+  "palette.action.search": "搜索",
   "palette.action.newSession": "新建会话",
   "palette.action.openNotebook": "打开 Notebook",
   "palette.empty": "没有匹配项",
@@ -482,7 +669,9 @@ Object.assign(I18N.zh, {
   "palette.searchPlaceholder": "搜索会话、产物、技能，或执行命令…",
   "perm.badge.subAgent": "子智能体",
   "perm.btn.allow": "允许",
+  "perm.btn.continueReplan": "继续并重新规划",
   "perm.btn.deny": "拒绝",
+  "perm.continuePrompt": "继续。刚才批准的是守护进程重启前被中断的操作；请先重新评估当前状态，只在仍有必要时发起新的操作，不要假设原操作已经执行。",
   "perm.lbl.rememberRule": "记住规则（可用 * 通配）",
   "perm.lbl.rememberScope": "记住范围",
   "perm.placeholder.denyReason": "（可选）拒绝原因，会反馈给智能体",
@@ -492,6 +681,8 @@ Object.assign(I18N.zh, {
   "perm.scope.project": "本项目",
   "perm.status.allowed": "已允许",
   "perm.status.allowedScope": "已允许（{0}）",
+  "perm.status.afterRestartAllowed": "批准已记录；守护进程重启后，原操作未执行。",
+  "perm.status.afterRestartDenied": "已拒绝；守护进程重启后，原操作未执行。",
   "perm.status.denied": "已拒绝",
   "perm.sub.approvalNeeded": "智能体请求执行下面的操作，需要你的批准。",
   "perm.title.run": "运行 {0}",
@@ -524,7 +715,24 @@ Object.assign(I18N.zh, {
   "proj.delete.confirm": "确定删除该项目？此操作不可撤销。",
   "proj.fallbackName": "项目",
   "proj.menu.allProjects": "所有项目",
+  "proj.menu.downloadArtifacts": "下载产物",
+  "proj.menu.settings": "项目设置",
+  "proj.menu.newProject": "新建项目",
+  "projectResearch.menu": "项目研究图谱",
+  "projectResearch.title": "{0} · 全局研究视图",
+  "projectResearch.timeline": "Timeline",
+  "projectResearch.lineage": "Lineage",
+  "projectResearch.timelineSummary": "{0} 个会话 · {1} 个行动",
+  "projectResearch.lineageSummary": "{0} 个 Artifact · {1} 个版本 · {2} 条边",
+  "projectResearch.latest": "latest",
+  "projectResearch.noLineage": "还没有项目级血缘数据。",
+  "projectResearch.edges": "血缘边（{0}）",
+  "sessionPackage.import": "导入会话包",
+  "sessionPackage.export": "导出会话包",
+  "sessionPackage.imported": "会话包已安全导入；Kernel 保持结束状态，需显式恢复",
+  "sessionPackage.tooLarge": "会话包超过客户端 128 MiB 限制",
   "projModal.create": "创建",
+  "projModal.editTitle": "项目设置",
   "projModal.ctx.label": "智能体上下文",
   "projModal.ctx.placeholder": "包含在此项目每个智能体的提示词中",
   "projModal.desc.placeholder": "显示在项目列表中",
@@ -576,7 +784,10 @@ Object.assign(I18N.zh, {
   "session.newFolder": "＋ 文件夹",
   "session.untitled": "未命名会话",
   "sessionMenu.duplicate": "复制会话",
+  "sessionMenu.cancel": "取消任务",
+  "sessionMenu.downloadArtifacts": "下载产物",
   "sessionMenu.exportMarkdown": "导出为 Markdown",
+  "sessionMenu.viewNotebook": "查看 Notebook",
   "sessionMenu.moveToFolder": "移动到文件夹",
   "skill.bodyPlaceholder": "SKILL.md 正文（Markdown 配方：步骤、代码、注意事项…）",
   "skill.descPlaceholder": "一句话描述（用于技能检索）",
@@ -591,6 +802,17 @@ Object.assign(I18N.zh, {
   "skill.namePlaceholder": "技能名（英文短横线，如 my-analysis）",
   "skill.newTitle": "新建技能",
   "skill.saveBtn": "保存技能",
+  "skill.historyBtn": "版本历史",
+  "skill.historyTitle": "技能版本 — {0}",
+  "skill.historyEmpty": "这个作用域还没有可回滚的版本。",
+  "skill.scope.personal": "个人",
+  "skill.scope.project": "项目",
+  "skill.scope.bundled": "内置",
+  "skill.versionActive": "当前版本",
+  "skill.rollbackBtn": "回滚到此版本",
+  "skill.rollbackConfirm": "将 {0} 回滚到版本 {1}？当前版本仍会保留。",
+  "skill.rollbackDone": "已将 {0} 回滚到所选版本",
+  "skill.versionSidecar": "Sidecar：{0}",
   "specialist.descPlaceholder": "一句话描述",
   "specialist.editTitle": "编辑专家 — {0}",
   "specialist.label.systemPrompt": "系统提示",
@@ -690,7 +912,23 @@ Object.assign(I18N.zh, {
   "versions.restoring": "恢复中…",
   "viewer.act.fullscreen": "全屏",
   "viewer.act.more": "更多",
+  "viewer.chem.fallback": "当前文件没有可安全绘制的二维坐标，下面保留原始化学表示。",
+  "viewer.chem.source": "原始化学表示",
+  "viewer.downloadOnly": "该二进制产物没有安全的内置预览器。",
   "viewer.empty": "在会话里点击一个文件以查看。",
+  "viewer.genome.features": "{0} 个特征 · {1} 条染色体/序列",
+  "viewer.genome.invalid": "忽略 {0} 条无效记录",
+  "viewer.genome.list": "特征描述",
+  "viewer.latex.preview": "安全预览",
+  "viewer.latex.source": "LaTeX 源码",
+  "viewer.loading": "正在选择安全渲染器…",
+  "viewer.msa.summary": "{0} 条序列 · {1} 列 · {2}",
+  "viewer.renderer.compat": "兼容模式",
+  "viewer.renderer.error": "无法预览此产物，可继续下载原文件。",
+  "viewer.renderer.matched": "匹配：{0}",
+  "viewer.renderer.version": "版本 {0}",
+  "viewer.sequence.omitted": "为保持界面流畅，其余 {0} 个残基未展开。",
+  "viewer.sequence.summary": "{0} 条序列 · {1} 个残基 · {2}",
   "ws.nav.files": "文件",
   "ws.nav.new": "新建",
   "ws.sidebar.collapse": "收起侧栏 (⌘B)",
@@ -749,6 +987,20 @@ Object.assign(I18N.en, {
   "common.settings": "Settings",
   "common.view": "View",
   "composer.attach": "Upload file",
+  "composer.addToMessage": "Add to message",
+  "composer.sessionOptions": "Session options",
+  "composer.menu.attachFiles": "Attach files",
+  "composer.menu.contextUsage": "Context usage",
+  "composer.menu.requestReview": "Request review",
+  "composer.menu.saveAsSkill": "Save as skill",
+  "composer.menu.yourFiles": "Your files",
+  "composer.option.autoReview": "Auto-review",
+  "composer.option.compute": "Compute",
+  "composer.option.delegation": "Delegation",
+  "composer.option.memory": "Memory",
+  "composer.option.reviewerModel": "Reviewer model",
+  "composer.option.sameModel": "Same as agent",
+  "composer.option.specialist": "Specialist",
   "composer.model": "Model",
   "composer.placeholder": "Ask anything — @ for artifacts, # for sessions, / for skills, ⌘K to search…",
   "composer.planMode": "Plan mode",
@@ -864,6 +1116,17 @@ Object.assign(I18N.en, {
   "cust.models.model.placeholder": "Model id (leave blank to use the provider default)",
   "cust.models.modelPlaceholder2": "Model id (leave blank for the provider default)",
   "cust.models.namePlaceholder": "Name (e.g. DeepSeek Prod / Local vLLM)",
+  "cust.models.local.title": "Local inference servers",
+  "cust.models.local.desc": "Automatically scans fixed loopback ports for Ollama, LM Studio, vLLM, and llama.cpp. Scanning never changes the active model; unknown capabilities default to conservative Code-as-Action.",
+  "cust.models.local.scan": "Scan again",
+  "cust.models.local.scanning": "Scanning this machine…",
+  "cust.models.local.none": "No local OpenAI-compatible endpoint was detected.",
+  "cust.models.local.models": "{0} models",
+  "cust.models.local.add": "Add profile",
+  "cust.models.local.configured": "Configured",
+  "cust.models.local.added": "Added local model: {0}",
+  "cust.models.local.error": "Local model discovery failed: {0}",
+  "cust.models.local.keyless": "local · no API key required",
   "cust.models.noKey": "⚠️ No key",
   "cust.models.provider.placeholder": "provider (e.g. ark / chatgpt / claude / gemini)",
   "cust.models.providerPlaceholder2": "provider (e.g. ark / chatgpt / claude / gemini)",
@@ -943,6 +1206,7 @@ Object.assign(I18N.en, {
   "dock.notes.placeholder": "Add a note…",
   "dock.tab.files": "Files",
   "dock.tab.notebook": "Notebook",
+  "dock.tab.timeline": "Action Timeline",
   "edac.keyword": "Keywords",
   "editor.label": "Editing {0}",
   "empty.sub": "Describe your research task and the agent will write Python, search the web, invoke skills, and produce charts/reports/structure files. Try:",
@@ -1004,8 +1268,10 @@ Object.assign(I18N.en, {
   "msgAction.thumbsUp": "Like",
   "nb.badge.idle": "Idle",
   "nb.badge.live": "Live",
+  "nb.badge.ready": "Ready",
   "nb.cell.statusOk": "ok",
   "nb.cell.statusRunning": "running",
+  "nb.kernel.shared": "shared with the agent",
   "nb.chips.all": "All",
   "nb.empty": "After running a task, Notebook code cells and outputs will appear here.",
   "nb.env.placeholder": "Environment…",
@@ -1041,12 +1307,158 @@ Object.assign(I18N.en, {
   "nb.status.ended": "{0} · ended — view only; this kernel's in-memory namespace no longer exists.",
   "nb.status.hint": "Send a message to continue. Your next message resumes in this environment — workspace files remain; in-memory variables are restored only while the kernel is alive.",
   "nb.status.live": "Live · {0}",
+  "nb.status.ready": "Ready · {0}",
+  "nb.revisions.summary": "{0} attempts · expand {1} failed revisions",
   "nb.table.rowsHidden": "… {0} rows not shown",
+  "nb.action.copy": "Copy",
+  "nb.action.copied": "Code copied",
+  "nb.action.rerun": "Rerun as new",
+  "nb.action.fork": "Fork from before",
+  "nb.action.promote": "Promote to Artifact",
+  "nb.action.unavailable": "This operation is not exposed by the current server; history will not be modified.",
+  "nb.action.failed": "Notebook action failed: {0}",
+  "nb.interrupt.noOwner": "There is no exact execution owner to interrupt.",
+  "nb.action.queued": "Appended as a new {0} cell",
+  "nb.cell.current": "Current",
+  "nb.cell.drafting": "Model draft · updating",
+  "nb.cell.stale": "Stale",
+  "nb.cell.nonReplayable": "Non-replayable",
+  "nb.cell.historical": "Historical revision · read only",
+  "nb.repl.language": "Language",
+  "nb.repl.run": "Shift+Enter to run",
+  "nb.repl.multilineHint": "Multiline Python/R input only appends new cells; executed history is always read-only.",
+  "nb.variables.title": "Variable Inspector",
+  "nb.variables.language": "Namespace",
+  "nb.variables.refresh": "Refresh variables",
+  "nb.variables.loading": "Reading the current namespace…",
+  "nb.variables.notLoaded": "Choose Python or R, then refresh manually. Inspection never runs a Cell.",
+  "nb.variables.empty": "There are no displayable user variables in this namespace.",
+  "nb.variables.error": "Variable inspection failed: {0}",
+  "nb.variables.generation": "Generation {0}",
+  "nb.variables.revision": "State revision S{0}",
+  "nb.variables.stale": "Possibly stale · refresh",
+  "nb.variables.truncated": "Showing only the first {0} variables",
+  "nb.variables.length": "length {0}",
+  "nb.variables.fingerprint": "fingerprint {0}",
+  "nb.variables.state.busy": "The kernel is executing; Variable Inspector is temporarily unavailable.",
+  "nb.variables.state.ended": "This kernel generation has ended; inspection will not restart it.",
+  "nb.variables.state.not_started": "This language kernel has never started; inspection will not start it.",
+  "nb.variables.state.restoring": "Kernel recovery is in progress; refresh when it finishes.",
+  "nb.variables.state.unsupported": "This kernel does not support safe variable inspection.",
+  "nb.variables.state.failed": "Variable inspection failed closed; the namespace was not changed.",
+  "runtime.branch": "Branch",
+  "runtime.python": "Python",
+  "runtime.r": "R",
+  "runtime.revision": "Revision",
+  "runtime.owner": "Owner",
+  "runtime.queue": "Queue",
+  "runtime.none": "—",
+  "runtime.status.live": "Live",
+  "runtime.status.busy": "Busy",
+  "runtime.status.ended": "Ended · view only",
+  "runtime.status.restoring": "Restoring",
+  "runtime.status.partial": "Partial",
+  "runtime.status.failed": "Failed",
+  "runtime.trust.quarantined": "Quarantined import",
+  "runtime.trust": "Trust",
+  "runtime.quarantineHint": "This imported Session is untrusted and view-only. Explicitly confirm Restart fresh in Recovery before continuing.",
+  "timeline.title": "Action Timeline",
+  "timeline.subtitle": "Safe projection of the durable Action Ledger; raw arguments, wire state and tokens are never shown.",
+  "timeline.refresh": "Refresh",
+  "timeline.loading": "Loading actions…",
+  "timeline.loadEarlier": "Load earlier actions",
+  "timeline.loadingEarlier": "Loading earlier actions…",
+  "timeline.loadEarlierFailed": "Could not load earlier actions: {0}",
+  "timeline.historyLimit": "Showing the most recent {0} actions; earlier loading is capped to keep this view responsive.",
+  "timeline.empty": "No actions to show yet. Notebook keeps scientific cells; the full control flow appears here.",
+  "timeline.owner": "Owner",
+  "timeline.permission": "Permission",
+  "timeline.resources": "Resources",
+  "timeline.generation": "Generation",
+  "timeline.replay": "Replay",
+  "timeline.duration": "Duration",
+  "timeline.artifacts": "Artifacts",
+  "timeline.tokens": "Tokens",
+  "timeline.tokensValue": "{0} in · {1} out",
+  "timeline.cost": "Cost",
+  "timeline.kind.native_tool": "Native Tool",
+  "timeline.kind.python": "Python Cell",
+  "timeline.kind.r": "R Cell",
+  "timeline.kind.dynamic_tool": "Dynamic Tool",
+  "timeline.kind.delegate": "Delegated Agent",
+  "timeline.kind.background": "Background / Remote Job",
+  "timeline.kind.permission": "Permission Pause",
+  "timeline.kind.recovery": "Recovery Event",
+  "timeline.kind.finalize": "FinalizeAction",
+  "timeline.kind.action": "Action",
+  "timeline.panel.branches": "Branch · Checkpoint",
+  "timeline.panel.context": "Context composition",
+  "timeline.panel.security": "Sandbox · Permission",
+  "timeline.panel.delegation": "Sub-agent tree",
+  "timeline.noBranch": "No branch/checkpoint projection is available yet.",
+  "timeline.noContext": "No context composition projection is available yet.",
+  "timeline.noSecurity": "No sandbox/permission projection is available yet.",
+  "timeline.noDelegation": "No sub-agent has been created in this session.",
+  "delegation.budget": "Budget {0}/{1}",
+  "delegation.active": "Active {0}",
+  "delegation.turns": "Boundary {0}/{1}",
+  "delegation.steering": "Messages: {0} queued · {1} delivered",
+  "branch.current": "current",
+  "branch.viewOnly": "inactive · view only",
+  "branch.currentSummary": "Current branch: {0}",
+  "branch.head": "Head {0}",
+  "branch.checkpoint": "Create checkpoint",
+  "branch.fork": "Fork",
+  "branch.forkName": "Name the new branch (optional)",
+  "branch.forkDefault": "Fork {0}",
+  "branch.forked": "Created a branch from checkpoint {0}",
+  "branch.activate": "Activate",
+  "branch.activating": "Switching…",
+  "branch.activated": "Activated branch {0}",
+  "branch.activatedPartial": "Activated branch {0}, but some state needs repair; inspect Recovery.",
+  "branch.internalCheckpoints": "Internal cursor checkpoints ({0})",
+  "branch.preview": "Preview revert",
+  "branch.revert": "Revert and continue",
+  "branch.undo": "Undo last revert",
+  "branch.undone": "The last revert was undone",
+  "branch.actionFailed": "Branch action failed: {0}",
+  "branch.conflict": "External file conflicts prevent this revert from being applied.",
+  "branch.previewTitle": "Revert preview",
+  "branch.diff": "Messages {0} · Notebook {1} · files write {2} / delete {3} · Artifacts +{4}/-{5}",
+  "recovery.title": "Kernel Recovery",
+  "recovery.checkpoint": "Checkpoint {0}",
+  "recovery.action.restore": "Restore checkpoint",
+  "recovery.action.retry": "Retry recovery",
+  "recovery.action.restart_fresh": "Restart fresh",
+  "recovery.action.ready": "Ready",
+  "recovery.action.loading": "Running…",
+  "recovery.action.unavailable": "This Recovery action is not advertised by the current server.",
+  "recovery.action.currentOnly": "Recovery is available only for the session's active branch.",
+  "recovery.action.failed": "Recovery action failed: {0}",
+  "recovery.action.done": "Recovery finished; status and journal were refreshed.",
+  "recovery.freshConfirm": "A fresh restart clears the current Python/R in-memory variables and does not claim the checkpoint namespace was restored. Conversation, Notebook, workspace files, and Artifacts remain. Continue?",
+  "context.tokens": "{0} tokens",
+  "context.outputReserve": "output reserve {0}",
+  "context.messages": "{0} messages",
+  "context.compressed": "compressed",
+  "context.handoff": "Handoff",
+  "context.history": "Compaction history ({0})",
+  "context.compaction": "Compaction",
+  "context.savings": "{0} → {1} tokens",
+  "context.artifacts": "{0} Artifact refs",
+  "security.sandbox": "Sandbox",
+  "security.generation": "Generation",
+  "security.generationEnded": "{0} ended ({1})",
+  "security.permission": "Permission",
+  "security.selfTest": "Self-test",
+  "security.network": "Network",
+  "security.pending": "{0} pending approvals",
   "notes.empty": "No notes yet.",
   "notes.emptyNoProject": "Notes can be added under a project.",
   "palette.action.backHome": "Back to home",
   "palette.action.customize": "Customize",
   "palette.action.newProject": "New project",
+  "palette.action.search": "Search",
   "palette.action.newSession": "New session",
   "palette.action.openNotebook": "Open Notebook",
   "palette.empty": "No matches",
@@ -1057,7 +1469,9 @@ Object.assign(I18N.en, {
   "palette.searchPlaceholder": "Search sessions, artifacts, skills, or run a command…",
   "perm.badge.subAgent": "Subagent",
   "perm.btn.allow": "Allow",
+  "perm.btn.continueReplan": "Continue and replan",
   "perm.btn.deny": "Deny",
+  "perm.continuePrompt": "Continue. The operation I just approved was interrupted before the daemon restarted. Re-evaluate the current state first, issue a fresh action only if it is still needed, and do not assume the original operation executed.",
   "perm.lbl.rememberRule": "Remember rule (use * as wildcard)",
   "perm.lbl.rememberScope": "Remember scope",
   "perm.placeholder.denyReason": "(Optional) reason for denial, will be sent to the agent",
@@ -1067,6 +1481,8 @@ Object.assign(I18N.en, {
   "perm.scope.project": "This project",
   "perm.status.allowed": "Allowed",
   "perm.status.allowedScope": "Allowed ({0})",
+  "perm.status.afterRestartAllowed": "Approval recorded; the original operation did not execute after the daemon restart.",
+  "perm.status.afterRestartDenied": "Denied; the original operation did not execute after the daemon restart.",
   "perm.status.denied": "Denied",
   "perm.sub.approvalNeeded": "The agent requests to perform the operation below and needs your approval.",
   "perm.title.run": "Run {0}",
@@ -1099,7 +1515,24 @@ Object.assign(I18N.en, {
   "proj.delete.confirm": "Delete this project? This action cannot be undone.",
   "proj.fallbackName": "Project",
   "proj.menu.allProjects": "All projects",
+  "proj.menu.downloadArtifacts": "Download artifacts",
+  "proj.menu.settings": "Project settings",
+  "proj.menu.newProject": "New project",
+  "projectResearch.menu": "Project research map",
+  "projectResearch.title": "{0} · Global research view",
+  "projectResearch.timeline": "Timeline",
+  "projectResearch.lineage": "Lineage",
+  "projectResearch.timelineSummary": "{0} sessions · {1} actions",
+  "projectResearch.lineageSummary": "{0} Artifacts · {1} versions · {2} edges",
+  "projectResearch.latest": "latest",
+  "projectResearch.noLineage": "No project lineage data yet.",
+  "projectResearch.edges": "Lineage edges ({0})",
+  "sessionPackage.import": "Import session",
+  "sessionPackage.export": "Export session package",
+  "sessionPackage.imported": "Session imported safely; its Kernel remains Ended until explicit recovery",
+  "sessionPackage.tooLarge": "Session package exceeds the 128 MiB client limit",
   "projModal.create": "Create",
+  "projModal.editTitle": "Project settings",
   "projModal.ctx.label": "Agent Context",
   "projModal.ctx.placeholder": "Included in every agent's prompt for this project",
   "projModal.desc.placeholder": "Shown in the project list",
@@ -1151,7 +1584,10 @@ Object.assign(I18N.en, {
   "session.newFolder": "＋ Folder",
   "session.untitled": "Untitled session",
   "sessionMenu.duplicate": "Duplicate session",
+  "sessionMenu.cancel": "Cancel",
+  "sessionMenu.downloadArtifacts": "Download artifacts",
   "sessionMenu.exportMarkdown": "Export as Markdown",
+  "sessionMenu.viewNotebook": "View notebook",
   "sessionMenu.moveToFolder": "Move to folder",
   "skill.bodyPlaceholder": "SKILL.md body (Markdown recipe: steps, code, caveats…)",
   "skill.descPlaceholder": "One-line description (used for skill retrieval)",
@@ -1166,6 +1602,17 @@ Object.assign(I18N.en, {
   "skill.namePlaceholder": "Skill name (lowercase-hyphenated, e.g. my-analysis)",
   "skill.newTitle": "New skill",
   "skill.saveBtn": "Save skill",
+  "skill.historyBtn": "Version history",
+  "skill.historyTitle": "Skill versions — {0}",
+  "skill.historyEmpty": "This scope has no rollbackable versions yet.",
+  "skill.scope.personal": "personal",
+  "skill.scope.project": "project",
+  "skill.scope.bundled": "bundled",
+  "skill.versionActive": "Active version",
+  "skill.rollbackBtn": "Roll back to this version",
+  "skill.rollbackConfirm": "Roll {0} back to version {1}? The current version will be retained.",
+  "skill.rollbackDone": "Rolled {0} back to the selected version",
+  "skill.versionSidecar": "Sidecar: {0}",
   "specialist.descPlaceholder": "One-line description",
   "specialist.editTitle": "Edit specialist — {0}",
   "specialist.label.systemPrompt": "System prompt",
@@ -1265,7 +1712,23 @@ Object.assign(I18N.en, {
   "versions.restoring": "Restoring…",
   "viewer.act.fullscreen": "Fullscreen",
   "viewer.act.more": "More",
+  "viewer.chem.fallback": "No safe 2D coordinates were found; the original chemical representation is preserved below.",
+  "viewer.chem.source": "Original chemical representation",
+  "viewer.downloadOnly": "This binary artifact has no safe built-in preview.",
   "viewer.empty": "Click a file in the conversation to view it.",
+  "viewer.genome.features": "{0} features · {1} chromosomes/sequences",
+  "viewer.genome.invalid": "Ignored {0} invalid records",
+  "viewer.genome.list": "Feature descriptors",
+  "viewer.latex.preview": "Safe preview",
+  "viewer.latex.source": "LaTeX source",
+  "viewer.loading": "Selecting a safe renderer…",
+  "viewer.msa.summary": "{0} sequences · {1} columns · {2}",
+  "viewer.renderer.compat": "Compatibility mode",
+  "viewer.renderer.error": "This artifact could not be previewed. You can still download the original file.",
+  "viewer.renderer.matched": "Matched by {0}",
+  "viewer.renderer.version": "Version {0}",
+  "viewer.sequence.omitted": "{0} additional residues are collapsed to keep the viewer responsive.",
+  "viewer.sequence.summary": "{0} sequences · {1} residues · {2}",
   "ws.nav.files": "Files",
   "ws.nav.new": "New",
   "ws.sidebar.collapse": "Collapse sidebar (⌘B)",
@@ -1320,6 +1783,7 @@ function dockToggle() { if (S.dock.open) dockClose(); else { dockOpen(); setActi
 function dockTab(tab) {
   if (tab === "files") setActiveTab("files");
   else if (tab === "notebook") setActiveTab("notebook");
+  else if (tab === "timeline") setActiveTab("timeline");
   else if (tab === "viewer") setActiveTab(S.dockArtifact ? S.dockArtifact.id : "notebook");
   else if (tab === "prov") { if (S.dockArtifact) showProvenance(S.dockArtifact); }
 }
@@ -1337,6 +1801,9 @@ function renderDockTabs() {
   const nt = tabBtn("button", "notebook", "Notebook");
   if (S.activeTab === "notebook") nt.classList.add("active");
   nt.onclick = () => setActiveTab("notebook"); bar.appendChild(nt);
+  const tt = tabBtn("button", "clock", t("dock.tab.timeline"));
+  if (S.activeTab === "timeline") tt.classList.add("active");
+  tt.onclick = () => setActiveTab("timeline"); bar.appendChild(tt);
   if (S.activeTab === "files") { const ft = tabBtn("button", "files", "Files"); ft.classList.add("active"); bar.appendChild(ft); }
 }
 function addOpenTab(a) { if (!(S.openTabs || []).some(x => x.id === a.id)) (S.openTabs = S.openTabs || []).push(a); }
@@ -1347,13 +1814,872 @@ function closeTab(id) {
 }
 function setActiveTab(t) {
   S.activeTab = t; dockOpen(); renderDockTabs();
-  showDockPane(t === "notebook" ? "notebook" : (t === "files" ? "files" : "viewer"));
+  showDockPane(t === "notebook" ? "notebook" : (t === "timeline" ? "timeline" : (t === "files" ? "files" : "viewer")));
   if (t === "notebook") renderNotebook();
+  else if (t === "timeline") { loadWorkbenchState(S.currentId); renderActionTimeline(); }
   else if (t === "files") { if (S.filesScope === "project") loadProjectArtifacts().then(renderFilesGrid); else renderFilesGrid(); }
   else renderViewer();
 }
-function showDockPane(pane) { ["viewer", "notebook", "files"].forEach(p => { const n = $("#dock-" + p); if (n) n.classList.toggle("hidden", p !== pane); }); }
+function showDockPane(pane) { ["viewer", "notebook", "timeline", "files"].forEach(p => { const n = $("#dock-" + p); if (n) n.classList.toggle("hidden", p !== pane); }); }
 function ghostIconBtn(name, title) { const b = el("button", "icon-ghost"); b.innerHTML = icon(name, 16); if (title) b.title = title; return b; }
+
+/* ---------- Action Timeline + session workbench projections ---------- */
+// These helpers are intentionally allowlist-based. The durable ledger may carry
+// provider wire ids, canonical arguments and complete results for audit/replay;
+// none of those belong in the researcher-facing DOM (or browser state).
+function publicText(value, limit = 180) {
+  let out = String(value == null ? "" : value);
+  out = out
+    .replace(/\bBearer\s+[^\s,;]+/gi, "Bearer [redacted]")
+    .replace(/\b(?:sk|ark|api[_-]?key|access[_-]?token|refresh[_-]?token)[-_][A-Za-z0-9._-]{8,}\b/gi, "[redacted]")
+    .replace(/([?&](?:key|token|api_key)=)[^&#\s]+/gi, "$1[redacted]");
+  return out.length > limit ? out.slice(0, Math.max(0, limit - 1)) + "…" : out;
+}
+function publicList(value, limit = 24) {
+  return (Array.isArray(value) ? value : []).slice(0, limit).map(item => publicText(item, 160)).filter(Boolean);
+}
+function publicArtifacts(result) {
+  const found = [];
+  const add = (value) => { const text = publicText(value, 160); if (text && !found.includes(text) && found.length < 16) found.push(text); };
+  const walk = (value, depth) => {
+    if (depth > 2 || value == null) return;
+    if (Array.isArray(value)) { value.slice(0, 16).forEach(item => walk(item, depth + 1)); return; }
+    if (typeof value !== "object") return;
+    ["filename", "artifact_id", "version_id"].forEach(key => { if (value[key] != null) add(value[key]); });
+    ["artifact", "artifacts", "files", "files_written"].forEach(key => { if (value[key] != null) walk(value[key], depth + 1); });
+  };
+  walk(result, 0); return found;
+}
+const ACTION_TIMELINE_PAGE_SIZE = 500;
+const ACTION_TIMELINE_MAX_GROUPS = 2000;
+function timelineOrdinal(value) {
+  return value !== null && value !== "" && Number.isFinite(Number(value)) ? Number(value) : null;
+}
+function sanitizeActionTimeline(payload) {
+  const source = payload && (payload.timeline || payload.payload || payload);
+  const usage = value => {
+    const source = value && typeof value === "object" ? value : {};
+    const number = key => Number.isSafeInteger(source[key]) && source[key] >= 0 ? source[key] : 0;
+    return { input_tokens: number("input_tokens"), output_tokens: number("output_tokens"), total_tokens: number("total_tokens") };
+  };
+  const permission = value => value && typeof value === "object"
+    ? publicText([value.state, value.scope].filter(Boolean).join(" · "), 80)
+    : publicText(value, 80);
+  const groups = ((source && source.groups) || []).slice(-ACTION_TIMELINE_PAGE_SIZE).map(group => ({
+    group_id: publicText(group.group_id, 96), branch_id: publicText(group.branch_id, 96),
+    turn_id: publicText(group.turn_id, 96), ordinal: timelineOrdinal(group.ordinal),
+    kind: publicText(group.kind, 48), language: publicText(group.language, 24), provider: publicText(group.provider, 48), model: publicText(group.model, 96),
+    title: publicText(group.title, 260), status: publicText(group.status, 32), owner: publicText(group.owner || group.owner_kind, 80),
+    permission: permission(group.permission || group.permission_state), replay_policy: publicText(group.replay_policy, 48),
+    usage: usage(group.usage), cost: Number.isFinite(+group.cost) && +group.cost >= 0 ? +group.cost : null, created_at: group.created_at,
+    session: group.session && typeof group.session === "object" ? {
+      root_frame_id: publicText(group.session.root_frame_id, 96), name: publicText(group.session.name, 160)
+    } : null,
+    events: ((group.events || []).slice(0, 100)).map(event => ({
+      event_id: publicText(event.event_id, 96), sequence: event.sequence, type: publicText(event.type, 64),
+      action_id: publicText(event.action_id, 96), name: publicText(event.name, 120),
+      side_effect_class: publicText(event.side_effect_class, 64), resource_keys: publicList(event.resource_keys),
+      artifacts: publicList(event.artifacts).concat(publicArtifacts(event.result)).slice(0, 16),
+      outcome: publicText(event.outcome, 32), is_error: !!event.is_error, created_at: event.created_at
+    })),
+    attempts: ((group.attempts || []).slice(0, 50)).map(attempt => ({
+      attempt_id: publicText(attempt.attempt_id, 96), producing_cell_id: publicText(attempt.producing_cell_id, 96),
+      attempt_ordinal: attempt.attempt_ordinal, generation_id: publicText(attempt.generation_id, 96),
+      allocated_at: attempt.allocated_at, started_at: attempt.started_at, response_at: attempt.response_at,
+      capture_at: attempt.capture_at, finished_at: attempt.finished_at,
+      terminal_state: publicText(attempt.terminal_state, 48), error: publicText(attempt.error, 240),
+      replayed_from_cell_id: publicText(attempt.replayed_from_cell_id, 96)
+    }))
+  }));
+  const firstOrdinal = timelineOrdinal(source && source.first_ordinal);
+  const lastOrdinal = timelineOrdinal(source && source.last_ordinal);
+  const hasMoreBefore = !!(source && (source.has_more_before || source.has_earlier));
+  const hasMoreAfter = !!(source && (source.has_more_after || source.has_more));
+  return {
+    project_id: publicText(source && source.project_id, 120),
+    root_frame_id: publicText(source && source.root_frame_id, 96),
+    branch_id: publicText(source && source.branch_id, 96), groups,
+    session_count: Number.isFinite(+(source && source.session_count)) ? Math.max(0, +(source && source.session_count)) : null,
+    count: Number.isFinite(+(source && source.count)) ? +(source && source.count) : groups.length,
+    total_count: Number.isFinite(+(source && source.total_count)) ? +(source && source.total_count) : groups.length,
+    truncated: !!(source && source.truncated),
+    has_more_before: hasMoreBefore, has_more_after: hasMoreAfter,
+    has_earlier: hasMoreBefore, has_more: hasMoreAfter,
+    first_ordinal: firstOrdinal != null ? firstOrdinal : (groups[0] && groups[0].ordinal),
+    last_ordinal: lastOrdinal != null ? lastOrdinal : (groups[groups.length - 1] && groups[groups.length - 1].ordinal),
+    history_limit_reached: !!(source && source.history_limit_reached),
+    running: !!(source && source.running)
+  };
+}
+function mergeActionTimelines(current, incoming, direction = "latest") {
+  if (!current) return incoming;
+  if (!incoming) return current;
+  if ((current.root_frame_id && incoming.root_frame_id && current.root_frame_id !== incoming.root_frame_id) ||
+      (current.branch_id && incoming.branch_id && current.branch_id !== incoming.branch_id)) return incoming;
+  const key = group => group.group_id ? `id:${group.group_id}` : ["group", group.branch_id, group.ordinal, group.turn_id, group.kind, group.created_at, group.title].join("\u001f");
+  const deduped = new Map();
+  const ordered = direction === "before" ? (incoming.groups || []).concat(current.groups || []) :
+    (current.groups || []).concat(incoming.groups || []);
+  ordered.forEach(group => deduped.set(key(group), group));
+  const all = Array.from(deduped.values()).sort((a, b) => {
+    const left = timelineOrdinal(a.ordinal), right = timelineOrdinal(b.ordinal);
+    if (left != null && right != null && left !== right) return left - right;
+    return (+a.created_at || 0) - (+b.created_at || 0);
+  });
+  const groups = all.slice(-ACTION_TIMELINE_MAX_GROUPS); // always retain the latest research state
+  const hitLimit = !!current.history_limit_reached || all.length > groups.length ||
+    (direction === "before" && groups.length >= ACTION_TIMELINE_MAX_GROUPS && incoming.has_more_before);
+  const currentFirst = timelineOrdinal(current.first_ordinal), incomingFirst = timelineOrdinal(incoming.first_ordinal);
+  const beforeSource = direction === "before" ? incoming :
+    (currentFirst != null && (incomingFirst == null || currentFirst <= incomingFirst) ? current : incoming);
+  const afterSource = direction === "before" ? current : incoming;
+  const hasMoreBefore = !hitLimit && !!beforeSource.has_more_before;
+  const hasMoreAfter = !!afterSource.has_more_after;
+  return {
+    ...afterSource,
+    root_frame_id: incoming.root_frame_id || current.root_frame_id,
+    branch_id: incoming.branch_id || current.branch_id,
+    groups, count: groups.length,
+    total_count: Math.max(+current.total_count || 0, +incoming.total_count || 0, groups.length),
+    truncated: hitLimit || hasMoreBefore || hasMoreAfter,
+    has_more_before: hasMoreBefore, has_more_after: hasMoreAfter,
+    has_earlier: hasMoreBefore, has_more: hasMoreAfter,
+    first_ordinal: groups.length ? groups[0].ordinal : null,
+    last_ordinal: groups.length ? groups[groups.length - 1].ordinal : null,
+    history_limit_reached: hitLimit,
+    running: direction === "before" ? !!current.running : !!incoming.running
+  };
+}
+function sanitizeExecutionQueue(payload) {
+  const source = payload && (payload.execution || payload.payload || payload) || {};
+  const ticket = item => item ? {
+    execution_id: publicText(item.execution_id, 96), status: publicText(item.status, 32),
+    owner: { kind: publicText((item.owner || {}).kind || item.owner_kind, 48), id: publicText((item.owner || {}).id || item.owner_id, 96) },
+    branch_id: publicText(item.branch_id, 96), language: publicText(item.language, 24),
+    generation_id: publicText(item.generation_id, 96), resource_keys: publicList(item.resource_keys),
+    queue_position: Number.isFinite(+item.queue_position) ? +item.queue_position : null,
+    queued_at: item.queued_at, started_at: item.started_at, cancel_requested: !!item.cancel_requested
+  } : null;
+  return {
+    owner: ticket(source.owner), queue: (source.queue || []).slice(0, 100).map(ticket).filter(Boolean),
+    queued_count: Number.isFinite(+source.queued_count) ? +source.queued_count : ((source.queue || []).length),
+    active_count: Number.isFinite(+source.active_count) ? +source.active_count : (source.owner ? 1 : 0),
+    closed: !!source.closed, close_reason: publicText(source.close_reason, 160)
+  };
+}
+function rememberExecutionQueue(payload) {
+  S.executionQueue = sanitizeExecutionQueue(payload);
+  const ticket = S.executionQueue.owner;
+  S.executionIdentity = ticket && ticket.execution_id && ticket.owner && ticket.owner.kind && ticket.owner.id ? {
+    execution_id: ticket.execution_id, owner: { kind: ticket.owner.kind, id: ticket.owner.id }
+  } : null;
+  return S.executionQueue;
+}
+function rememberExecutionState(event) {
+  const status = String(event && event.status || "").toLowerCase();
+  const identity = event && event.execution_id && event.owner && event.owner.kind && event.owner.id ? {
+    execution_id: publicText(event.execution_id, 96),
+    owner: { kind: publicText(event.owner.kind, 48), id: publicText(event.owner.id, 96) }
+  } : null;
+  if (identity && ["running", "finalizing"].includes(status)) S.executionIdentity = identity;
+  else if (identity && status === "queued" && !S.executionIdentity) S.executionIdentity = identity;
+  if (S.executionIdentity && event && event.execution_id === S.executionIdentity.execution_id && ["completed", "failed", "cancelled"].includes(status)) S.executionIdentity = null;
+  const pending = S.pendingReplIdentity;
+  if (pending && event && event.execution_id === pending.execution_id && ["completed", "failed", "cancelled"].includes(status)) {
+    const frameId = pending.frame_id;
+    S.pendingReplIdentity = null;
+    invalidateKernelCache();
+    if (S.currentId === frameId) {
+      loadExecutionLog(frameId).catch(() => {});
+      loadArtifacts(frameId);
+      scheduleWorkbenchRefresh();
+      if (S.dock.open && S.activeTab === "notebook") scheduleNotebookRender();
+    }
+  }
+}
+function identityForOwner(queue, ownerKind) {
+  const safe = queue || sanitizeExecutionQueue({}), candidates = [safe.owner].concat(safe.queue || []).filter(Boolean);
+  const ticket = ownerKind ? candidates.find(item => item.owner && item.owner.kind === ownerKind) : safe.owner;
+  return ticket && ticket.execution_id && ticket.owner && ticket.owner.kind && ticket.owner.id ? { execution_id: ticket.execution_id, owner: ticket.owner } : null;
+}
+async function exactExecutionIdentity(frameId, ownerKind) {
+  const pending = ownerKind === "user_repl" && frameId === S.currentId && S.pendingReplIdentity && S.pendingReplIdentity.frame_id === frameId ? S.pendingReplIdentity : null;
+  if (pending && pending.owner.kind === ownerKind) return pending;
+  if (frameId === S.currentId) {
+    const cached = identityForOwner(S.executionQueue, ownerKind);
+    if (cached) return cached;
+    if (!ownerKind && S.executionIdentity) return S.executionIdentity;
+  }
+  const snapshot = await optionalApi([`/frames/${frameId}/execution-queue`, `/frames/${frameId}/execution`]);
+  if (!snapshot) return null;
+  const safe = sanitizeExecutionQueue(snapshot);
+  if (frameId === S.currentId) rememberExecutionQueue(snapshot);
+  return identityForOwner(safe, ownerKind);
+}
+async function scopedExecutionRequest(frameId, endpoint, reason, ownerKind) {
+  const identity = await exactExecutionIdentity(frameId, ownerKind);
+  if (!identity) { hint(t("nb.interrupt.noOwner"), true); return { ok: false, reason: "no_exact_owner" }; }
+  return api(`/frames/${frameId}/${endpoint}`, {
+    method: "POST", body: JSON.stringify({ execution_id: identity.execution_id, owner: identity.owner, owner_id: identity.owner.id, reason })
+  });
+}
+function sanitizeRecovery(payload) {
+  const source = payload && (payload.recovery || payload.payload || payload) || {};
+  const generations = source.generations || {}, current = source.current || {};
+  const candidateJournal = source.log || source.events || current.events;
+  const journal = Array.isArray(candidateJournal) ? candidateJournal : (/recovery_log/.test(String(source.type || "")) ? [source] : []);
+  return {
+    status: publicText(source.status || source.state, 48), progress: Number.isFinite(+source.progress) ? Math.max(0, Math.min(1, +source.progress)) : null,
+    state_revision: source.state_revision, branch_id: publicText(source.branch_id, 96),
+    view_only: source.view_only === true, trust_state: publicText(source.trust_state, 32), explicit_recovery_required: source.explicit_recovery_required === true,
+    python_generation_id: publicText(source.python_generation_id || (generations.python || {}).generation_id || generations.python, 96),
+    r_generation_id: publicText(source.r_generation_id || (generations.r || {}).generation_id || generations.r, 96),
+    message: publicText(source.message || source.reason || source.error || current.phase, 240),
+    log: journal.slice(-50).map(item => ({
+      status: publicText(item.status || item.state || item.type, 48),
+      message: publicText(item.message || item.reason || item.error || [item.phase, item.status].filter(Boolean).join(": "), 240),
+      at: item.at || item.created_at
+    }))
+  };
+}
+const RECOVERY_ACTION_IDS = ["restore", "retry", "restart_fresh"];
+function sanitizeRecoveryActions(payload) {
+  const source = payload && (payload.recovery || payload.payload || payload) || {};
+  const advertised = new Map((Array.isArray(source.actions) ? source.actions : []).map(item => [String(item && item.id || ""), item || {}]));
+  return {
+    root_frame_id: publicText(source.root_frame_id, 96), branch_id: publicText(source.branch_id, 96),
+    checkpoint_id: publicText(source.checkpoint_id, 96), state: publicText(source.state, 48),
+    view_only: source.view_only === true, trust_state: publicText(source.trust_state, 32), explicit_recovery_required: source.explicit_recovery_required === true,
+    actions: RECOVERY_ACTION_IDS.map(id => {
+      const item = advertised.get(id);
+      return {
+        id, enabled: !!(item && item.enabled === true),
+        reason: publicText(item ? item.reason : t("recovery.action.unavailable"), 240),
+        requires_confirmation: !!(item && item.requires_confirmation === true),
+        requires_ticket: !!(item && item.requires_ticket === true)
+      };
+    })
+  };
+}
+function sanitizeBranches(payload) {
+  const source = payload && (payload.branch || payload.payload || payload) || {};
+  const capabilities = source.capabilities || source.actions || {};
+  const capabilityEnabled = value => value === true || !!(value && typeof value === "object" && value.enabled === true);
+  const capabilityReason = value => publicText(value && typeof value === "object" ? value.reason : "", 200);
+  const checkpoints = items => (Array.isArray(items) ? items : []).slice(0, 100).map(item => {
+    const cp = item && typeof item === "object" ? item : {}, metadata = cp.metadata && typeof cp.metadata === "object" ? cp.metadata : {};
+    return {
+      checkpoint_id: publicText(cp.checkpoint_id || cp.id, 96), parent_checkpoint_id: publicText(cp.parent_checkpoint_id, 96),
+      reason: publicText(cp.reason, 80), created_at: cp.created_at, message_cursor: cp.message_cursor,
+      action_cursor: cp.action_cursor, cell_cursor: cp.cell_cursor,
+      internal: cp.internal === true || cp.internal === 1,
+      source_kind: publicText(cp.source_kind, 24), source_id: publicText(cp.source_id, 96),
+      requires_kernel_recovery: !!(metadata.requires_kernel_recovery || cp.requires_kernel_recovery),
+      undo_revert_checkpoint_id: publicText(metadata.undo_checkpoint_id ? (cp.checkpoint_id || cp.id) : "", 96)
+    };
+  });
+  return {
+    root_frame_id: publicText(source.root_frame_id, 96),
+    branch_id: publicText(source.branch_id || source.current_branch_id, 96),
+    capabilities: {
+      checkpoint: capabilityEnabled(capabilities.checkpoint), fork: capabilityEnabled(capabilities.fork),
+      fork_from_cell: capabilityEnabled(capabilities.fork && capabilities.fork.fork_from_cell),
+      fork_from_message: capabilityEnabled(capabilities.fork && capabilities.fork.fork_from_message),
+      revert_preview: capabilityEnabled(capabilities.revert_preview || capabilities.preview_revert),
+      revert: capabilityEnabled(capabilities.revert), activate: capabilityEnabled(capabilities.activate),
+      promote: capabilityEnabled(capabilities.promote || capabilities.promote_artifact)
+    },
+    capability_reasons: {
+      checkpoint: capabilityReason(capabilities.checkpoint), fork: capabilityReason(capabilities.fork),
+      fork_from_cell: publicText((capabilities.fork || {}).fork_from_cell_reason, 200),
+      fork_from_message: publicText((capabilities.fork || {}).fork_from_message_reason, 200),
+      revert_preview: capabilityReason(capabilities.revert_preview || capabilities.preview_revert),
+      revert: capabilityReason(capabilities.revert), activate: capabilityReason(capabilities.activate)
+    },
+    branches: (Array.isArray(source.branches) ? source.branches : []).slice(0, 100).map(item => {
+      const branch = item && typeof item === "object" ? item : {};
+      return {
+        branch_id: publicText(branch.branch_id || branch.id, 96), name: publicText(branch.name, 120),
+        head_checkpoint_id: publicText(branch.head_checkpoint_id, 96), created_at: branch.created_at,
+        active: branch.active === true, view_only: branch.view_only === true, activatable: branch.activatable === true,
+        checkpoints: checkpoints(branch.checkpoints)
+      };
+    }),
+    revert_preview: sanitizeRevertPreview(source.revert_preview)
+  };
+}
+function branchUndoFromProjection(state) {
+  if (!state || !state.branch_id) return null;
+  const branch = (state.branches || []).find(item => item.branch_id === state.branch_id);
+  const checkpoint = branch && (branch.checkpoints || []).find(item => item.checkpoint_id === branch.head_checkpoint_id);
+  return checkpoint && checkpoint.undo_revert_checkpoint_id ? {
+    branch_id: state.branch_id, revert_checkpoint_id: checkpoint.undo_revert_checkpoint_id
+  } : null;
+}
+function sanitizeRevertPreview(source) {
+  if (!source || typeof source !== "object") return null;
+  const workspace = source.workspace || {};
+  const count = value => Array.isArray(value) ? Math.min(value.length, 1000000) : 0;
+  const delta = value => Number.isFinite(Number(value)) ? Math.max(-1000000, Math.min(1000000, Number(value))) : 0;
+  const setDelta = value => ({ added_count: count((value || {}).added), removed_count: count((value || {}).removed) });
+  return {
+    branch_id: publicText(source.branch_id, 96), current_checkpoint_id: publicText(source.current_checkpoint_id, 96),
+    target_checkpoint_id: publicText(source.target_checkpoint_id, 96), can_apply: !!source.can_apply,
+    messages: { delta: delta((source.messages || {}).delta) },
+    notebook: { delta: delta((source.notebook || {}).delta) },
+    actions: { delta: delta((source.actions || {}).delta) },
+    workspace: { writes_count: count(workspace.writes), deletes_count: count(workspace.deletes), conflicts_count: count(workspace.conflicts) },
+    artifacts: setDelta(source.artifacts), environment: source.environment ? { changed: true } : null,
+    permissions: source.permissions ? { changed: true } : null
+  };
+}
+function sanitizeRevertMutationResult(source) {
+  const checkpoint = source && source.checkpoint || {};
+  return {
+    ok: !!(source && source.ok === true), branch_id: publicText(checkpoint.branch_id, 96),
+    revert_checkpoint_id: publicText(checkpoint.checkpoint_id, 96),
+    requires_kernel_recovery: !!(source && source.requires_kernel_recovery === true)
+  };
+}
+function sanitizeVariableInspection(payload, frameId, language) {
+  const source = payload && typeof payload === "object" ? payload : {};
+  const allowedStates = ["active", "busy", "ended", "not_started", "restoring", "unsupported", "failed"];
+  const state = allowedStates.includes(String(source.state || "")) ? String(source.state) : "failed";
+  const activeBranch = publicText(S.branchState && S.branchState.branch_id, 96) || frameId;
+  const exactScope = publicText(source.root_frame_id, 96) === frameId && publicText(source.branch_id, 96) === activeBranch && source.language === language;
+  const primitive = value => {
+    if (value === null || typeof value === "boolean") return value;
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string") return publicText(value, 240);
+    return undefined;
+  };
+  const variables = (Array.isArray(source.variables) ? source.variables : []).slice(0, 500).map(raw => {
+    const item = raw && typeof raw === "object" ? raw : {};
+    const safe = { name: publicText(item.name, 160), type: publicText(item.type, 160) };
+    const kind = publicText(item.kind, 32); if (kind) safe.kind = kind;
+    if (Number.isSafeInteger(item.length) && item.length >= 0) safe.length = Math.min(item.length, 1000000000000);
+    const preview = primitive(item.preview); if (preview !== undefined) safe.preview = preview;
+    const fingerprint = publicText(item.fingerprint, 128).toLowerCase(); if (/^[a-f0-9]{8,128}$/.test(fingerprint)) safe.fingerprint = fingerprint;
+    return safe;
+  }).filter(item => item.name && item.type);
+  const available = !!(source.available === true && exactScope && state === "active");
+  return {
+    available,
+    root_frame_id: exactScope ? frameId : "", branch_id: exactScope ? activeBranch : "", language,
+    state: exactScope ? state : "failed", generation_id: publicText(source.generation_id, 96),
+    state_revision: Number.isSafeInteger(source.state_revision) && source.state_revision >= 0 ? source.state_revision : 0,
+    variables: available ? variables : [], truncated: available && !!source.truncated, reason: publicText(source.reason, 200)
+  };
+}
+function sanitizeContext(payload) {
+  const source = payload && (payload.context || payload.payload || payload) || {};
+  const layers = source.layers || source.segments || source.composition || [];
+  const history = Array.isArray(source.compaction_history) ? source.compaction_history : [];
+  return {
+    token_count: Number.isFinite(+source.token_count) ? +source.token_count : null,
+    token_limit: Number.isFinite(+source.token_limit) ? +source.token_limit : null,
+    output_reserve: Number.isFinite(+source.output_reserve) ? +source.output_reserve : null,
+    message_count: Number.isFinite(+source.message_count) ? +source.message_count : null,
+    compaction_count: Number.isFinite(+source.compaction_count) ? Math.max(0, +source.compaction_count) : history.length,
+    handoff: !!(source.handoff || source.handoff_id), compressed: !!(source.compressed || source.compaction_count),
+    layers: (Array.isArray(layers) ? layers : []).slice(0, 100).map(layer => ({
+      name: publicText(layer.name || layer.kind || layer.type, 120), kind: publicText(layer.kind || layer.type, 64),
+      token_count: Number.isFinite(+layer.token_count) ? +layer.token_count : null,
+      status: publicText(layer.status, 48), compressed: !!layer.compressed
+    })),
+    compaction_history: history.slice(0, 50).map(item => ({
+      archive_id: publicText(item && item.archive_id, 120), branch_id: publicText(item && item.branch_id, 120),
+      generation_id: publicText(item && item.generation_id, 120), created_at: Number(item && item.created_at) || 0,
+      message_count: Number.isFinite(+(item && item.message_count)) ? Math.max(0, +(item && item.message_count)) : 0,
+      tokens_before: Number.isFinite(+(item && item.tokens_before)) ? Math.max(0, +(item && item.tokens_before)) : 0,
+      tokens_after: Number.isFinite(+(item && item.tokens_after)) ? Math.max(0, +(item && item.tokens_after)) : 0,
+      artifact_count: Array.isArray(item && item.artifact_refs) ? Math.min(item.artifact_refs.length, 100) : 0
+    }))
+  };
+}
+function sanitizeSecurity(payload) {
+  const source = payload && (payload.security || payload.payload || payload) || {};
+  const sandbox = source.sandbox || source.kernel_sandbox || (/sandbox/.test(String(source.type || "")) ? source : {});
+  const permission = source.permission || source.permissions || {};
+  return {
+    sandbox: {
+      state: publicText(sandbox.state || sandbox.status, 48), mode: publicText(sandbox.mode, 32),
+      backend: publicText(sandbox.backend, 64), enforced: !!sandbox.enforced,
+      self_test_passed: sandbox.self_test_passed === true, network_policy: publicText(sandbox.network_policy, 64),
+      detail: publicText(sandbox.detail || sandbox.warning, 500), generation_ended: !!sandbox.generation_ended,
+      runtimes: (sandbox.runtimes || []).slice(0, 2).map(runtime => ({
+        language: publicText(runtime.language, 16), source: publicText(runtime.source, 32),
+        generation_state: publicText(runtime.generation_state, 48), generation_ended: !!runtime.generation_ended,
+        generation_ended_reason: publicText(runtime.generation_ended_reason, 80)
+      }))
+    },
+    permission: {
+      mode: publicText(permission.mode || permission.policy, 48),
+      pending_count: Number.isFinite(+permission.pending_count) ? +permission.pending_count : 0,
+      unattended: publicText(permission.unattended, 48)
+    }
+  };
+}
+function sanitizeDelegations(payload) {
+  const source = payload && (payload.delegation || payload.payload || payload) || {};
+  const count = value => Number.isSafeInteger(+value) && +value >= 0 ? Math.min(+value, 1000000) : 0;
+  const budgetSource = source.budget && typeof source.budget === "object" ? source.budget : null;
+  const budget = budgetSource ? {
+    limit: count(budgetSource.limit), spawned: count(budgetSource.spawned),
+    active: count(budgetSource.active), remaining: count(budgetSource.remaining),
+  } : null;
+  const children = (Array.isArray(source.children) ? source.children : []).slice(0, 1000).map(raw => {
+    const item = raw && typeof raw === "object" ? raw : {};
+    const progress = item.progress && typeof item.progress === "object" ? item.progress : {};
+    const steering = item.steering && typeof item.steering === "object" ? item.steering : {};
+    const overrides = item.overrides && typeof item.overrides === "object" ? item.overrides : {};
+    return {
+      child_id: publicText(item.child_id, 96), parent_child_id: publicText(item.parent_child_id, 96),
+      frame_id: publicText(item.frame_id, 96), name: publicText(item.name, 160),
+      status: publicText(item.status, 32), depth: Math.min(count(item.depth), 16),
+      stop_reason: publicText(item.stop_reason, 160), error: publicText(item.error, 240),
+      created_at: item.created_at, started_at: item.started_at, finished_at: item.finished_at,
+      progress: { turn_boundary: count(progress.turn_boundary), max_turns: count(progress.max_turns) || null },
+      steering: { queued: count(steering.queued), delivered: count(steering.delivered), discarded: count(steering.discarded) },
+      overrides: {
+        model: publicText(overrides.model, 120), steps: count(overrides.steps) || null,
+        permission_count: Array.isArray(overrides.permissions) ? Math.min(overrides.permissions.length, 100) : 0,
+        capability_count: Array.isArray(overrides.capabilities) ? Math.min(overrides.capabilities.length, 100) : 0,
+      },
+    };
+  }).filter(item => item.child_id);
+  return {
+    root_frame_id: publicText(source.root_frame_id, 96), initialized: source.initialized === true,
+    budget, stats: source.stats && typeof source.stats === "object" ? {
+      total: count(source.stats.total), pending: count(source.stats.pending), running: count(source.stats.running),
+      done: count(source.stats.done), failed: count(source.stats.failed), stopped: count(source.stats.stopped),
+    } : { total: children.length, pending: 0, running: 0, done: 0, failed: 0, stopped: 0 },
+    children,
+  };
+}
+async function optionalApi(paths) {
+  for (const path of paths) { try { return await api(path); } catch {} }
+  return null;
+}
+async function loadEarlierActionTimeline() {
+  const id = S.currentId, timeline = S.actionTimeline;
+  if (!id || !timeline || !timeline.has_more_before || S._timelineHistoryLoading === id) return;
+  const first = timelineOrdinal(timeline.first_ordinal);
+  if (first == null || first < 0) return;
+  const request = S._timelineHistoryReq = (S._timelineHistoryReq || 0) + 1;
+  S._timelineHistoryLoading = id;
+  delete S.workbenchErrors.timelineHistory;
+  if (S.activeTab === "timeline") renderActionTimeline();
+  try {
+    const page = await api(`/frames/${encodeURIComponent(id)}/action-timeline?before_ordinal=${first}&limit=${ACTION_TIMELINE_PAGE_SIZE}`);
+    if (request !== S._timelineHistoryReq || id !== S.currentId) return;
+    S.actionTimeline = mergeActionTimelines(S.actionTimeline, sanitizeActionTimeline(page), "before");
+  } catch (error) {
+    if (request === S._timelineHistoryReq && id === S.currentId) S.workbenchErrors.timelineHistory = publicText(error && error.message, 240);
+  } finally {
+    if (request === S._timelineHistoryReq && id === S.currentId) {
+      S._timelineHistoryLoading = null;
+      if (S.activeTab === "timeline") renderActionTimeline();
+    }
+  }
+}
+async function loadWorkbenchState(id, force = false) {
+  if (!id || id !== S.currentId) return;
+  if (!force && S._workbenchLoading === id) return;
+  const request = S._workbenchReq = (S._workbenchReq || 0) + 1;
+  S._workbenchLoading = id;
+  const base = `/frames/${id}`;
+  const [timeline, execution, branches, context, security, delegation, recovery, recoveryActions] = await Promise.all([
+    optionalApi([base + `/action-timeline?limit=${ACTION_TIMELINE_PAGE_SIZE}`]),
+    optionalApi([base + "/execution-queue", base + "/execution"]),
+    optionalApi([base + "/branches"]), optionalApi([base + "/context"]), optionalApi([base + "/security"]), optionalApi([base + "/delegations"]),
+    optionalApi([base + "/recovery"]), optionalApi([base + "/recovery/actions"])
+  ]);
+  if (request !== S._workbenchReq || id !== S.currentId) return;
+  S._workbenchLoading = null;
+  if (timeline) S.actionTimeline = mergeActionTimelines(S.actionTimeline, sanitizeActionTimeline(timeline), "latest");
+  if (execution) rememberExecutionQueue(execution);
+  if (branches) { S.branchState = sanitizeBranches(branches); S.branchUndo = branchUndoFromProjection(S.branchState); }
+  if (context) S.contextState = sanitizeContext(context);
+  if (security) S.securityState = sanitizeSecurity(security);
+  if (delegation) S.delegationState = sanitizeDelegations(delegation);
+  if (recovery) S.recoveryState = sanitizeRecovery(recovery);
+  if (recoveryActions) S.recoveryActions = sanitizeRecoveryActions(recoveryActions);
+  if (S.activeTab === "timeline") renderActionTimeline();
+  if (S.activeTab === "notebook") renderNotebook();
+}
+function scheduleWorkbenchRefresh(delay = 180) {
+  clearTimeout(S._workbenchTimer);
+  S._workbenchTimer = setTimeout(() => loadWorkbenchState(S.currentId, true), delay);
+}
+function scheduleBranchConversationResync(fid, delay = 120) {
+  clearTimeout(S._branchConversationTimer);
+  S._branchConversationTimer = setTimeout(() => { if (S.currentId === fid) openConversation(fid, S.project); }, delay);
+}
+function latestCellForLanguage(language) {
+  return (S.cells || []).concat(S.liveCells || []).filter(cell => String(cell.language || cell.kernel_id || "python").toLowerCase().startsWith(language)).slice(-1)[0] || null;
+}
+function runtimeSummary() {
+  const queue = S.executionQueue || {};
+  const ownerTicket = queue.owner || null;
+  const owner = ownerTicket && ownerTicket.owner || {};
+  const recovery = S.recoveryState || {};
+  const recoveryStatus = String(recovery.status || "").toLowerCase();
+  const trustState = publicText(recovery.trust_state || (S.recoveryActions || {}).trust_state || (_kc.st || {}).trust_state, 32);
+  const viewOnly = recovery.view_only === true || (S.recoveryActions || {}).view_only === true || (_kc.st || {}).view_only === true;
+  let status = "ended";
+  if (/fail|error/.test(recoveryStatus)) status = "failed";
+  else if (/partial/.test(recoveryStatus)) status = "partial";
+  else if (/restor|recover|bootstrap|validat/.test(recoveryStatus)) status = "restoring";
+  else if (ownerTicket || S.running || (_kc.st && _kc.st.turn_running)) status = "busy";
+  else if (_kc.st && _kc.st.alive) status = "live";
+  const pythonCell = latestCellForLanguage("python"), rCell = latestCellForLanguage("r");
+  const branch = (S.branchState && S.branchState.branch_id) || (S.actionTimeline && S.actionTimeline.branch_id) || (recovery && recovery.branch_id) || S.currentId;
+  const stateRevision = recovery.state_revision != null ? recovery.state_revision : Math.max(0, ...((S.cells || []).concat(S.liveCells || []).map(cell => Number(cell.state_revision) || 0)));
+  const pyGeneration = recovery.python_generation_id || (_kc.st && (_kc.st.python_generation_id || _kc.st.generation_id)) || (pythonCell && pythonCell.generation_id);
+  const rGeneration = recovery.r_generation_id || (rCell && rCell.generation_id);
+  return {
+    status, branch: publicText(branch, 96), python: publicText(pyGeneration, 96), r: publicText(rGeneration, 96),
+    viewOnly, trustState,
+    revision: stateRevision || null, owner: publicText(owner.kind || (ownerTicket && ownerTicket.owner_kind), 48),
+    ownerId: publicText(owner.id || (ownerTicket && ownerTicket.owner_id), 96),
+    queue: Number(queue.queued_count || (queue.queue || []).length || 0)
+  };
+}
+function shortRuntime(value) { const text = publicText(value, 96); return text ? (text.length > 12 ? text.slice(0, 8) + "…" : text) : t("runtime.none"); }
+function runtimeSummaryNode(compact = false) {
+  const runtime = runtimeSummary();
+  const root = el("div", "runtime-summary" + (compact ? " compact" : ""));
+  const state = el("span", "runtime-state " + runtime.status, t("runtime.status." + runtime.status)); root.appendChild(state);
+  const item = (key, value, title) => { const chip = el("span", "runtime-chip"); chip.appendChild(el("span", "runtime-key", t(key))); const val = el("span", "runtime-val", value); if (title) val.title = publicText(title, 160); chip.appendChild(val); root.appendChild(chip); };
+  item("runtime.branch", shortRuntime(runtime.branch), runtime.branch);
+  item("runtime.python", shortRuntime(runtime.python), runtime.python);
+  item("runtime.r", shortRuntime(runtime.r), runtime.r);
+  item("runtime.revision", runtime.revision == null ? t("runtime.none") : "S" + runtime.revision);
+  item("runtime.owner", runtime.owner ? runtime.owner + (runtime.ownerId ? " · " + shortRuntime(runtime.ownerId) : "") : t("runtime.none"), runtime.ownerId);
+  item("runtime.queue", String(runtime.queue));
+  if (runtime.viewOnly && runtime.trustState === "quarantined") item("runtime.trust", t("runtime.trust.quarantined"));
+  return root;
+}
+function timelineKind(group) {
+  const kind = String(group && group.kind || "").toLowerCase();
+  const eventKinds = (group.events || []).map(event => String(event.type || "").toLowerCase()).join(" ");
+  const latestAttempt = (group.attempts || []).slice(-1)[0], linkedCell = latestAttempt && nbFindCell(latestAttempt.producing_cell_id);
+  const language = String(group.language || (linkedCell && linkedCell.language) || "").toLowerCase();
+  if (/final/.test(kind + " " + eventKinds)) return "finalize";
+  if (/permission|approval/.test(kind + " " + eventKinds)) return "permission";
+  if (/recover|restore|bootstrap/.test(kind + " " + eventKinds)) return "recovery";
+  if (/delegat|subagent/.test(kind + " " + eventKinds)) return "delegate";
+  if (/background|remote|compute|job/.test(kind + " " + eventKinds)) return "background";
+  if (/dynamic/.test(kind + " " + eventKinds)) return "dynamic_tool";
+  if (language === "r" || /\br\b|r_cell|rcode/.test(kind)) return "r";
+  if (/code|python|cell/.test(kind)) return "python";
+  if (/tool/.test(kind + " " + eventKinds)) return "native_tool";
+  return "action";
+}
+function timelineDuration(attempt) {
+  if (!attempt) return "";
+  const parse = value => { if (value == null) return null; const number = +value; if (Number.isFinite(number)) return number > 1e12 ? number : number * 1000; const date = Date.parse(value); return Number.isFinite(date) ? date : null; };
+  const start = parse(attempt.started_at || attempt.allocated_at), end = parse(attempt.finished_at || attempt.capture_at || attempt.response_at);
+  if (start == null || end == null || end < start) return "";
+  const ms = end - start; return ms < 1000 ? Math.round(ms) + " ms" : (ms / 1000).toFixed(ms < 10000 ? 1 : 0) + " s";
+}
+function timelineCost(value) {
+  if (value == null || !Number.isFinite(+value) || +value < 0) return "";
+  const amount = +value;
+  return "$" + (amount < 0.01 ? amount.toFixed(6) : amount.toFixed(4));
+}
+function timelineMeta(label, value) {
+  if (value == null || value === "" || (Array.isArray(value) && !value.length)) return null;
+  const row = el("div", "timeline-meta"); row.appendChild(el("span", "timeline-meta-key", label));
+  const values = Array.isArray(value) ? value : [value]; const body = el("span", "timeline-meta-value");
+  values.slice(0, 24).forEach(item => body.appendChild(el("span", "timeline-pill", publicText(item, 160)))); row.appendChild(body); return row;
+}
+function actionTimelineCard(group) {
+  const kind = timelineKind(group), status = String(group.status || "completed").toLowerCase();
+  const card = el("article", "timeline-card kind-" + kind + " status-" + status); card.setAttribute("data-action-kind", kind);
+  const head = el("div", "timeline-card-head");
+  const kindLabel = el("span", "timeline-kind"); kindLabel.appendChild(iconEl(kind === "delegate" ? "users" : (kind === "permission" ? "lock" : (kind === "recovery" ? "refresh" : (kind === "finalize" ? "check" : (kind === "native_tool" || kind === "dynamic_tool" ? "sliders" : "terminal")))), 14)); kindLabel.appendChild(el("span", null, t("timeline.kind." + kind))); head.appendChild(kindLabel);
+  head.appendChild(el("span", "timeline-status " + status, publicText(status || "completed", 32))); card.appendChild(head);
+  card.appendChild(el("div", "timeline-card-title", group.title || t("timeline.kind." + kind)));
+  const latest = (group.attempts || []).slice(-1)[0] || null;
+  const resources = []; const artifacts = [];
+  (group.events || []).forEach(event => { (event.resource_keys || []).forEach(value => { if (!resources.includes(value)) resources.push(value); }); (event.artifacts || []).forEach(value => { if (!artifacts.includes(value)) artifacts.push(value); }); });
+  const owner = group.owner || "";
+  [
+    timelineMeta(t("timeline.owner"), owner),
+    timelineMeta(t("timeline.permission"), group.permission || (group.events || []).map(event => event.side_effect_class).filter(Boolean)),
+    timelineMeta(t("timeline.resources"), resources),
+    timelineMeta(t("timeline.artifacts"), artifacts),
+    timelineMeta(t("timeline.generation"), latest && latest.generation_id),
+    timelineMeta(t("timeline.replay"), group.replay_policy || (latest && latest.replayed_from_cell_id ? "replayed" : "original")),
+    timelineMeta(t("timeline.duration"), timelineDuration(latest)),
+    timelineMeta(t("timeline.tokens"), t("timeline.tokensValue", (group.usage || {}).input_tokens || 0, (group.usage || {}).output_tokens || 0)),
+    timelineMeta(t("timeline.cost"), timelineCost(group.cost))
+  ].filter(Boolean).forEach(node => card.appendChild(node));
+  if (latest && latest.error) card.appendChild(el("div", "timeline-error", latest.error));
+  return card;
+}
+function recoveryIsCurrentBranch(actions) {
+  if (!actions || !S.currentId) return false;
+  const projectedBranch = publicText(S.branchState && S.branchState.branch_id, 96) || S.currentId;
+  return actions.root_frame_id === S.currentId && actions.branch_id === projectedBranch;
+}
+async function executeRecoveryAction(actionId) {
+  const projection = S.recoveryActions;
+  const action = projection && (projection.actions || []).find(item => item.id === actionId);
+  if (!RECOVERY_ACTION_IDS.includes(actionId) || !action || !action.enabled || !recoveryIsCurrentBranch(projection) || S._recoveryActionLoading) return;
+  if (actionId === "restart_fresh" && !confirm(t("recovery.freshConfirm"))) return;
+  const frameId = S.currentId;
+  S._recoveryActionLoading = actionId; delete S.workbenchErrors.recoveryAction; renderActionTimeline();
+  try {
+    await api(`/frames/${frameId}/recovery/actions/${actionId}`, {
+      method: "POST", body: JSON.stringify({ branch_id: projection.branch_id, confirm: actionId === "restart_fresh" })
+    });
+    await Promise.all([loadWorkbenchState(frameId, true), loadExecutionLog(frameId)]);
+    if (S.currentId === frameId) hint(t("recovery.action.done"));
+  } catch (error) {
+    if (S.currentId === frameId) S.workbenchErrors.recoveryAction = publicText(error && error.message, 240);
+  } finally {
+    if (S.currentId === frameId && S._recoveryActionLoading === actionId) {
+      S._recoveryActionLoading = null; renderActionTimeline();
+    }
+  }
+}
+function recoveryTimelineCard(state, actionsState) {
+  const hasActionsProjection = !!actionsState;
+  state = state || {}; actionsState = actionsState || sanitizeRecoveryActions({});
+  const status = publicText(state.status || actionsState.state || "none", 32);
+  const statusClass = String(status).toLowerCase().replace(/[^a-z0-9_-]+/g, "-");
+  const card = el("article", "timeline-card kind-recovery status-" + statusClass); card.setAttribute("data-action-kind", "recovery");
+  const head = el("div", "timeline-card-head"), kind = el("span", "timeline-kind"); kind.appendChild(iconEl("refresh", 14)); kind.appendChild(el("span", null, t("recovery.title"))); head.appendChild(kind); head.appendChild(el("span", "timeline-status", status)); card.appendChild(head);
+  if (state.message) card.appendChild(el("div", "timeline-card-title", state.message));
+  if (actionsState.checkpoint_id) card.appendChild(el("div", "recovery-checkpoint", t("recovery.checkpoint", shortRuntime(actionsState.checkpoint_id))));
+  if (state.progress != null) { const track = el("div", "recovery-progress"); const bar = el("span"); bar.style.width = Math.round(state.progress * 100) + "%"; track.appendChild(bar); card.appendChild(track); }
+  const currentBranch = recoveryIsCurrentBranch(actionsState), list = el("div", "recovery-action-list");
+  (actionsState.actions || []).forEach(action => {
+    const row = el("div", "recovery-action-row");
+    const loading = S._recoveryActionLoading === action.id;
+    const reason = !hasActionsProjection ? t("recovery.action.unavailable") : (!currentBranch ? t("recovery.action.currentOnly") : (action.reason || t("recovery.action.ready")));
+    row.appendChild(disabledWorkbenchButton(loading ? t("recovery.action.loading") : t("recovery.action." + action.id), !!(currentBranch && action.enabled && !S._recoveryActionLoading), () => executeRecoveryAction(action.id), reason));
+    row.appendChild(el("span", "recovery-action-reason", reason)); list.appendChild(row);
+  });
+  card.appendChild(list);
+  if (S.workbenchErrors.recoveryAction) card.appendChild(el("div", "timeline-error", t("recovery.action.failed", S.workbenchErrors.recoveryAction)));
+  (state.log || []).slice(-12).forEach(entry => { const row = el("div", "recovery-log-row"); row.appendChild(el("span", "timeline-pill", entry.status || "event")); row.appendChild(el("span", "recovery-log-message", entry.message || "")); card.appendChild(row); });
+  return card;
+}
+function panelShell(title, className) {
+  const panel = el("section", "workbench-panel " + className); panel.appendChild(el("div", "workbench-panel-title", title)); return panel;
+}
+function branchCapability(name) { return !!(S.branchState && S.branchState.capabilities && S.branchState.capabilities[name]); }
+function branchCapabilityReason(name) { return publicText(S.branchState && S.branchState.capability_reasons && S.branchState.capability_reasons[name], 200); }
+function disabledWorkbenchButton(label, enabled, action, disabledReason) {
+  const button = el("button", "outline-btn small", label); button.disabled = !enabled; button.title = enabled ? label : (disabledReason || t("nb.action.unavailable")); if (enabled) button.onclick = action; return button;
+}
+async function createSessionCheckpoint() {
+  if (!S.currentId || !branchCapability("checkpoint") || S._branchActionLoading) return;
+  const frameId = S.currentId; S._branchActionLoading = "checkpoint"; delete S.workbenchErrors.branchAction; renderActionTimeline();
+  try { await api(`/frames/${frameId}/branches/checkpoints`, { method: "POST", body: JSON.stringify({ branch_id: (S.branchState || {}).branch_id }) }); await loadWorkbenchState(frameId, true); }
+  catch (error) { if (S.currentId === frameId) S.workbenchErrors.branchAction = publicText(error && error.message, 240); }
+  finally { if (S.currentId === frameId) { S._branchActionLoading = null; renderActionTimeline(); } }
+}
+async function forkSessionCheckpoint(checkpointId) {
+  if (!S.currentId || !branchCapability("fork") || !checkpointId || S._branchActionLoading) return;
+  checkpointId = publicText(checkpointId, 96);
+  const requestedName = prompt(t("branch.forkName"), t("branch.forkDefault", shortRuntime(checkpointId)));
+  if (requestedName === null) return;
+  const name = publicText(String(requestedName).trim(), 120), frameId = S.currentId;
+  S._branchActionLoading = "fork:" + checkpointId; delete S.workbenchErrors.branchAction; renderActionTimeline();
+  try {
+    const body = { from_checkpoint_id: checkpointId }; if (name) body.name = name;
+    await api(`/frames/${frameId}/branches/fork`, { method: "POST", body: JSON.stringify(body) });
+    await loadWorkbenchState(frameId, true); if (S.currentId === frameId) hint(t("branch.forked", shortRuntime(checkpointId)));
+  } catch (error) { if (S.currentId === frameId) S.workbenchErrors.branchAction = publicText(error && error.message, 240); }
+  finally { if (S.currentId === frameId) { S._branchActionLoading = null; renderActionTimeline(); } }
+}
+async function activateSessionBranch(branchId) {
+  branchId = publicText(branchId, 96);
+  if (!S.currentId || !branchId || !branchCapability("activate") || S._branchActionLoading) return;
+  const frameId = S.currentId; S._branchActionLoading = "activate:" + branchId; delete S.workbenchErrors.branchAction; renderActionTimeline();
+  try {
+    const result = await api(`/frames/${encodeURIComponent(frameId)}/branches/${encodeURIComponent(branchId)}/activate`, { method: "POST", body: "{}" });
+    invalidateKernelCache(); S.cells = []; S.liveCells = []; S._liveCell = null; S.pendingReplIdentity = null;
+    await openConversation(frameId, S.project);
+    if (S.currentId === frameId) {
+      const partial = String(result && result.status || "").toLowerCase() !== "active";
+      hint(t(partial ? "branch.activatedPartial" : "branch.activated", shortRuntime(branchId)), partial);
+    }
+  } catch (error) { if (S.currentId === frameId) S.workbenchErrors.branchAction = publicText(error && error.message, 240); }
+  finally { if (S.currentId === frameId) { S._branchActionLoading = null; renderActionTimeline(); renderNotebook(); } }
+}
+async function previewSessionRevert(checkpointId) {
+  if (!S.currentId || !branchCapability("revert_preview") || S._branchActionLoading) return;
+  const frameId = S.currentId; S._branchActionLoading = "preview:" + checkpointId; delete S.workbenchErrors.branchAction; renderActionTimeline();
+  try {
+    const preview = await api(`/frames/${frameId}/branches/revert-preview`, { method: "POST", body: JSON.stringify({ branch_id: (S.branchState || {}).branch_id, target_checkpoint_id: checkpointId }) });
+    if (S.currentId === frameId && S.branchState) S.branchState.revert_preview = sanitizeRevertPreview(preview.preview || preview);
+  } catch (error) { if (S.currentId === frameId) S.workbenchErrors.branchAction = publicText(error && error.message, 240); }
+  finally { if (S.currentId === frameId) { S._branchActionLoading = null; renderActionTimeline(); } }
+}
+async function applySessionRevert() {
+  const preview = S.branchState && S.branchState.revert_preview;
+  if (!preview || !preview.can_apply || !branchCapability("revert") || S._branchActionLoading) return;
+  const frameId = S.currentId; S._branchActionLoading = "revert"; delete S.workbenchErrors.branchAction; renderActionTimeline();
+  try {
+    const response = await api(`/frames/${frameId}/branches/revert`, { method: "POST", body: JSON.stringify({ branch_id: preview.branch_id, target_checkpoint_id: preview.target_checkpoint_id }) });
+    const safe = sanitizeRevertMutationResult(response);
+    const undo = safe.ok && safe.revert_checkpoint_id ? { branch_id: safe.branch_id || preview.branch_id, revert_checkpoint_id: safe.revert_checkpoint_id } : null;
+    await openConversation(frameId, S.project);
+    if (S.currentId === frameId && undo && undo.branch_id === (S.branchState || {}).branch_id) { S.branchUndo = undo; renderActionTimeline(); }
+  } catch (error) { if (S.currentId === frameId) S.workbenchErrors.branchAction = publicText(error && error.message, 240); }
+  finally { if (S.currentId === frameId) { S._branchActionLoading = null; renderActionTimeline(); } }
+}
+async function undoSessionRevert() {
+  const undo = S.branchUndo;
+  if (!S.currentId || !undo || undo.branch_id !== (S.branchState || {}).branch_id || !undo.revert_checkpoint_id || S._branchActionLoading) return;
+  const frameId = S.currentId; S._branchActionLoading = "undo"; delete S.workbenchErrors.branchAction; renderActionTimeline();
+  try {
+    await api(`/frames/${frameId}/revert/undo`, { method: "POST", body: JSON.stringify({ branch_id: undo.branch_id, revert_checkpoint_id: undo.revert_checkpoint_id }) });
+    S.branchUndo = null; await openConversation(frameId, S.project);
+    if (S.currentId === frameId) hint(t("branch.undone"));
+  } catch (error) { if (S.currentId === frameId) S.workbenchErrors.branchAction = publicText(error && error.message, 240); }
+  finally { if (S.currentId === frameId) { S._branchActionLoading = null; renderActionTimeline(); } }
+}
+function renderBranchPanel() {
+  const panel = panelShell(t("timeline.panel.branches"), "branch-panel"), state = S.branchState;
+  const busy = !!S._branchActionLoading, controls = el("div", "workbench-controls");
+  controls.appendChild(disabledWorkbenchButton(S._branchActionLoading === "checkpoint" ? t("common.loading") : t("branch.checkpoint"), !!(branchCapability("checkpoint") && !busy), createSessionCheckpoint, branchCapabilityReason("checkpoint")));
+  if (S.branchUndo && S.branchUndo.branch_id === (state || {}).branch_id) controls.appendChild(disabledWorkbenchButton(S._branchActionLoading === "undo" ? t("common.loading") : t("branch.undo"), !busy, undoSessionRevert));
+  panel.appendChild(controls);
+  if (state && state.branch_id) panel.appendChild(el("div", "branch-current-summary", t("branch.currentSummary", shortRuntime(state.branch_id))));
+  if (S.workbenchErrors.branchAction) panel.appendChild(el("div", "timeline-error", t("branch.actionFailed", S.workbenchErrors.branchAction)));
+  if (!state || !(state.branches || []).length) { panel.appendChild(el("div", "workbench-empty", t("timeline.noBranch"))); return panel; }
+  (state.branches || []).forEach(branch => {
+    const row = el("div", "branch-row" + (branch.branch_id === state.branch_id ? " current" : ""));
+    const head = el("div", "branch-head"); head.appendChild(el("span", "branch-name", branch.name || shortRuntime(branch.branch_id)));
+    if (branch.branch_id === state.branch_id) head.appendChild(el("span", "timeline-pill", t("branch.current")));
+    else {
+      head.appendChild(el("span", "timeline-pill", t("branch.viewOnly")));
+      head.appendChild(disabledWorkbenchButton(S._branchActionLoading === "activate:" + branch.branch_id ? t("branch.activating") : t("branch.activate"), !!(branch.activatable && branchCapability("activate") && !busy), () => activateSessionBranch(branch.branch_id), branchCapabilityReason("activate")));
+    }
+    if (branch.head_checkpoint_id) head.appendChild(el("span", "branch-head-id", t("branch.head", shortRuntime(branch.head_checkpoint_id)))); row.appendChild(head);
+    const cps = el("div", "checkpoint-list"), allCheckpoints = branch.checkpoints || [];
+    const checkpointRow = cp => {
+      const cpRow = el("div", "checkpoint-row"); cpRow.appendChild(el("span", "checkpoint-id", shortRuntime(cp.checkpoint_id)));
+      cpRow.appendChild(el("span", "checkpoint-reason", cp.reason || "checkpoint"));
+      const actions = el("span", "checkpoint-actions");
+      actions.appendChild(disabledWorkbenchButton(S._branchActionLoading === "fork:" + cp.checkpoint_id ? t("common.loading") : t("branch.fork"), !!(branchCapability("fork") && !busy), () => forkSessionCheckpoint(cp.checkpoint_id), branchCapabilityReason("fork")));
+      actions.appendChild(disabledWorkbenchButton(S._branchActionLoading === "preview:" + cp.checkpoint_id ? t("common.loading") : t("branch.preview"), !!(branchCapability("revert_preview") && !busy), () => previewSessionRevert(cp.checkpoint_id), branchCapabilityReason("revert_preview")));
+      cpRow.appendChild(actions); return cpRow;
+    };
+    allCheckpoints.filter(cp => !cp.internal).slice(0, 8).forEach(cp => cps.appendChild(checkpointRow(cp)));
+    const internalCheckpoints = allCheckpoints.filter(cp => cp.internal);
+    if (internalCheckpoints.length) {
+      const collapsed = el("details", "internal-checkpoints"); collapsed.appendChild(el("summary", null, t("branch.internalCheckpoints", internalCheckpoints.length)));
+      const internalList = el("div", "checkpoint-list"); internalCheckpoints.slice(0, 20).forEach(cp => internalList.appendChild(checkpointRow(cp))); collapsed.appendChild(internalList); cps.appendChild(collapsed);
+    }
+    row.appendChild(cps); panel.appendChild(row);
+  });
+  const preview = state.revert_preview;
+  if (preview) {
+    const box = el("div", "revert-preview"); box.appendChild(el("div", "revert-preview-title", t("branch.previewTitle") + " · " + shortRuntime(preview.target_checkpoint_id)));
+    const arts = preview.artifacts || {}, ws = preview.workspace || {};
+    box.appendChild(el("div", "revert-diff", t("branch.diff", (preview.messages || {}).delta || 0, (preview.notebook || {}).delta || 0, ws.writes_count || 0, ws.deletes_count || 0, arts.added_count || 0, arts.removed_count || 0)));
+    if (ws.conflicts_count) box.appendChild(el("div", "timeline-error", t("branch.conflict")));
+    box.appendChild(disabledWorkbenchButton(S._branchActionLoading === "revert" ? t("common.loading") : t("branch.revert"), !!(preview.can_apply && branchCapability("revert") && !busy), applySessionRevert, branchCapabilityReason("revert"))); panel.appendChild(box);
+  }
+  return panel;
+}
+function renderContextPanel() {
+  const panel = panelShell(t("timeline.panel.context"), "context-panel"), state = S.contextState;
+  if (!state || !(state.layers || []).length) { panel.appendChild(el("div", "workbench-empty", t("timeline.noContext"))); return panel; }
+  const summary = el("div", "context-summary");
+  if (state.token_count != null) summary.appendChild(el("span", "timeline-pill", t("context.tokens", state.token_count) + (state.token_limit ? " / " + state.token_limit : "")));
+  if (state.output_reserve) summary.appendChild(el("span", "timeline-pill", t("context.outputReserve", state.output_reserve)));
+  if (state.message_count != null) summary.appendChild(el("span", "timeline-pill", t("context.messages", state.message_count)));
+  if (state.compressed) summary.appendChild(el("span", "timeline-pill", t("context.compressed")));
+  if (state.handoff) summary.appendChild(el("span", "timeline-pill", t("context.handoff"))); panel.appendChild(summary);
+  state.layers.forEach(layer => { const row = el("div", "context-layer"); row.appendChild(el("span", "context-layer-name", layer.name || layer.kind || "context")); if (layer.token_count != null) row.appendChild(el("span", "context-layer-tokens", t("context.tokens", layer.token_count))); if (layer.status) row.appendChild(el("span", "timeline-pill", layer.status)); panel.appendChild(row); });
+  if ((state.compaction_history || []).length) {
+    const history = el("details", "context-history"); history.appendChild(el("summary", null, t("context.history", state.compaction_count || state.compaction_history.length)));
+    state.compaction_history.forEach(item => {
+      const row = el("div", "context-history-row");
+      row.appendChild(el("span", "context-history-id", shortRuntime(item.archive_id) || t("context.compaction")));
+      row.appendChild(el("span", "context-layer-tokens", t("context.savings", item.tokens_before, item.tokens_after)));
+      if (item.message_count) row.appendChild(el("span", "timeline-pill", t("context.messages", item.message_count)));
+      if (item.artifact_count) row.appendChild(el("span", "timeline-pill", t("context.artifacts", item.artifact_count)));
+      history.appendChild(row);
+    });
+    panel.appendChild(history);
+  }
+  return panel;
+}
+function renderSecurityPanel() {
+  const panel = panelShell(t("timeline.panel.security"), "security-panel"), state = S.securityState;
+  if (!state) { panel.appendChild(el("div", "workbench-empty", t("timeline.noSecurity"))); return panel; }
+  const sandbox = state.sandbox || {}, permission = state.permission || {};
+  const row = (label, values, stateClass) => { const line = el("div", "security-row " + (stateClass || "")); line.appendChild(el("span", "security-label", label)); values.filter(Boolean).forEach(value => line.appendChild(el("span", "timeline-pill", value))); panel.appendChild(line); };
+  row(t("security.sandbox"), [sandbox.state || sandbox.mode || "unknown", sandbox.backend, sandbox.enforced ? "enforced" : "not enforced"], sandbox.enforced ? "ok" : "warn");
+  row(t("security.selfTest"), [sandbox.self_test_passed ? "passed" : "not passed"], sandbox.self_test_passed ? "ok" : "warn");
+  row(t("security.network"), [sandbox.network_policy || "unknown"]);
+  (sandbox.runtimes || []).filter(runtime => runtime.generation_ended).forEach(runtime => {
+    row(t("security.generation"), [t("security.generationEnded", runtime.language || "kernel", runtime.generation_ended_reason || runtime.generation_state || "ended")]);
+  });
+  row(t("security.permission"), [permission.mode || "unknown", permission.pending_count ? t("security.pending", permission.pending_count) : ""]);
+  if (sandbox.detail) panel.appendChild(el("div", "security-detail", sandbox.detail)); return panel;
+}
+function renderDelegationPanel() {
+  const panel = panelShell(t("timeline.panel.delegation"), "delegation-panel"), state = S.delegationState;
+  if (!state || !(state.children || []).length) {
+    panel.appendChild(el("div", "workbench-empty", t("timeline.noDelegation")));
+    return panel;
+  }
+  const summary = el("div", "delegation-summary"), budget = state.budget || {};
+  if (state.budget) summary.appendChild(el("span", "timeline-pill", t("delegation.budget", budget.spawned || 0, budget.limit || 0)));
+  summary.appendChild(el("span", "timeline-pill", t("delegation.active", budget.active || (state.stats || {}).running || 0)));
+  panel.appendChild(summary);
+  (state.children || []).forEach(child => {
+    const row = el("div", "delegation-child status-" + String(child.status || "unknown").toLowerCase());
+    row.style.setProperty("--delegation-indent", Math.min(child.depth || 0, 4) * 10 + "px");
+    const head = el("div", "delegation-child-head");
+    head.appendChild(el("span", "delegation-child-name", child.name || shortRuntime(child.child_id)));
+    head.appendChild(el("span", "timeline-status " + String(child.status || "unknown").toLowerCase(), child.status || "unknown"));
+    row.appendChild(head);
+    const details = el("div", "delegation-child-details");
+    if (child.progress && child.progress.max_turns) details.appendChild(el("span", "timeline-pill", t("delegation.turns", child.progress.turn_boundary || 0, child.progress.max_turns)));
+    if (child.overrides && child.overrides.model) details.appendChild(el("span", "timeline-pill", child.overrides.model));
+    if (child.overrides && child.overrides.steps) details.appendChild(el("span", "timeline-pill", "steps " + child.overrides.steps));
+    if (child.steering && (child.steering.queued || child.steering.delivered)) details.appendChild(el("span", "timeline-pill", t("delegation.steering", child.steering.queued || 0, child.steering.delivered || 0)));
+    row.appendChild(details);
+    if (child.error || child.stop_reason) row.appendChild(el("div", "delegation-child-message", child.error || child.stop_reason));
+    panel.appendChild(row);
+  });
+  return panel;
+}
+function renderActionTimeline() {
+  const root = $("#dock-timeline"); if (!root) return; root.innerHTML = "";
+  const top = el("div", "timeline-top"); const heading = el("div"); heading.appendChild(el("div", "timeline-title", t("timeline.title"))); heading.appendChild(el("div", "timeline-subtitle", t("timeline.subtitle"))); top.appendChild(heading);
+  const refresh = ghostIconBtn("refresh", t("timeline.refresh")); refresh.onclick = () => loadWorkbenchState(S.currentId, true); top.appendChild(refresh); root.appendChild(top);
+  root.appendChild(runtimeSummaryNode(false));
+  const layout = el("div", "workbench-layout"), side = el("div", "workbench-side"), actions = el("section", "timeline-actions");
+  side.appendChild(renderBranchPanel()); side.appendChild(renderDelegationPanel()); side.appendChild(renderContextPanel()); side.appendChild(renderSecurityPanel()); layout.appendChild(side);
+  const timeline = S.actionTimeline || {}, groups = timeline.groups || [];
+  if (timeline.has_more_before) {
+    const controls = el("div", "workbench-controls timeline-history-controls");
+    const loading = S._timelineHistoryLoading === S.currentId;
+    const earlier = el("button", "outline-btn small", t(loading ? "timeline.loadingEarlier" : "timeline.loadEarlier"));
+    earlier.disabled = loading; earlier.setAttribute("data-action", "load-earlier-timeline");
+    earlier.setAttribute("aria-busy", loading ? "true" : "false"); earlier.onclick = loadEarlierActionTimeline;
+    controls.appendChild(earlier); actions.appendChild(controls);
+  }
+  if (S.workbenchErrors.timelineHistory) actions.appendChild(el("div", "timeline-error", t("timeline.loadEarlierFailed", S.workbenchErrors.timelineHistory)));
+  if (timeline.history_limit_reached) actions.appendChild(el("div", "workbench-empty", t("timeline.historyLimit", ACTION_TIMELINE_MAX_GROUPS)));
+  if (S.recoveryActions || (S.recoveryState && (S.recoveryState.status || (S.recoveryState.log || []).length))) actions.appendChild(recoveryTimelineCard(S.recoveryState, S.recoveryActions));
+  if (!groups.length && !actions.children.length) actions.appendChild(el("div", "workbench-empty timeline-empty", S._workbenchLoading ? t("timeline.loading") : t("timeline.empty")));
+  else groups.slice().sort((a, b) => (+a.ordinal || 0) - (+b.ordinal || 0)).forEach(group => actions.appendChild(actionTimelineCard(group)));
+  layout.appendChild(actions); root.appendChild(layout);
+}
 
 /* ---------- WebSocket ---------- */
 function connectWS() {
@@ -1365,23 +2691,60 @@ function connectWS() {
   clearInterval(connectWS._p); connectWS._p = setInterval(() => { try { ws.readyState === 1 && ws.send('{"type":"ping"}'); } catch {} }, 25000);
 }
 const sub = (f) => { try { S.ws && S.ws.readyState === 1 && S.ws.send(JSON.stringify({ type: "view_session", root_frame_id: f })); } catch {} };
+const unsub = (f) => { try { S.ws && S.ws.readyState === 1 && f && S.ws.send(JSON.stringify({ type: "unview_session", root_frame_id: f })); } catch {} };
 const conn = (on) => { const d = $("#conn-dot"); if (d) d.className = "dot " + (on ? "on" : "off"); };
 function onEvent(m) {
   const fid = m.root_frame_id || m.frame_id;
   if (m.type === "replay_begin") { if (mine(fid)) { if (S.stream && S.stream.wrap) S.stream.wrap.remove(); S.stream = null; S.liveCells = []; S._liveCell = null; } }
   else if (m.type === "replay_end") { if (mine(fid)) down(); }
   else if (m.type === "text_reset") { if (mine(fid)) startStream(); }
+  else if (m.type === "notebook_cell_draft") { if (mine(fid)) nbCellDraft(m); }
+  else if (m.type === "notebook_cell_start") { if (mine(fid)) nbCellStart(m); }
+  else if (m.type === "notebook_cell_chunk") { if (mine(fid)) nbCellChunk(m); }
+  else if (m.type === "notebook_cell_finished") { if (mine(fid)) { nbCellFinished(m); scheduleWorkbenchRefresh(); } }
+  else if (m.type === "action_timeline" || m.type === "action-timeline") { if (mine(fid)) { S.actionTimeline = mergeActionTimelines(S.actionTimeline, sanitizeActionTimeline(m), "latest"); if (S.activeTab === "timeline") renderActionTimeline(); } }
+  else if (m.type === "execution_queue") { if (mine(fid)) { rememberExecutionQueue(m); if (S.activeTab === "timeline") renderActionTimeline(); if (S.activeTab === "notebook") renderNotebook(); } }
+  else if (m.type === "execution_state" || m.type === "execution_owner") { if (mine(fid)) {
+    // State/owner events are deltas. Paint the safe owner immediately, then
+    // refresh the authoritative FIFO snapshot so queue positions never drift.
+    if (m.type === "execution_owner") {
+      const current = S.executionQueue || sanitizeExecutionQueue({});
+      current.owner = m.owner ? sanitizeExecutionQueue({ owner: { ...m, owner: m.owner } }).owner : null;
+      S.executionQueue = current;
+      if (m.owner && m.execution_id) rememberExecutionState({ ...m, status: "running" }); else S.executionIdentity = null;
+    }
+    else rememberExecutionState(m);
+    scheduleWorkbenchRefresh(60); if (S.activeTab === "timeline") renderActionTimeline(); if (S.activeTab === "notebook") renderNotebook();
+  } }
+  else if (["recovery", "recovery_state", "recovery_log"].includes(m.type)) { if (mine(fid)) {
+    const next = sanitizeRecovery(m), previous = S.recoveryState;
+    if (previous && m.type === "recovery_log") S.recoveryState = { ...previous, ...Object.fromEntries(Object.entries(next).filter(([, value]) => value != null && value !== "")), log: (previous.log || []).concat(next.log || []).slice(-50) };
+    else S.recoveryState = next;
+    if (m.type === "recovery_state" || ["completed", "failed", "partial", "cancelled"].includes(String(m.status || m.state || "").toLowerCase())) scheduleWorkbenchRefresh(120);
+    if (S.activeTab === "timeline") renderActionTimeline(); if (S.activeTab === "notebook") renderNotebook();
+  } }
+  else if (["branch", "branch_state", "branch_activation_state", "branch_projection_restored", "checkpoint", "checkpoint_created", "branch_created", "branch_reverted", "branch_revert_conflict"].includes(m.type)) { if (mine(fid)) {
+    if (m.type === "branch_projection_restored" || (m.type === "branch_activation_state" && m.branch_id)) { scheduleBranchConversationResync(fid); return; }
+    if (m.type === "branch_reverted" && m.ok === true && publicText(m.branch_id, 96) === publicText(S.branchState && S.branchState.branch_id, 96) && publicText(m.checkpoint_id, 96)) S.branchUndo = { branch_id: publicText(m.branch_id, 96), revert_checkpoint_id: publicText(m.checkpoint_id, 96) };
+    if (m.branches || (m.payload && m.payload.branches)) { S.branchState = sanitizeBranches(m); S.branchUndo = branchUndoFromProjection(S.branchState); }
+    else scheduleWorkbenchRefresh(m.type === "branch_activation_state" ? 0 : 80);
+    if (S.activeTab === "timeline") renderActionTimeline(); if (S.activeTab === "notebook") renderNotebook();
+  } }
+  else if (["delegation_child_event", "delegation_state", "delegation_progress", "delegation_steering"].includes(m.type)) { if (mine(fid)) {
+    scheduleWorkbenchRefresh(60); if (S.activeTab === "timeline") renderActionTimeline();
+  } }
+  else if (["sandbox", "sandbox_status", "security_status"].includes(m.type)) { if (mine(fid)) { S.securityState = sanitizeSecurity(m); if (S.activeTab === "timeline") renderActionTimeline(); } }
   else if (m.type === "text_chunk") { if (mine(fid)) feed(m.block_type || "text", m.chunk || "", m); }
   else if (m.type === "step") { if (mine(fid)) addLiveStep(m); }
   else if (m.type === "step_update") { if (mine(fid)) updateLiveStep(m); }
   else if (m.type === "plan_ready") { if (mine(fid)) renderPlanCard(m.plan, m.status); }
   else if (m.type === "plan_progress") { if (mine(fid)) updatePlanProgress(m); }
-  else if (m.type === "await_permission") { if (mine(fid)) renderPermissionCard(m); }
-  else if (m.type === "permission_resolved") { if (mine(fid)) resolvePermissionCard(m); }
+  else if (m.type === "await_permission") { if (mine(fid)) { renderPermissionCard(m); scheduleWorkbenchRefresh(); } }
+  else if (m.type === "permission_resolved") { if (mine(fid)) { resolvePermissionCard(m); scheduleWorkbenchRefresh(); } }
   else if (m.type === "frame_update") {
     if (mine(m.frame_id) || mine(fid)) {
       if (m.status === "processing" && !S.running) { S.running = true; enableComposer(false); $("#cancel-btn").classList.remove("hidden"); resumeWatch(fid, S._openGen); }  // a turn observed on the WS (e.g. started from another tab) — watchdog covers a missed terminal event
-      if (["completed","failed","cancelled","success","done"].includes(m.status)) turnDone(m.status);
+      if (["completed","failed","cancelled","success","done","ready"].includes(m.status)) { turnDone(m.status); scheduleWorkbenchRefresh(); }
     }
     loadSessions();
   }
@@ -1392,9 +2755,15 @@ function onEvent(m) {
     // and refresh the viewer if that very artifact is currently open.
     const art = m.artifact || {};
     const aid = art.id || art.artifact_id;
+    if (aid) syncArtifactVersion(art, true);
     if (aid) {
       (S._artBust = S._artBust || {})[aid] = art.version_id || String(Date.now());
-      if (S.dockArtifact && S.dockArtifact.id === aid && !S.provMode && S.activeTab === aid) renderViewer();
+      if (S.dockArtifact && S.dockArtifact.id === aid && S.activeTab === aid) {
+        // Capture emits before the execution log is persisted. Render the
+        // invalidated/loading provenance state now; loadExecutionLog() fetches
+        // the complete cell+lineage payload after the cell transaction.
+        renderViewer();
+      }
     }
     const fn = art.filename || "";
     // An overwritten file may reuse the same cache key (fallback URL) — drop just
@@ -1404,7 +2773,8 @@ function onEvent(m) {
     // show up as the agent makes them (not only after the whole turn ends).
     const isImg = /^image\//.test(art.content_type || "") || /\.(png|jpe?g|gif|svg|webp|bmp)$/i.test(fn);
     if (S.running && fn && isImg) {
-      const cell = S._liveCell || (S.liveCells && S.liveCells[S.liveCells.length - 1]);
+      const producer = art.producing_cell_id || m.producing_cell_id;
+      const cell = (producer && nbFindCell(producer)) || S._liveCell || (S.liveCells && S.liveCells[S.liveCells.length - 1]);
       if (cell && !(cell.figures || []).includes(fn)) { (cell.figures = cell.figures || []).push(fn); nbRender(); }
     }
     if (S.currentId) loadArtifacts(S.currentId);
@@ -1417,12 +2787,25 @@ function onEvent(m) {
     else if (m.status === "started") hint(t("kernel.started"));
     else if (m.status === "env_changed") hint(t("kernel.envChanged", ((m.env && m.env.name) || t("kernel.envChanged.default"))));
     invalidateKernelCache();  // kernel generation/env just changed — re-read state
+    if (m.sandbox) S.securityState = sanitizeSecurity({ sandbox: m.sandbox });
+    scheduleWorkbenchRefresh();
     if (S.dock.open && S.activeTab === "notebook") renderNotebook();
   } }
 }
 const mine = (f) => f && S.currentId && f === S.currentId;
 
 /* ---------- streaming ---------- */
+const LIVE_OUTPUT_CHAR_CAP = 1000000;
+const LIVE_OUTPUT_TRUNCATION = "\n...(live output truncated)";
+function appendLiveOutput(current, chunk) {
+  const existing = String(current || ""), addition = String(chunk || "");
+  if (existing.includes(LIVE_OUTPUT_TRUNCATION)) return existing;
+  if (existing.length >= LIVE_OUTPUT_CHAR_CAP) return existing.slice(0, LIVE_OUTPUT_CHAR_CAP) + LIVE_OUTPUT_TRUNCATION;
+  const remaining = LIVE_OUTPUT_CHAR_CAP - existing.length;
+  return addition.length > remaining
+    ? existing + addition.slice(0, remaining) + LIVE_OUTPUT_TRUNCATION
+    : existing + addition;
+}
 // Batch markdown re-renders onto animation frames: a fast token stream would
 // otherwise reparse the whole message on every chunk (janky, and it makes the
 // caret strobe as the subtree is torn down each token).
@@ -1456,6 +2839,7 @@ function startStream() {
 const ensure = () => { if (!S.stream) startStream(); return S.stream; };
 function feed(kind, chunk, event) {
   const st = ensure();
+  const structuredCellId = event && (event.producing_cell_id || event.cell_id);
   if (kind === "tool") {
     const cellHeader = !!(event && event.cell_index != null);
     const subagentHeader = !cellHeader && chunk.startsWith("◆");
@@ -1477,12 +2861,14 @@ function feed(kind, chunk, event) {
       st.wrap.appendChild(card); st.toolPre = pre; st.toolMeta = meta;
       if (!suba) { st.toolCard = card; card._demoted = false; }
       st.md = el("div", "md"); st.wrap.appendChild(st.md); st.text = "";
-      if (!suba) nbLiveStart(tool, raw, event && event.kernel_id, event && event.cell_index, event && event.language);
+      // Structured notebook_cell_* events own Notebook state on new daemons.
+      // Keep sentinel parsing only as a compatibility fallback for old replays.
+      if (!suba && !structuredCellId) nbLiveStart(tool, raw, event && event.kernel_id, event && event.cell_index, event && event.language);
     } else if (st.toolPre) {
       const add = chunk.replace(/^↳\s*/, "");
-      st.toolPre.textContent += add;
+      st.toolPre.textContent = appendLiveOutput(st.toolPre.textContent, add);
       if (st.toolMeta) { const n = (st.toolPre.textContent.match(/\n/g) || []).length; st.toolMeta.textContent = n > 1 ? (n + (n === 1 ? " line" : " lines")) : "done"; }
-      nbLiveAppend(add);
+      if (!structuredCellId) nbLiveAppend(add);
     }
   } else { st.text += chunk; st.full += chunk; st.md.classList.add("cursor"); scheduleRender(st); return; }
   down();
@@ -1628,7 +3014,7 @@ async function revisePlan(changes) {
 }
 
 /* ---------- semantic activity steps (plan / search / env / skill / …) ---------- */
-const STEP_ICON = { search: "search", fetch: "globe", plan: "list-check", env: "package", skill: "book", bash: "terminal", edit: "pencil", write: "file-text", read: "file-text", files: "files", artifact: "download", delegate: "users", mcp: "link", fold: "box", code: "terminal" };
+const STEP_ICON = { search: "search", fetch: "globe", plan: "list-check", env: "package", skill: "book", bash: "terminal", edit: "pencil", write: "file-text", read: "file-text", files: "files", artifact: "download", delegate: "users", review: "eye-context", mcp: "link", fold: "box", code: "terminal" };
 function stepIcon(kind) { return STEP_ICON[kind] || "check"; }
 function openArt(meta) {
   if (!meta || !meta.artifact_id) return;
@@ -1739,6 +3125,18 @@ function stepBody(step) {
   const k = step.kind, inp = step.input || {}, out = step.output || {};
   const box = el("div", "s-inner");
   if (out.error) { box.appendChild(clipPre(out.error, "d-del")); return box; }
+  if (k === "review") {
+    const issues = Array.isArray(out.issues) ? out.issues : [];
+    if (out.verdict === "pass") return box;
+    issues.forEach(issue => {
+      const row = el("div", "review-issue " + (issue.severity || "medium"));
+      const head = el("div", "review-issue-head"); head.appendChild(el("span", "review-severity", issue.severity || "medium")); head.appendChild(el("strong", null, issue.title || "Review finding")); row.appendChild(head);
+      if (issue.detail) row.appendChild(el("div", "review-detail", issue.detail));
+      if (issue.evidence) row.appendChild(el("div", "review-evidence", issue.evidence));
+      box.appendChild(row);
+    });
+    return box;
+  }
   if (k === "search") {
     if (inp.query) box.appendChild(el("div", "s-q", "“" + inp.query + "”"));
     (out.results || []).forEach(r => {
@@ -1902,10 +3300,16 @@ function applyStepState(handle) {
   const status = step.status || "running";
   card.classList.toggle("running", status === "running");
   card.classList.toggle("err", status === "error");
-  if (status === "running") { ic.innerHTML = icon("loader", 14, "spin"); meta.textContent = ""; }
+  if (status === "running") { ic.innerHTML = icon("loader", 14, "spin"); meta.textContent = step.kind === "review" ? "Reviewing" : ""; }
   else { ic.innerHTML = icon(status === "error" ? "x" : stepIcon(step.kind), 14); meta.textContent = step.summary || (step.output && step.output.error ? t("step.status.failed") : ""); }
   body.innerHTML = ""; body.appendChild(stepBody(step));
   if ((step.kind === "plan" || step.kind === "artifact") && status !== "running") card.classList.add("open");
+  if (step.kind === "review") {
+    const hasIssues = step.output && step.output.verdict === "issues";
+    card.classList.toggle("review-pass", status === "done" && !hasIssues);
+    card.classList.toggle("review-issues", status === "done" && hasIssues);
+    card.classList.toggle("open", !!hasIssues);
+  }
 }
 function addLiveStep(m) {
   // Idempotent: if this step is already on screen (reconstructed on reopen, then
@@ -1926,12 +3330,13 @@ function addLiveStep(m) {
   st.wrap.appendChild(handle.card);
   if (st.toolCard && !st.toolCard._demoted) { st.toolCard.classList.add("has-steps"); st.toolCard._demoted = true; const lbl = st.toolCard.querySelector(".lbl"); if (lbl) lbl.textContent = t("step.label.code"); }
   st.md = el("div", "md"); st.wrap.appendChild(st.md); st.text = "";
+  if (m.kind === "review") hint("Reviewing", false, true);
   down();
 }
 function updateLiveStep(m) {
   const h = (S.stepEls || {})[m.step_id]; if (!h) return;
   h.step.status = m.status; h.step.output = m.output; h.step.summary = m.summary;
-  applyStepState(h); down();
+  applyStepState(h); if (h.step.kind === "review" && m.status !== "running") hint(""); down();
 }
 function renderStoredStep(s) {
   const handle = buildStepCard(s);
@@ -2005,9 +3410,13 @@ function renderPermissionCard(m) {
     const body = { decision_id: m.decision_id, allow: ok, scope };
     if (scope !== "once") body.pattern = patIn.value.trim() || "*";
     if (!ok && fb.value.trim()) body.message = fb.value.trim();
-    try { await api(`/frames/${encodeURIComponent(m.frame_id)}/decision`, { method: "POST", body: JSON.stringify(body) }); }
+    let resolution;
+    try {
+      resolution = await api(`/frames/${encodeURIComponent(m.frame_id)}/decision`, { method: "POST", body: JSON.stringify(body) });
+      if (!resolution || resolution.ok !== true) throw new Error((resolution && resolution.error) || "permission decision was not accepted");
+    }
     catch (e) { allow.disabled = deny.disabled = false; hint(t("toast.submitFailed", e.message), true); return; }
-    markPermCard(m.decision_id, ok, scope);
+    markPermCard(m.decision_id, ok, scope, resolution);
   };
   allow.onclick = () => send(true);
   deny.onclick = () => send(false);
@@ -2018,21 +3427,35 @@ function renderPermissionCard(m) {
   S.permCards[m.decision_id] = { card, allow, deny, resolved: false };
   down();
 }
-function markPermCard(id, allowed, scope) {
+function markPermCard(id, allowed, scope, resolution) {
   const reg = S.permCards || {};
   if (!Object.prototype.hasOwnProperty.call(reg, id)) return;  // ignore __proto__/constructor keys
-  const h = reg[id]; h.resolved = true;
+  const h = reg[id]; h.resolved = true; h.resolution = resolution || null;
   if (h.allow) h.allow.disabled = true; if (h.deny) h.deny.disabled = true;
   h.card.classList.add("resolved", allowed ? "allowed" : "denied");
   let st = h.card.querySelector(".perm-status");
   if (!st) { st = el("div", "perm-status"); h.card.appendChild(st); }
-  st.textContent = allowed ? ((scope && scope !== "once") ? t("perm.status.allowedScope", permScopeCn(scope)) : t("perm.status.allowed")) : t("perm.status.denied");
+  const afterRestart = resolution && resolution.resolution_context === "after_restart";
+  st.textContent = afterRestart
+    ? (allowed ? t("perm.status.afterRestartAllowed") : t("perm.status.afterRestartDenied"))
+    : (allowed ? ((scope && scope !== "once") ? t("perm.status.allowedScope", permScopeCn(scope)) : t("perm.status.allowed")) : t("perm.status.denied"));
+  const oldContinue = h.card.querySelector(".perm-continue"); if (oldContinue) oldContinue.remove();
+  if (allowed && resolution && resolution.requires_continue === true) {
+    const cont = el("button", "perm-continue", t("perm.btn.continueReplan"));
+    cont.onclick = async () => {
+      if (S.running) { hint(t("toast.running"), false, true); return; }
+      cont.disabled = true;
+      try { await send(t("perm.continuePrompt")); }
+      finally { if (cont.isConnected && !S.running) cont.disabled = false; }
+    };
+    h.card.appendChild(cont);
+  }
 }
 function resolvePermissionCard(m) {
   const reg = S.permCards || {};
   if (!Object.prototype.hasOwnProperty.call(reg, m.decision_id)) return;  // ignore __proto__/constructor keys
   const h = reg[m.decision_id];
-  if (!h.resolved) markPermCard(m.decision_id, !!m.allow, m.scope || null);
+  if (!h.resolved) markPermCard(m.decision_id, !!m.allow, m.scope || null, m);
 }
 
 /* ---------- dashboard ---------- */
@@ -2123,15 +3546,98 @@ function stopDashPoll() { if (S._dashPoll) { clearInterval(S._dashPoll); S._dash
 
 /* ---------- projects ---------- */
 async function loadProjects() { try { const d = await api("/projects?limit=100&offset=0"); S.projects = (d && d.projects) || []; } catch { S.projects = []; } }
+function sanitizeProjectLineage(payload) {
+  const source = payload && typeof payload === "object" ? payload : {};
+  const nodes = (Array.isArray(source.nodes) ? source.nodes : []).slice(0, 5000).map(item => ({
+    id: publicText(item && item.id, 160), kind: publicText(item && item.kind, 48),
+    artifact_id: publicText(item && item.artifact_id, 120), version_id: publicText(item && item.version_id, 120),
+    filename: publicText(item && item.filename, 240), root_frame_id: publicText(item && item.root_frame_id, 120),
+    cell_id: publicText(item && (item.cell_id || item.producing_cell_id), 120), created_at: item && item.created_at,
+    latest: !!(item && item.latest)
+  })).filter(item => item.id);
+  const ids = new Set(nodes.map(item => item.id));
+  const edges = (Array.isArray(source.edges) ? source.edges : []).slice(0, 10000).map(item => ({
+    from: publicText(item && item.from, 160), to: publicText(item && item.to, 160), kind: publicText(item && item.kind, 48)
+  })).filter(item => ids.has(item.from) && ids.has(item.to));
+  return {
+    project_id: publicText(source.project_id, 120), nodes, edges,
+    artifact_count: Number.isFinite(+source.artifact_count) ? Math.max(0, +source.artifact_count) : 0,
+    version_count: Number.isFinite(+source.version_count) ? Math.max(0, +source.version_count) : 0,
+    truncated: !!source.truncated
+  };
+}
+async function openProjectResearchView(initialTab = "timeline") {
+  if (!S.project) return;
+  const projectId = S.project, mode = "project-research:" + projectId;
+  S._modalMode = mode; $("#modal-title").textContent = t("projectResearch.title", projName(projectId));
+  $("#modal-download").style.display = "none"; const body = $("#modal-body"); body.innerHTML = ""; $("#modal").classList.remove("hidden");
+  const tabs = el("div", "project-research-tabs"), content = el("div", "project-research-content"); body.appendChild(tabs); body.appendChild(content);
+  const cache = { timeline: null, lineage: null };
+  const renderTimeline = data => {
+    content.innerHTML = "";
+    const summary = el("div", "project-research-summary", t("projectResearch.timelineSummary", data.session_count || 0, data.total_count || data.count || 0)); content.appendChild(summary);
+    if (!(data.groups || []).length) { content.appendChild(el("div", "dock-empty", t("timeline.empty"))); return; }
+    (data.groups || []).forEach(group => {
+      const wrapper = el("div", "project-timeline-entry");
+      if (group.session) wrapper.appendChild(el("div", "project-session-label", group.session.name || shortRuntime(group.session.root_frame_id)));
+      wrapper.appendChild(actionTimelineCard(group)); content.appendChild(wrapper);
+    });
+  };
+  const renderLineage = data => {
+    content.innerHTML = "";
+    content.appendChild(el("div", "project-research-summary", t("projectResearch.lineageSummary", data.artifact_count, data.version_count, data.edges.length)));
+    const byId = new Map((data.nodes || []).map(item => [item.id, item]));
+    (data.nodes || []).filter(item => item.kind === "artifact_version").forEach(item => {
+      const row = el("div", "project-lineage-node"); row.appendChild(el("span", "project-lineage-name", item.filename || shortRuntime(item.version_id)));
+      if (item.latest) row.appendChild(el("span", "timeline-pill", t("projectResearch.latest")));
+      if (item.cell_id) row.appendChild(el("span", "project-lineage-cell", shortRuntime(item.cell_id))); content.appendChild(row);
+    });
+    if (!(data.nodes || []).some(item => item.kind === "artifact_version")) content.appendChild(el("div", "dock-empty", t("projectResearch.noLineage")));
+    if ((data.edges || []).length) {
+      const edges = el("details", "project-lineage-edges"); edges.appendChild(el("summary", null, t("projectResearch.edges", data.edges.length)));
+      data.edges.slice(0, 500).forEach(edge => {
+        const from = byId.get(edge.from), to = byId.get(edge.to);
+        edges.appendChild(el("div", "project-lineage-edge", (from && (from.filename || from.cell_id) || shortRuntime(edge.from)) + " → " + (to && (to.filename || to.cell_id) || shortRuntime(edge.to))));
+      }); content.appendChild(edges);
+    }
+  };
+  const select = async tab => {
+    if (S._modalMode !== mode) return;
+    Array.from(tabs.children).forEach(button => button.classList.toggle("active", button.dataset.tab === tab));
+    content.innerHTML = ""; content.appendChild(el("div", "dock-empty", t("common.loading")));
+    try {
+      if (!cache[tab]) cache[tab] = tab === "timeline"
+        ? sanitizeActionTimeline(await api(`/projects/${encodeURIComponent(projectId)}/action-timeline?limit=500`))
+        : sanitizeProjectLineage(await api(`/projects/${encodeURIComponent(projectId)}/lineage?limit=2000`));
+      if (S._modalMode !== mode) return;
+      (tab === "timeline" ? renderTimeline : renderLineage)(cache[tab]);
+    } catch (error) { if (S._modalMode === mode) { content.innerHTML = ""; content.appendChild(el("div", "timeline-error", publicText(error && error.message, 240))); } }
+  };
+  [["timeline", t("projectResearch.timeline")], ["lineage", t("projectResearch.lineage")]].forEach(([key, label]) => { const button = el("button", "seg-btn", label); button.dataset.tab = key; button.onclick = () => select(key); tabs.appendChild(button); });
+  select(initialTab === "lineage" ? "lineage" : "timeline");
+}
 function renderProjMenu() {
   $("#proj-current").textContent = S.project ? projName(S.project) : t("proj.current.allSessions");
   const m = $("#proj-menu"); m.innerHTML = "";
-  const home = el("div", "proj-item"); const hg = el("span"); hg.style.cssText = "display:flex;align-items:center;gap:6px"; hg.appendChild(iconEl("arrow-left", 16)); hg.appendChild(el("span", null, t("proj.menu.allProjects"))); home.appendChild(hg); home.onclick = () => { $("#proj-menu").classList.add("hidden"); showDashboard(); }; m.appendChild(home);
+  const item = (label, iconName, onClick) => {
+    const it = el("div", "proj-item"); const group = el("span"); group.style.cssText = "display:flex;align-items:center;gap:6px";
+    group.appendChild(iconEl(iconName, 16)); group.appendChild(el("span", null, label)); it.appendChild(group);
+    it.onclick = () => { $("#proj-menu").classList.add("hidden"); onClick(); }; m.appendChild(it); return it;
+  };
+  if (S.project) {
+    const current = S.projects.find(p => (p.project_id || p.id) === S.project);
+    if (current) item(t("proj.menu.settings"), "settings", () => openProjectModal(current));
+    item(t("projectResearch.menu"), "provenance", () => openProjectResearchView("timeline"));
+    item(t("sessionPackage.import"), "cloud-upload", chooseSessionPackage);
+    item(t("proj.menu.downloadArtifacts"), "download", () => downloadArtifactBundle(`/api/projects/${encodeURIComponent(S.project)}/artifacts.zip`, `${projName(S.project)}-artifacts.zip`));
+    m.appendChild(el("div", "ctx-sep"));
+  }
+  item(t("proj.menu.allProjects"), "arrow-left", showDashboard);
   S.projects.forEach(p => {
-    const it = el("div", "proj-item"); it.appendChild(el("span", null, (p.name || t("proj.fallbackName")).slice(0, 26)));
-    const del = el("span", "del"); del.appendChild(iconEl("trash-2", 15)); del.onclick = (e) => { e.stopPropagation(); if (confirm(t("proj.delete.confirm"))) deleteProject(p.project_id || p.id); };
-    it.appendChild(del); it.onclick = () => selectProject(p.project_id || p.id); m.appendChild(it);
+    if ((p.project_id || p.id) !== S.project) item((p.name || t("proj.fallbackName")).slice(0, 26), "box", () => selectProject(p.project_id || p.id));
   });
+  m.appendChild(el("div", "ctx-sep"));
+  item(t("proj.menu.newProject"), "plus", () => openProjectModal());
 }
 const projName = (id) => { const p = S.projects.find(x => (x.project_id || x.id) === id); return p ? (p.name || t("proj.fallbackName")) : t("proj.fallbackName"); };
 function selectProject(id) { S.project = id; $("#proj-menu").classList.add("hidden"); renderProjMenu(); loadSessions(); }
@@ -2144,7 +3650,48 @@ async function createProject(name, description, context) {
   const p = await api("/projects", { method: "POST", body: JSON.stringify({ name, description, context }) });
   await loadProjects(); openProject(p.project_id || p.id);
 }
-async function deleteProject(id) { try { await api("/projects/" + id, { method: "DELETE" }); } catch {} await loadProjects(); if (S.project === id) showDashboard(); else renderProjMenu(); }
+function closeProjectModal() {
+  $("#proj-modal").classList.add("hidden");
+  S.editingProject = null;
+}
+function openProjectModal(project) {
+  const p = project || null;
+  S.editingProject = p ? (p.project_id || p.id) : null;
+  const title = $("#proj-modal .modal-head span");
+  if (title) title.textContent = t(p ? "projModal.editTitle" : "projModal.title");
+  $("#pm-name").value = p ? (p.name || "") : "";
+  $("#pm-desc").value = p ? (p.description || "") : "";
+  $("#pm-ctx").value = p ? (p.context || p.agent_context || "") : "";
+  $("#pm-create").textContent = t(p ? "common.save" : "projModal.create");
+  $("#pm-delete").classList.toggle("hidden", !p);
+  $("#proj-modal").classList.remove("hidden");
+  requestAnimationFrame(() => $("#pm-name").focus());
+}
+async function submitProjectModal() {
+  const btn = $("#pm-create"); const name = $("#pm-name").value.trim() || t("palette.action.newProject");
+  btn.disabled = true;
+  try {
+    if (S.editingProject) {
+      await api(`/projects/${S.editingProject}`, { method: "PATCH", body: JSON.stringify({ name, description: $("#pm-desc").value, context: $("#pm-ctx").value }) });
+      await loadProjects(); renderProjMenu();
+      if (!$("#dashboard").classList.contains("hidden")) renderDashProjects();
+      closeProjectModal();
+    } else {
+      await createProject(name, $("#pm-desc").value, $("#pm-ctx").value);
+      closeProjectModal();
+    }
+  } catch (e) { hint(t("artifact.save.err", e.message), true); }
+  finally { btn.disabled = false; }
+}
+async function deleteProject(id) {
+  try {
+    await api("/projects/" + id, { method: "DELETE" });
+    closeProjectModal();
+    await loadProjects();
+    if (S.project === id) { S.project = null; showDashboard(); }
+    else renderProjMenu();
+  } catch (e) { hint(t("toast.deleteFailed", e.message), true); }
+}
 
 /* ---------- sessions ---------- */
 async function loadSessions() {
@@ -2177,8 +3724,6 @@ function renderSessions() {
   const list = $("#session-list"); if (!list) return; list.innerHTML = "";
   let ss = S.sessions; if (S.project) ss = ss.filter(f => f.project_id === S.project);
   ss = ss.slice().sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
-  // folder toolbar
-  if (S.project) { const tb = el("div", "folder-tools"); const nf = el("button", "side-mini", t("session.newFolder")); nf.onclick = newFolder; tb.appendChild(nf); list.appendChild(tb); }
   if (!ss.length && !(S.folders || []).length) { list.appendChild(el("div", "side-label", t("session.empty.label"))); return; }
   S._folderCollapsed = S._folderCollapsed || {};
   // folders first
@@ -2243,6 +3788,9 @@ function resumeWatch(fid, gen) {
   S._resumeTimer = setTimeout(tick, 2000);
 }
 async function openConversation(fid, pid) {
+  clearTimeout(S._branchConversationTimer);
+  const previousFid = S.currentId;
+  if (previousFid && previousFid !== fid) unsub(previousFid);
   if (pid && pid !== S.project) { S.project = pid; S._projArtFor = null; }  // new project → drop cached project-wide Files
   // reflect the open conversation in the address bar so it's a persistent,
   // shareable, reload-safe location (no-op when we're already at this path, e.g.
@@ -2255,8 +3803,15 @@ async function openConversation(fid, pid) {
   clearTimeout(S._resumeTimer);  // stop any resume-watchdog from the previously open session
   const gen = S._openGen = (S._openGen || 0) + 1;  // guard async continuations against fast session-switching
   S.cells = []; S.kernels = []; S.liveCells = []; S._liveCell = null; S.dockArtifact = null; S.kernelFilter = null;
+  S.actionTimeline = null; S.executionQueue = null; S.executionIdentity = null; S.recoveryState = null; S.recoveryActions = null; S.delegationState = null;
+  S.branchState = null; S.branchUndo = null; S.contextState = null; S.securityState = null;
+  S.workbenchErrors = {}; S._timelineHistoryReq = (S._timelineHistoryReq || 0) + 1; S._timelineHistoryLoading = null;
+  S._recoveryActionLoading = null; S._branchActionLoading = null;
+  S.variableInspector = { language: "python", results: {}, loading: null, error: "", request: 0 };
+  clearTimeout(S._workbenchTimer); S._workbenchReq = (S._workbenchReq || 0) + 1; S._workbenchLoading = null;
   S._tbl = {}; invalidateKernelCache();  // drop the prior session's table + kernel-state caches
   S.openTabs = []; S.activeTab = "notebook"; S.provMode = false; S.lineage = null; S._lineageFor = null;
+  showDockPane("notebook");
   S.stepEls = {};  // fresh step registry so reopen-then-replay dedupes by step_id
   S.permCards = Object.create(null);  // fresh permission-card registry (null-proto; drop cards from the prior conversation)
   S.planReady = null; S.planStatus = null; S.planPending = false;  // fresh plan state per session
@@ -2286,7 +3841,7 @@ async function openConversation(fid, pid) {
   } catch {}
   if (gen !== S._openGen) return;
   if (!msgCount) renderEmptySession();
-  loadArtifacts(fid); loadExecutionLog(fid); loadAnnotations(fid); down(true); updateJumpPill();
+  loadArtifacts(fid); loadExecutionLog(fid); loadAnnotations(fid); loadWorkbenchState(fid); down(true); updateJumpPill();
   // Resume: subscribe AFTER history renders so a replayed in-flight turn streams
   // below it. If a turn is still running server-side (survived our last close),
   // lock the composer and let the WS replay rebuild the live stream + notebook.
@@ -2335,15 +3890,129 @@ async function commitTitle() {
   try { await api("/frames/" + S.currentId, { method: "PATCH", body: JSON.stringify({ name }) }); S._titleName = name; setTitle(name); loadSessions(); }
   catch (e) { setTitle(S._titleName); hint(t("toast.renameFailed", e.message), true); }
 }
-function sessionMenu(anchor, fid) {
+function addToMessageMenu(anchor) {
   openMenu(anchor, [
-    { label: t("folder.menu.rename"), icon: "pencil", onClick: () => renameFrame(fid) },
+    { label: t("composer.menu.attachFiles"), icon: "plus", onClick: () => $("#file-input").click() },
+    { label: t("composer.menu.yourFiles"), icon: "files", onClick: () => setActiveTab("files") },
+    { label: t("composer.menu.requestReview"), icon: "eye-context", onClick: requestReview },
+    { label: t("composer.menu.saveAsSkill"), icon: "book", onClick: saveCurrentAsSkill },
+    { sep: true },
+    { label: t("composer.menu.contextUsage"), icon: "circle-dot", onClick: showContextUsage },
+  ]);
+}
+async function showContextUsage() {
+  if (!S.currentId) return;
+  let frame, steps = []; try { const data = await Promise.all([api(`/frames/${S.currentId}`), api(`/frames/${S.currentId}/steps`).catch(() => ({ steps: [] }))]); frame = data[0]; steps = data[1].steps || []; } catch (e) { hint(e.message, true); return; }
+  const input = Number(frame.input_tokens || 0); const output = Number(frame.output_tokens || 0);
+  const reviewer = steps.filter(s => s.kind === "review").reduce((sum, s) => sum + Number(s.output && s.output.usage && ((s.output.usage.input_tokens || 0) + (s.output.usage.output_tokens || 0)) || 0), 0);
+  $("#modal-title").textContent = t("composer.menu.contextUsage"); $("#modal-download").style.display = "none";
+  const body = $("#modal-body"); body.innerHTML = "";
+  const card = el("div", "prov-card"); card.appendChild(el("div", "prov-h", `${(input + output).toLocaleString()} tokens`));
+  card.appendChild(el("div", "prov-meta", `Input ${input.toLocaleString()} · Output ${output.toLocaleString()} · Reviewer ${reviewer.toLocaleString()}`)); body.appendChild(card);
+  $("#modal").classList.remove("hidden");
+}
+async function saveCurrentAsSkill() {
+  if (!S.currentId) { skillEditor(null); return; }
+  let messages = []; try { const data = await api(`/frames/${S.currentId}/messages?from=0&limit=500`); messages = data.messages || []; } catch {}
+  const latestUser = [...messages].reverse().find(m => m.role === "user");
+  const latestAssistant = [...messages].reverse().find(m => m.role === "assistant");
+  const title = (S._titleName || "research-workflow").toLowerCase().replace(/[^a-z0-9一-龥]+/g, "-").replace(/^-|-$/g, "").slice(0, 48) || "research-workflow";
+  const request = String(latestUser && latestUser.content || "").trim(); const result = String(latestAssistant && latestAssistant.content || "").trim();
+  skillEditor(null, {
+    name: title,
+    description: request.replace(/\s+/g, " ").slice(0, 180),
+    body: `# Purpose\n\n${request || "Describe when this workflow should be used."}\n\n# Procedure\n\n1. Reproduce the evidence-gathering and analysis workflow.\n2. Preserve data provenance, code, and generated artifacts.\n3. State uncertainty and do not overclaim beyond the evidence.\n\n# Example outcome\n\n${result.slice(0, 6000)}`,
+  });
+}
+async function requestReview() {
+  if (!S.currentId || S.running) return;
+  S.running = true; enableComposer(false); $("#cancel-btn").classList.remove("hidden"); hint("Reviewing", false, true);
+  try {
+    await api(`/frames/${S.currentId}/review`, { method: "POST", body: "{}" });
+    resumeWatch(S.currentId, S._openGen);
+  } catch (e) {
+    turnDone("failed"); hint(e.message, true);
+  }
+}
+async function sessionOptionsMenu(anchor) {
+  if (!S.currentId) return;
+  let review = { auto_review: false, reviewer_model: "", delegation_enabled: true };
+  try { review = await api(`/frames/${S.currentId}/review-settings`); } catch {}
+  const checked = on => on ? "✓  " : "";
+  openMenu(anchor, [
+    { label: checked(review.delegation_enabled !== false) + t("composer.option.delegation"), icon: "users", onClick: async () => { const on = review.delegation_enabled === false; try { await api(`/frames/${S.currentId}/review-settings`, { method: "PATCH", body: JSON.stringify({ delegation_enabled: on }) }); hint(t("composer.option.delegation") + ` · ${on ? "On" : "Off"}`); } catch (e) { hint(e.message, true); } } },
+    { label: checked(S.planMode) + t("composer.planMode"), icon: "grid", onClick: () => $("#plan-toggle").click() },
+    { label: checked(S.exploreMode) + t("composer.exploreMode"), icon: "compass", onClick: () => $("#explore-toggle").click() },
+    { sep: true },
+    { label: checked(review.auto_review) + t("composer.option.autoReview"), icon: "eye-context", onClick: async () => { try { await api(`/frames/${S.currentId}/review-settings`, { method: "PATCH", body: JSON.stringify({ auto_review: !review.auto_review }) }); hint(t("composer.option.autoReview") + ` · ${!review.auto_review ? "On" : "Off"}`); } catch (e) { hint(e.message, true); } } },
+    { label: t("composer.option.reviewerModel") + (review.reviewer_model ? ` · ${review.reviewer_model}` : ""), icon: "sliders", onClick: () => reviewerModelMenu(anchor, review.reviewer_model) },
+    { label: t("composer.option.memory"), icon: "book", onClick: () => openCust("memory") },
+    { label: t("composer.option.specialist"), icon: "users", onClick: () => openCust("specialists") },
+    { label: t("composer.option.compute"), icon: "terminal", onClick: () => openCust("compute") },
+  ]);
+}
+function reviewerModelMenu(anchor, current) {
+  const choices = [{ id: "", name: t("composer.option.sameModel") }].concat((S.models || []).map(m => ({ id: m.id, name: m.name || m.id })));
+  openMenu(anchor, choices.map(model => ({
+    label: (model.id === (current || "") ? "✓  " : "") + model.name,
+    icon: "circle-dot",
+    onClick: async () => { try { await api(`/frames/${S.currentId}/review-settings`, { method: "PATCH", body: JSON.stringify({ reviewer_model: model.id }) }); hint(t("composer.option.reviewerModel") + ` · ${model.name}`); } catch (e) { hint(e.message, true); } },
+  })));
+}
+function sessionMenu(anchor, fid) {
+  const frame = S.sessions.find(x => x.id === fid) || {};
+  const items = [{ label: t("folder.menu.rename"), icon: "pencil", onClick: () => renameFrame(fid) }];
+  if (frame.running || (fid === S.currentId && S.running)) items.push({ label: t("sessionMenu.cancel"), icon: "stop", onClick: async () => {
+    try { const result = await scopedExecutionRequest(fid, "cancel", "session menu cancel"); if (result && result.ok && fid === S.currentId) turnDone("cancelled"); }
+    catch (error) { hint(t("nb.action.failed", error.message), true); }
+    loadSessions();
+  } });
+  items.push(
+    { label: t("sessionMenu.exportMarkdown"), icon: "download", onClick: () => exportSession(fid) },
+    { label: t("sessionPackage.export"), icon: "archive", onClick: () => exportSessionPackage(fid, frame) },
+    { label: t("sessionMenu.downloadArtifacts"), icon: "files", onClick: () => downloadArtifactBundle(`/api/frames/${encodeURIComponent(fid)}/artifacts.zip`, `${frame.name || frame.task_summary || "session"}-artifacts.zip`) },
+    { label: t("sessionMenu.viewNotebook"), icon: "notebook", onClick: async () => { if (fid !== S.currentId) await openConversation(fid, frame.project_id); setActiveTab("notebook"); } },
+    { sep: true },
     { label: t("sessionMenu.duplicate"), icon: "copy", onClick: () => duplicateSession(fid) },
     { label: t("sessionMenu.moveToFolder"), icon: "folder", onClick: () => moveToFolderAt(anchor, fid) },
-    { label: t("sessionMenu.exportMarkdown"), icon: "download", onClick: () => exportSession(fid) },
-    { sep: true },
     { label: t("common.delete"), icon: "trash-2", danger: true, onClick: () => { if (confirm(t("confirm.deleteSession"))) deleteSession(fid); } },
-  ]);
+  );
+  openMenu(anchor, items);
+}
+function exportSessionPackage(fid, frame = {}) {
+  const label = frame.name || frame.task_summary || "session";
+  downloadArtifactBundle(
+    `/api/frames/${encodeURIComponent(fid)}/session/export`,
+    label.replace(/[^\w一-龥-]+/g, "_") + ".openai4s-session.zip",
+  );
+}
+function chooseSessionPackage() {
+  const input = $("#session-package-input");
+  if (input) input.click();
+}
+async function importSessionPackage(file) {
+  if (!file) return;
+  if (file.size > 128 * 1024 * 1024) { hint(t("sessionPackage.tooLarge"), true); return; }
+  try {
+    const response = await fetch("/api/sessions/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/vnd.openai4s.session+zip" },
+      body: file,
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result.root_frame_id || !result.project_id) {
+      throw new Error(result.error || `HTTP ${response.status}`);
+    }
+    await loadProjects();
+    hint(t("sessionPackage.imported"));
+    await openConversation(result.root_frame_id, result.project_id);
+  } catch (error) {
+    hint(t("toast.importFailed", error.message), true);
+  }
+}
+function downloadArtifactBundle(url, filename) {
+  const link = document.createElement("a"); link.href = url; link.download = filename || "artifacts.zip";
+  document.body.appendChild(link); link.click(); link.remove();
 }
 function moveToFolderAt(anchor, fid) {
   const folders = S.folders || [];
@@ -2401,7 +4070,9 @@ function openMenu(anchor, items) {
   });
   document.body.appendChild(m); S._menu = m;
   const r = anchor.getBoundingClientRect();
-  m.style.top = (r.bottom + 4) + "px";
+  let top = r.bottom + 4;
+  if (top + m.offsetHeight > window.innerHeight - 8) top = Math.max(8, r.top - m.offsetHeight - 4);
+  m.style.top = top + "px";
   m.style.left = Math.max(8, Math.min(r.left, window.innerWidth - m.offsetWidth - 8)) + "px";
   setTimeout(() => document.addEventListener("mousedown", menuOutside), 0);
 }
@@ -2431,12 +4102,21 @@ function sendFeedback(key, rating) {
   api("/frames/" + S.currentId + "/feedback", { method: "POST", body: JSON.stringify({ key, rating }) }).catch(() => {});
   hint(rating === "up" ? t("toast.feedbackUp") : rating === "down" ? t("toast.feedbackDown") : t("toast.feedbackCancelled"));
 }
-async function cancelTurn() { if (!S.currentId) return; try { await api("/frames/" + S.currentId + "/cancel", { method: "POST" }); } catch {} turnDone("cancelled"); }
+async function cancelTurn() {
+  if (!S.currentId) return;
+  try { const result = await scopedExecutionRequest(S.currentId, "cancel", "composer cancel"); if (result && result.ok) turnDone("cancelled"); }
+  catch (error) { hint(t("nb.action.failed", error.message), true); }
+}
 
 /* ---------- send ---------- */
 async function send(text, opts) {
   text = (text || "").trim(); opts = opts || {};
   if (S.running) return;
+  const runtime = runtimeSummary();
+  if (S.currentId && runtime.viewOnly && runtime.trustState === "quarantined") {
+    hint(t("runtime.quarantineHint"), true);
+    return;
+  }
   const anns = openAnnotations();                 // pinned image comments to ride along
   if (!text && !anns.length) return;              // nothing to send
   const planNow = S.planMode && !opts.execute;
@@ -2484,7 +4164,7 @@ async function send(text, opts) {
                      // drops them (server replay is gated on is_running, which is already
                      // false once the blocking POST returns). Idempotent set add.
   try {
-    await api(`/frames/${S.currentId}/message`, { method: "POST", body: JSON.stringify({ input_data: { request: payload }, model: S.defaultModel, plan: planNow, explore: exploreNow, annotation_ids: annIds }) });
+    await api(`/frames/${S.currentId}/message`, { method: "POST", body: JSON.stringify({ input_data: { request: payload }, model: S.defaultModel, plan: planNow, explore: exploreNow, annotation_ids: annIds, wait: false }) });
     // The optimistic status above clears the badge immediately; reload once the turn POST finishes to reconcile with the server.
     if (annIds.length) { try { await loadAnnotations(S.currentId); } catch {} refreshAllStages(); updateAnnotBadge(); }
   }
@@ -2498,8 +4178,14 @@ async function send(text, opts) {
       refreshAllStages(); updateAnnotBadge();
     }
     hint(t("toast.sendFailed", e.message), true);
+    if (S.running) turnDone("failed");
+    loadSessions();
+    return;
   }
-  if (S.running) turnDone("completed");
+  // The async POST returns as soon as the job is accepted. Keep the composer
+  // locked until the authoritative WebSocket frame_update arrives; the status
+  // watchdog covers a missed terminal event after reconnects.
+  resumeWatch(S.currentId, S._openGen);
   loadSessions();
 }
 /* compact "N annotations attached" block under a user message bubble */
@@ -2536,15 +4222,49 @@ async function loadModels() {
 }
 
 /* ---------- artifacts (inline + files) ---------- */
+function artifactCacheKey(a) {
+  if (!a || !a.id) return "_live";
+  const seen = S._artVer && S._artVer[a.id];
+  const version = seen || a.version_id || a.latest_version_id || a.checksum || "unknown";
+  return a.id + ":" + version;
+}
+function syncArtifactVersion(patch, force) {
+  const aid = patch && (patch.id || patch.artifact_id);
+  if (!aid) return false;
+  const version = patch.version_id || patch.latest_version_id || patch.checksum;
+  const seen = S._artVer || (S._artVer = {});
+  const dockMatch = !!(S.dockArtifact && S.dockArtifact.id === aid);
+  const previous = seen[aid] || (dockMatch && (S.dockArtifact.version_id || S.dockArtifact.latest_version_id || S.dockArtifact.checksum));
+  const changed = !!(version && previous && previous !== version);
+  if (version) seen[aid] = version;
+  const update = Object.assign({}, patch, { id: aid });
+  if (version) update.version_id = version;
+  (S.openTabs || []).forEach(item => { if (item.id === aid) Object.assign(item, update); });
+  if (dockMatch) Object.assign(S.dockArtifact, update);
+  if (dockMatch && (changed || force)) {
+    S.lineage = null; S._lineageFor = null;
+    S._lineageReq = (S._lineageReq || 0) + 1;
+    const key = artifactCacheKey(S.dockArtifact);
+    if (S._envSnapById) delete S._envSnapById[key];
+  }
+  return changed || (dockMatch && !!force);
+}
 async function loadArtifacts(id) {
+  const request = S._artifactLoadReq = (S._artifactLoadReq || 0) + 1;
   let a = []; try { a = await api(`/frames/${id}/artifacts`); } catch { a = []; }
-  if (id !== S.currentId) return;
+  if (id !== S.currentId || request !== S._artifactLoadReq) return;
   a = Array.isArray(a) ? a : [];
   // Bust the URL cache of any artifact whose latest version changed since we last
   // saw it (covers overwrite-in-place edits even if the live event was missed).
-  const seen = S._artVer || (S._artVer = {});
-  a.forEach(x => { const v = x.version_id || x.checksum; if (v && seen[x.id] && seen[x.id] !== v) (S._artBust = S._artBust || {})[x.id] = v; if (v) seen[x.id] = v; });
+  let refreshProv = false;
+  a.forEach(x => {
+    const v = x.version_id || x.latest_version_id || x.checksum;
+    const changed = syncArtifactVersion(x, false);
+    if (changed && v) (S._artBust = S._artBust || {})[x.id] = v;
+    if (changed && S.provMode && S.dockArtifact && S.dockArtifact.id === x.id) refreshProv = true;
+  });
   S.artifacts = a; renderConversationArtifacts();
+  if (refreshProv && S.dockArtifact) showProvenance(S.dockArtifact);
   if (S.dock.open && S.activeTab === "files") {
     // In project scope, a conversation switch may have crossed into another
     // project — reload the aggregate (cache was invalidated on project change).
@@ -2695,7 +4415,10 @@ function renderConversationArtifacts() {
       more.onclick = () => { more.remove(); list.slice(CAP - 1).forEach(a => tiles.appendChild(mkTile(a))); };
       tiles.appendChild(more);
     }
-    g.appendChild(tiles); $("#messages").appendChild(g);
+    g.appendChild(tiles);
+    const host = $("#messages"); let review = host.querySelector(".step-review");
+    while (review && review.parentElement !== host) review = review.parentElement;
+    host.insertBefore(g, review || null);
   };
   // Separate user uploads from cell-generated outputs so an uploaded file (e.g. a
   // .fasta) is labelled "uploaded", not "generated".
@@ -2724,15 +4447,296 @@ function tileThumbBig(a) { const t = tileThumb(a); t.className = "a-thumb"; retu
 
 /* Shared artifact body renderer (used by dock Viewer + fullscreen modal). */
 function artUrl(a) { const b = (S._artBust || {})[a.id]; return `/api/artifacts/${a.id}` + (b ? `?_=${b}` : ""); }
+function scientificRenderers() { return window.OpenAI4SScientificRenderers || null; }
+function artifactRendererVersion(a) { return a && (a.version_id || a.latest_version_id) || ""; }
+function loadRendererCatalog() {
+  if (Array.isArray(S.rendererCatalog)) return Promise.resolve(S.rendererCatalog);
+  if (S._rendererCatalogPromise) return S._rendererCatalogPromise;
+  S._rendererCatalogPromise = api("/renderers").then(result => {
+    const catalog = result && Array.isArray(result.renderers) ? result.renderers.filter(item => item && typeof item.renderer_id === "string") : [];
+    S.rendererCatalog = catalog;
+    return catalog;
+  }).catch(() => {
+    S.rendererCatalog = [];
+    return [];
+  });
+  return S._rendererCatalogPromise;
+}
+function compatibilityRendererDescriptor(a) {
+  const ct = String(a.content_type || "").toLowerCase().split(";", 1)[0];
+  const nm = String(a.filename || "").toLowerCase();
+  let id = "download";
+  if (ct.startsWith("image/") || /\.(png|jpe?g|gif|webp|svg)$/i.test(nm)) id = "image";
+  else if (ct === "application/pdf" || nm.endsWith(".pdf")) id = "pdf";
+  else if (ct === "text/html" || /\.html?$/i.test(nm)) id = "html-preview";
+  else if (/\.(pdb|cif|mmcif|ent|xyz)$/i.test(nm)) id = "molecule-3d";
+  else if (/\.(mol|mol2|sdf|smi|smiles)$/i.test(nm)) id = "chemistry-2d";
+  else if (/\.(bed|bedgraph|gff3?|gtf|vcf)$/i.test(nm)) id = "genome-track";
+  else if (/\.(aln|a2m|a3m|sto|stockholm)$/i.test(nm)) id = "msa";
+  else if (/\.(fa|fasta|faa|fna|fastq|fq)$/i.test(nm)) id = "sequence";
+  else if (/\.(md|markdown|rst)$/i.test(nm)) id = "markdown";
+  else if (/\.tex$/i.test(nm)) id = "latex";
+  else if (/csv|tab-separated/.test(ct) || /\.(csv|tsv)$/i.test(nm)) id = "table";
+  else if (ct.startsWith("text/") || /json/.test(ct) || TEXT_EXT.test(nm)) id = "text";
+  return { artifact_id: a.id, version_id: artifactRendererVersion(a), matched_by: "compatibility", renderer: { renderer_id: id, label: id }, trusted_html: false };
+}
+function artifactRendererDescriptor(a) {
+  const version = artifactRendererVersion(a);
+  const key = `${a.id}:${version || "latest"}`;
+  S.rendererDescriptors = S.rendererDescriptors || {};
+  if (S.rendererDescriptors[key]) return S.rendererDescriptors[key];
+  const suffix = version ? `?version=${encodeURIComponent(version)}` : "";
+  const request = Promise.all([
+    loadRendererCatalog(),
+    api(`/artifacts/${encodeURIComponent(a.id)}/renderer${suffix}`),
+  ]).then(([catalog, descriptor]) => {
+    if (!descriptor || descriptor.artifact_id !== a.id) throw new Error("renderer descriptor does not match artifact");
+    if (version && descriptor.version_id && descriptor.version_id !== version) throw new Error("renderer descriptor does not match artifact version");
+    const runtime = scientificRenderers();
+    const rendererId = runtime ? runtime.rendererIdFromDescriptor(descriptor, catalog) : "download";
+    const catalogRenderer = catalog.find(item => item.renderer_id === rendererId);
+    return {
+      ...descriptor,
+      renderer: catalogRenderer || { renderer_id: rendererId, label: rendererId, capabilities: ["view"], sandboxed: true },
+    };
+  }).catch(error => {
+    delete S.rendererDescriptors[key];
+    throw error;
+  });
+  S.rendererDescriptors[key] = request;
+  return request;
+}
 function renderArtifactBody(body, a) {
-  body.innerHTML = ""; const ct = a.content_type || ""; const nm = (a.filename || "").toLowerCase(); const url = artUrl(a);
-  if (ct.startsWith("image/") || /\.(png|jpe?g|gif|webp|svg)$/i.test(nm)) { renderAnnotatableImage(body, a, url); }
-  else if (ct === "application/pdf" || nm.endsWith(".pdf")) { const f = el("iframe"); f.src = url; body.appendChild(f); }
-  else if (ct === "text/html" || nm.endsWith(".html") || nm.endsWith(".htm")) { const f = el("iframe"); f.setAttribute("sandbox", "allow-scripts allow-forms"); f.src = (S.sandboxOrigin || "") + `/preview/${a.id}`; body.appendChild(f); }
-  else if (/\.(pdb|cif|mol|mol2|sdf|xyz)$/i.test(nm)) molecule(body, url, nm);
-  else if (/\.(md|markdown)$/i.test(nm)) fetch(url).then(r => r.text()).then(t => { const d = el("div", "md"); d.style.padding = "18px"; d.innerHTML = renderMd(t); body.appendChild(d); }).catch(() => {});
-  else if (/csv|json/.test(ct) || /\.(csv|json|tsv)$/i.test(nm)) fetch(url).then(r => r.text()).then(t => { const rows = parseTable(t, a); if (rows && rows.length) { const tbl = el("table", "sheet"); const hr = el("tr"); Object.keys(rows[0]).forEach(k => hr.appendChild(el("th", null, k))); tbl.appendChild(hr); rows.forEach(row => { const tr = el("tr"); Object.keys(rows[0]).forEach(k => tr.appendChild(el("td", null, String(row[k] ?? "")))); tbl.appendChild(tr); }); body.appendChild(tbl); } else { const p = el("pre"); p.textContent = t; body.appendChild(p); } }).catch(() => {});
-  else fetch(url).then(r => r.text()).then(t => { const p = el("pre"); p.textContent = t.slice(0, 300000); body.appendChild(p); }).catch(() => {});
+  const request = body._rendererRequest = (body._rendererRequest || 0) + 1;
+  body.innerHTML = "";
+  const loading = el("div", "renderer-loading"); loading.appendChild(iconEl("loader", 16, "spin")); loading.appendChild(el("span", null, t("viewer.loading"))); body.appendChild(loading);
+  artifactRendererDescriptor(a).then(descriptor => {
+    if (body._rendererRequest !== request) return;
+    renderArtifactDescriptor(body, a, descriptor);
+  }).catch(() => {
+    if (body._rendererRequest !== request) return;
+    renderArtifactDescriptor(body, a, compatibilityRendererDescriptor(a));
+  });
+}
+function renderArtifactDescriptor(body, a, descriptor) {
+  body.innerHTML = "";
+  const renderer = descriptor.renderer || {};
+  const rendererId = renderer.renderer_id || "download";
+  const shell = el("div", "renderer-shell"); shell.dataset.rendererId = rendererId;
+  const meta = el("div", "renderer-meta");
+  meta.appendChild(el("span", "renderer-name", publicText(renderer.label || rendererId, 80)));
+  const match = descriptor.matched_by === "compatibility" ? t("viewer.renderer.compat") : t("viewer.renderer.matched", publicText(descriptor.matched_by || "metadata", 30));
+  meta.appendChild(el("span", "renderer-detail", match));
+  if (descriptor.version_id) meta.appendChild(el("span", "renderer-version", t("viewer.renderer.version", publicText(String(descriptor.version_id).slice(0, 10), 12))));
+  shell.appendChild(meta);
+  const content = el("div", "renderer-content"); shell.appendChild(content); body.appendChild(shell);
+  const url = artUrl(a); const nm = String(a.filename || "").toLowerCase();
+  if (rendererId === "image") renderAnnotatableImage(content, a, url);
+  else if (rendererId === "pdf") { const frame = el("iframe"); frame.src = url; content.appendChild(frame); }
+  else if (rendererId === "html-preview") { const frame = el("iframe"); frame.setAttribute("sandbox", "allow-scripts allow-forms"); frame.src = (S.sandboxOrigin || "") + `/preview/${encodeURIComponent(a.id)}`; content.appendChild(frame); }
+  else if (rendererId === "molecule-3d") molecule(content, url, nm);
+  else if (rendererId === "chemistry-2d") renderChemistry2D(content, a, url);
+  else if (rendererId === "genome-track") renderGenomeTrack(content, a, url);
+  else if (rendererId === "sequence") renderSequenceArtifact(content, a, url);
+  else if (rendererId === "msa") renderAlignmentArtifact(content, a, url);
+  else if (rendererId === "latex") renderLatexArtifact(content, a, url);
+  else if (rendererId === "markdown") renderMarkdownArtifact(content, url);
+  else if (rendererId === "table") renderTableArtifact(content, a, url);
+  else if (rendererId === "text") renderTextArtifact(content, a, url);
+  else renderDownloadArtifact(content, a, url);
+}
+function fetchArtifactText(url) {
+  return fetch(url).then(response => {
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.text();
+  });
+}
+function rendererFailure(container, a, url) {
+  container.innerHTML = "";
+  const card = el("div", "renderer-fallback"); card.appendChild(iconEl("alert-triangle", 18));
+  card.appendChild(el("div", "renderer-fallback-text", t("viewer.renderer.error")));
+  const download = el("a", "outline-btn small", t("common.download")); download.href = url; download.setAttribute("download", a.filename || "artifact"); card.appendChild(download);
+  container.appendChild(card);
+}
+function renderMarkdownArtifact(container, url) {
+  fetchArtifactText(url).then(text => {
+    if (!container.isConnected) return;
+    const markdown = el("div", "md renderer-markdown"); markdown.innerHTML = renderMd(text.slice(0, 1000000)); container.appendChild(markdown);
+  }).catch(() => rendererFailure(container, { filename: "artifact" }, url));
+}
+function renderTextArtifact(container, a, url) {
+  fetchArtifactText(url).then(text => {
+    if (!container.isConnected) return;
+    if (looksBinary(text)) return renderDownloadArtifact(container, a, url);
+    const ct = String(a.content_type || "").toLowerCase(); const nm = String(a.filename || "").toLowerCase();
+    if (/json/.test(ct) || /\.json$/i.test(nm)) return renderStructuredText(container, a, text);
+    const pre = el("pre", "renderer-source"); pre.textContent = text.slice(0, 300000); container.appendChild(pre);
+  }).catch(() => rendererFailure(container, a, url));
+}
+function renderStructuredText(container, a, text) {
+  const rows = parseTable(text, a);
+  if (!rows || !rows.length) { const pre = el("pre", "renderer-source"); pre.textContent = text.slice(0, 300000); container.appendChild(pre); return; }
+  renderSheet(container, rows);
+}
+function renderTableArtifact(container, a, url) {
+  fetchArtifactText(url).then(text => {
+    if (!container.isConnected) return;
+    if (looksBinary(text)) return renderDownloadArtifact(container, a, url);
+    const rows = parseTable(text, a);
+    if (rows && rows.length) renderSheet(container, rows);
+    else { const pre = el("pre", "renderer-source"); pre.textContent = text.slice(0, 300000); container.appendChild(pre); }
+  }).catch(() => rendererFailure(container, a, url));
+}
+function renderSheet(container, rows) {
+  const safeRows = rows.slice(0, 5000); const columns = Object.keys(safeRows[0] || {}).slice(0, 100);
+  const table = el("table", "sheet"); const head = el("tr"); columns.forEach(key => head.appendChild(el("th", null, key))); table.appendChild(head);
+  safeRows.forEach(row => { const tr = el("tr"); columns.forEach(key => tr.appendChild(el("td", null, String(row[key] ?? "")))); table.appendChild(tr); });
+  container.appendChild(table);
+}
+function appendResidues(container, sequence, alphabet, limit) {
+  const runtime = scientificRenderers(); const fragment = document.createDocumentFragment();
+  const shown = String(sequence || "").slice(0, Math.max(0, limit));
+  for (const residue of shown) {
+    const span = el("span", "bio-residue " + (runtime ? runtime.residueClass(residue, alphabet) : "other"), residue);
+    fragment.appendChild(span);
+  }
+  container.appendChild(fragment); return shown.length;
+}
+function renderSequenceArtifact(container, a, url) {
+  fetchArtifactText(url).then(text => {
+    if (!container.isConnected) return;
+    const runtime = scientificRenderers(); const parsed = runtime && runtime.parseSequence(text, a.filename);
+    if (!parsed || !parsed.records.length) return renderTextArtifact(container, a, url);
+    const summary = el("div", "bio-summary", t("viewer.sequence.summary", parsed.records.length, parsed.total_length.toLocaleString(), parsed.alphabet)); container.appendChild(summary);
+    const list = el("div", "sequence-list"); let remaining = 30000; let shown = 0;
+    parsed.records.slice(0, 100).forEach(record => {
+      if (remaining <= 0) return;
+      const card = el("section", "sequence-record"); const head = el("div", "sequence-head");
+      head.appendChild(el("strong", null, record.name || "sequence"));
+      head.appendChild(el("span", null, `${record.sequence.length.toLocaleString()} ${parsed.alphabet === "protein" ? "aa" : "nt"}`));
+      card.appendChild(head); if (record.description) card.appendChild(el("div", "sequence-description", record.description));
+      const sequence = el("div", "bio-sequence"); const used = appendResidues(sequence, record.sequence, parsed.alphabet, Math.min(remaining, 10000));
+      remaining -= used; shown += used; card.appendChild(sequence); list.appendChild(card);
+    });
+    container.appendChild(list);
+    if (shown < parsed.total_length) container.appendChild(el("div", "renderer-note", t("viewer.sequence.omitted", (parsed.total_length - shown).toLocaleString())));
+  }).catch(() => rendererFailure(container, a, url));
+}
+function renderAlignmentArtifact(container, a, url) {
+  fetchArtifactText(url).then(text => {
+    if (!container.isConnected) return;
+    const runtime = scientificRenderers(); const parsed = runtime && runtime.parseAlignment(text, a.filename);
+    if (!parsed || !parsed.records.length) return renderTextArtifact(container, a, url);
+    container.appendChild(el("div", "bio-summary", t("viewer.msa.summary", parsed.records.length, parsed.columns.toLocaleString(), parsed.format)));
+    const viewport = el("div", "msa-viewport");
+    parsed.records.slice(0, 48).forEach(record => {
+      const row = el("div", "msa-row"); const label = el("div", "msa-label", record.name || "sequence"); label.title = record.name || "sequence"; row.appendChild(label);
+      const sequence = el("div", "msa-sequence"); appendResidues(sequence, record.sequence, parsed.alphabet || "protein", 1200); row.appendChild(sequence); viewport.appendChild(row);
+    });
+    container.appendChild(viewport);
+    const omitted = parsed.records.reduce((sum, record, index) => sum + (index >= 48 ? record.sequence.length : Math.max(0, record.sequence.length - 1200)), 0);
+    if (omitted) container.appendChild(el("div", "renderer-note", t("viewer.sequence.omitted", omitted.toLocaleString())));
+  }).catch(() => rendererFailure(container, a, url));
+}
+function svgElement(name, attrs) {
+  const node = document.createElementNS("http://www.w3.org/2000/svg", name);
+  Object.entries(attrs || {}).forEach(([key, value]) => node.setAttribute(key, String(value)));
+  return node;
+}
+function renderGenomeTrack(container, a, url) {
+  fetchArtifactText(url).then(text => {
+    if (!container.isConnected) return;
+    const runtime = scientificRenderers(); const parsed = runtime && runtime.parseGenome(text, a.filename);
+    if (!parsed || !parsed.features.length) return renderTextArtifact(container, a, url);
+    container.appendChild(el("div", "bio-summary", `${parsed.format} · ${t("viewer.genome.features", parsed.features.length.toLocaleString(), parsed.chromosomes.length)}`));
+    if (parsed.invalid) container.appendChild(el("div", "renderer-note", t("viewer.genome.invalid", parsed.invalid.toLocaleString())));
+    const grouped = new Map(); parsed.features.forEach(feature => { if (!grouped.has(feature.chrom)) grouped.set(feature.chrom, []); grouped.get(feature.chrom).push(feature); });
+    const tracks = el("div", "genome-tracks"); let budget = 500;
+    parsed.chromosomes.slice(0, 24).forEach(chromosome => {
+      const row = el("section", "genome-row"); const head = el("div", "genome-head");
+      head.appendChild(el("strong", null, chromosome.chrom)); head.appendChild(el("span", null, `${chromosome.start.toLocaleString()}–${chromosome.end.toLocaleString()} · ${chromosome.count}`)); row.appendChild(head);
+      const svg = svgElement("svg", { viewBox: "0 0 1000 58", role: "img", "aria-label": `${chromosome.chrom} genome track` });
+      svg.appendChild(svgElement("line", { x1: 18, y1: 29, x2: 982, y2: 29, class: "genome-axis" }));
+      const span = Math.max(1, chromosome.end - chromosome.start); const features = (grouped.get(chromosome.chrom) || []).slice(0, Math.max(0, budget)); budget -= features.length;
+      features.forEach((feature, index) => {
+        const x = 18 + 964 * ((feature.start - chromosome.start) / span); const width = Math.max(2, 964 * ((feature.end - feature.start) / span));
+        const rect = svgElement("rect", { x: x.toFixed(2), y: 9 + (index % 5) * 8, width: Math.min(982 - x, width).toFixed(2), height: 6, rx: 2, class: `genome-feature genome-${String(feature.type || "feature").replace(/[^a-z0-9_-]/gi, "").toLowerCase()}` });
+        const title = svgElement("title"); title.textContent = `${feature.label} · ${feature.chrom}:${feature.start + 1}-${feature.end} · ${feature.type}`; rect.appendChild(title); svg.appendChild(rect);
+      });
+      row.appendChild(svg); tracks.appendChild(row);
+    });
+    container.appendChild(tracks);
+    const details = el("details", "genome-descriptors"); details.appendChild(el("summary", null, t("viewer.genome.list")));
+    parsed.features.slice(0, 300).forEach(feature => {
+      const row = el("div", "genome-descriptor"); row.appendChild(el("code", null, `${feature.chrom}:${feature.start + 1}-${feature.end}`)); row.appendChild(el("span", "genome-type", feature.type)); row.appendChild(el("span", "genome-label", feature.label)); details.appendChild(row);
+    });
+    container.appendChild(details);
+  }).catch(() => rendererFailure(container, a, url));
+}
+function chemistryElementColor(element) {
+  return ({ C: "#38434f", N: "#2563eb", O: "#dc2626", S: "#ca8a04", P: "#ea580c", F: "#16a34a", CL: "#16a34a", BR: "#9a3412", I: "#7e22ce", H: "#64748b" })[String(element || "").toUpperCase()] || "#475569";
+}
+function molecule2dSvg(model) {
+  if (!model || !model.atoms.length) return null;
+  const xs = model.atoms.map(atom => atom.x); const ys = model.atoms.map(atom => atom.y);
+  const minX = Math.min(...xs); const maxX = Math.max(...xs); const minY = Math.min(...ys); const maxY = Math.max(...ys);
+  if (model.atoms.length > 1 && Math.abs(maxX - minX) < 1e-8 && Math.abs(maxY - minY) < 1e-8) return null;
+  const width = 900, height = 520, pad = 64; const sx = Math.max(1e-6, maxX - minX); const sy = Math.max(1e-6, maxY - minY);
+  const scale = Math.min((width - pad * 2) / sx, (height - pad * 2) / sy); const usedW = sx * scale; const usedH = sy * scale;
+  const point = atom => ({ x: (width - usedW) / 2 + (atom.x - minX) * scale, y: height - ((height - usedH) / 2 + (atom.y - minY) * scale) });
+  const svg = svgElement("svg", { viewBox: `0 0 ${width} ${height}`, role: "img", "aria-label": model.title || "2D molecule" });
+  model.bonds.forEach(bond => {
+    const p1 = point(model.atoms[bond.a]); const p2 = point(model.atoms[bond.b]); const dx = p2.x - p1.x; const dy = p2.y - p1.y; const length = Math.max(1, Math.hypot(dx, dy)); const nx = -dy / length * 4; const ny = dx / length * 4;
+    const count = Math.max(1, Math.min(3, bond.order));
+    for (let index = 0; index < count; index++) {
+      const offset = (index - (count - 1) / 2); svg.appendChild(svgElement("line", { x1: p1.x + nx * offset, y1: p1.y + ny * offset, x2: p2.x + nx * offset, y2: p2.y + ny * offset, class: "chem-bond" }));
+    }
+  });
+  model.atoms.forEach(atom => {
+    const p = point(atom); svg.appendChild(svgElement("circle", { cx: p.x, cy: p.y, r: 13, class: "chem-atom-bg" }));
+    const label = svgElement("text", { x: p.x, y: p.y + 5, class: "chem-atom", fill: chemistryElementColor(atom.element), "text-anchor": "middle" }); label.textContent = atom.element; svg.appendChild(label);
+  });
+  return svg;
+}
+function renderChemistry2D(container, a, url) {
+  fetchArtifactText(url).then(text => {
+    if (!container.isConnected) return;
+    const runtime = scientificRenderers(); const model = runtime && runtime.parseMolfile(text); const drawing = molecule2dSvg(model);
+    const wrap = el("div", "chemistry-view");
+    if (drawing) {
+      const head = el("div", "bio-summary", `${model.title} · ${model.atoms.length} atoms · ${model.bonds.length} bonds`); wrap.appendChild(head); wrap.appendChild(drawing);
+    } else {
+      wrap.appendChild(el("div", "renderer-note", t("viewer.chem.fallback")));
+      const smiles = runtime ? runtime.smilesLines(text) : [];
+      if (/\.(smi|smiles)$/i.test(String(a.filename || "")) && smiles.length) {
+        const list = el("div", "smiles-list"); smiles.forEach(item => { const row = el("div", "smiles-row"); row.appendChild(el("span", "smiles-name", item.name)); row.appendChild(el("code", "smiles-code", item.smiles)); list.appendChild(row); }); wrap.appendChild(list);
+      }
+    }
+    const details = el("details", "chem-source"); details.appendChild(el("summary", null, t("viewer.chem.source"))); const pre = el("pre"); pre.textContent = text.slice(0, 300000); details.appendChild(pre); wrap.appendChild(details); container.appendChild(wrap);
+  }).catch(() => rendererFailure(container, a, url));
+}
+function renderLatexArtifact(container, a, url) {
+  fetchArtifactText(url).then(text => {
+    if (!container.isConnected) return;
+    const runtime = scientificRenderers(); const blocks = runtime ? runtime.latexPreview(text) : [];
+    const wrap = el("div", "latex-view"); const tabs = el("div", "latex-tabs"); const previewButton = el("button", "latex-tab active", t("viewer.latex.preview")); const sourceButton = el("button", "latex-tab", t("viewer.latex.source")); tabs.appendChild(previewButton); tabs.appendChild(sourceButton); wrap.appendChild(tabs);
+    const preview = el("article", "latex-preview");
+    blocks.forEach(block => {
+      const node = block.kind === "heading" ? el(`h${Math.max(2, Math.min(4, (block.level || 1) + 1))}`) : el(block.kind === "math" ? "div" : "p", block.kind === "math" ? "latex-math" : null);
+      node.textContent = block.text; preview.appendChild(node);
+    });
+    if (!blocks.length) preview.appendChild(el("div", "renderer-note", t("viewer.chem.fallback")));
+    const source = el("pre", "renderer-source latex-source"); source.textContent = text.slice(0, 500000); source.classList.add("hidden"); wrap.appendChild(preview); wrap.appendChild(source);
+    const show = mode => { const isPreview = mode === "preview"; preview.classList.toggle("hidden", !isPreview); source.classList.toggle("hidden", isPreview); previewButton.classList.toggle("active", isPreview); sourceButton.classList.toggle("active", !isPreview); };
+    previewButton.onclick = () => show("preview"); sourceButton.onclick = () => show("source"); container.appendChild(wrap);
+  }).catch(() => rendererFailure(container, a, url));
+}
+function renderDownloadArtifact(container, a, url) {
+  container.innerHTML = "";
+  const ct = String(a.content_type || "").toLowerCase(); const nm = String(a.filename || "").toLowerCase();
+  if (ct.startsWith("text/") || /json|xml|javascript/.test(ct) || TEXT_EXT.test(nm)) return renderTextArtifact(container, a, url);
+  const card = el("div", "download-artifact"); card.appendChild(iconEl("package", 28)); card.appendChild(el("strong", null, a.filename || "artifact")); card.appendChild(el("span", null, t("viewer.downloadOnly")));
+  const link = el("a", "solid-btn small", t("common.download")); link.href = url; link.setAttribute("download", a.filename || "artifact"); card.appendChild(link); container.appendChild(card);
 }
 
 /* ---------- image annotations (figure review → message → remote edit) ---------- */
@@ -3086,10 +5090,11 @@ function renderArtifactEditor(body, a) {
   save.onclick = async () => {
     save.disabled = true; save.textContent = t("common.saving");
     try {
-      await api(`/artifacts/${a.id}/edit`, { method: "POST", body: JSON.stringify({ content: ta.value }) });
+      const edited = await api(`/artifacts/${a.id}/edit`, { method: "POST", body: JSON.stringify({ content: ta.value }) });
+      syncArtifactVersion({ id: a.id, version_id: edited && edited.version_id }, true);
       S._editing = null; (S._artBust = S._artBust || {})[a.id] = Date.now(); hint(t("artifact.saved", (a.filename || "")));
       if (S.currentId) loadArtifacts(S.currentId);
-      renderViewer();
+      if (S.provMode) showProvenance(S.dockArtifact || a); else renderViewer();
     } catch (e) { save.disabled = false; save.textContent = t("common.save"); hint(t("artifact.save.err", e.message), true); }
   };
 }
@@ -3133,7 +5138,7 @@ async function showVersions(a) {
   const body = $("#modal-body"); body.innerHTML = "<div class='dock-empty'>" + t("common.loading") + "</div>";
   $("#modal").classList.remove("hidden");
   const render = async () => {
-    let d; try { d = await api(`/artifacts/${a.id}/versions`); } catch (e) { body.innerHTML = t("versions.load.err", e.message); return; }
+    let d; try { d = await api(`/artifacts/${a.id}/versions`); } catch (e) { body.textContent = t("versions.load.err", e.message); return; }
     const vs = (d && d.versions) || []; body.innerHTML = "";
     const wrap = el("div", "ver-list");
     if (!vs.length) { wrap.appendChild(el("div", "dock-empty", t("versions.empty"))); }
@@ -3145,7 +5150,7 @@ async function showVersions(a) {
       row.appendChild(info);
       const acts = el("div", "ver-acts");
       const view = el("a", "outline-btn small", t("common.view")); view.href = `/api/artifacts/${v.version_id}`; view.target = "_blank"; acts.appendChild(view);
-      if (!v.is_latest) { const rb = el("button", "solid-btn small", t("versions.restore")); rb.onclick = async () => { rb.disabled = true; rb.textContent = t("versions.restoring"); try { await api(`/artifacts/${a.id}/versions/${v.version_id}/restore`, { method: "POST" }); hint(t("versions.restored", v.ordinal)); (S._artBust = S._artBust || {})[a.id] = Date.now(); if (S.currentId) loadArtifacts(S.currentId); if (S.dockArtifact === a) renderViewer(); render(); } catch (e) { rb.disabled = false; rb.textContent = t("versions.restore"); hint(t("versions.restore.err", e.message), true); } }; acts.appendChild(rb); }
+      if (!v.is_latest) { const rb = el("button", "solid-btn small", t("versions.restore")); rb.onclick = async () => { rb.disabled = true; rb.textContent = t("versions.restoring"); try { const restored = await api(`/artifacts/${a.id}/versions/${v.version_id}/restore`, { method: "POST" }); syncArtifactVersion((restored && restored.artifact) || { id: a.id, version_id: v.version_id }, true); hint(t("versions.restored", v.ordinal)); (S._artBust = S._artBust || {})[a.id] = Date.now(); if (S.currentId) loadArtifacts(S.currentId); if (S.dockArtifact && S.dockArtifact.id === a.id) { if (S.provMode) showProvenance(S.dockArtifact); else renderViewer(); } render(); } catch (e) { rb.disabled = false; rb.textContent = t("versions.restore"); hint(t("versions.restore.err", e.message), true); } }; acts.appendChild(rb); }
       row.appendChild(acts); wrap.appendChild(row);
     });
     body.appendChild(wrap);
@@ -3268,12 +5273,138 @@ function renderTableInto(holder, fname) {
   }).catch(() => {});
 }
 async function loadExecutionLog(id) {
+  const request = S._executionLoadReq = (S._executionLoadReq || 0) + 1;
   let d = null;
   try { d = await api(`/frames/${id}/execution-log`); } catch { d = null; }
-  if (id !== S.currentId) return;  // a newer session was opened while this was in flight
-  S.cells = (d && d.entries) || []; S.kernels = (d && d.kernels) || [];
+  // A slower response for the same session must not roll the Notebook back
+  // after a newer REST response or a structured cell-finished event.
+  if (id !== S.currentId || request !== S._executionLoadReq) return;
+  const serverCells = (d && d.entries) || [];
+  S.cells = mergeNotebookCells(serverCells, S.cells || []);
+  S.kernels = (d && d.kernels) || [];
+  S.cells.forEach(cell => { const k = cell.kernel_id || "python"; if (!S.kernels.includes(k)) S.kernels.push(k); });
   renderNotebook();
+  if (S.provMode && S.dockArtifact) {
+    S.lineage = null; S._lineageFor = null;
+    S._lineageReq = (S._lineageReq || 0) + 1;
+    showProvenance(S.dockArtifact);
+  }
 }
+
+function nbEventCellId(event) { return event && (event.producing_cell_id || event.cell_id); }
+function nbCellKey(cell) {
+  if (cell && (cell.producing_cell_id || cell.cell_id)) return String(cell.producing_cell_id || cell.cell_id);
+  return "legacy:" + String(cell && cell.kernel_id || "python") + ":" + String(cell && cell.cell_index != null ? cell.cell_index : "?");
+}
+function mergeNotebookCells(serverCells, localCells) {
+  const merged = new Map();
+  (localCells || []).forEach(cell => merged.set(nbCellKey(cell), cell));
+  // A persisted execution record is authoritative for an identical Cell ID.
+  (serverCells || []).forEach(cell => merged.set(nbCellKey(cell), cell));
+  return Array.from(merged.values()).sort((a, b) => {
+    const ai = Number(a.cell_index), bi = Number(b.cell_index);
+    if (Number.isFinite(ai) && Number.isFinite(bi) && ai !== bi) return ai - bi;
+    return String(nbCellKey(a)).localeCompare(String(nbCellKey(b)));
+  });
+}
+function nbFindCell(producingCellId) {
+  const key = String(producingCellId || "");
+  return (S.liveCells || []).find(cell => nbCellKey(cell) === key)
+    || (S.cells || []).find(cell => nbCellKey(cell) === key)
+    || null;
+}
+function nbCellDraft(event) {
+  const draftId = publicText(event && event.draft_id, 160);
+  if (!draftId) return;
+  const revision = Math.max(0, Number(event.revision) || 0);
+  const previous = nbFindCell(draftId);
+  if (previous && Number(previous._draftRevision || 0) > revision) return;
+  if (event.status === "discarded") {
+    S.liveCells = (S.liveCells || []).filter(cell => nbCellKey(cell) !== draftId);
+    S._liveCell = (S.liveCells || [])[S.liveCells.length - 1] || null;
+    nbRender(); return;
+  }
+  const language = String(event.language || "").toLowerCase() === "r" ? "r" : "python";
+  const status = event.status === "ready" ? "ready" : "drafting";
+  const cell = {
+    producing_cell_id: draftId, cell_id: draftId, cell_index: null,
+    kernel_id: language, language, origin: "agent",
+    source: typeof event.source === "string" ? event.source.slice(0, 200000) : "",
+    stdout: "", stderr: "", error: "", status,
+    figures: [], files_written: [], files_read: [],
+    complete: event.complete === true, draft: true, live: true,
+    _draftRevision: revision
+  };
+  // One Agent writer owns the session. A new turn replaces any stale draft
+  // left by a dropped terminal event instead of appending another partial Cell.
+  S.liveCells = (S.liveCells || []).filter(candidate => !candidate.draft || nbCellKey(candidate) === draftId);
+  S.liveCells = mergeNotebookCells([cell], S.liveCells);
+  S._liveCell = cell; nbRender();
+}
+function nbCellStart(event) {
+  const id = nbEventCellId(event);
+  if (!id) return;
+  // The transient model draft becomes this immutable server-identified Cell.
+  S.liveCells = (S.liveCells || []).filter(candidate => !candidate.draft);
+  const previous = nbFindCell(id) || {};
+  // A persisted finished Cell may still be present when a live-turn replay
+  // begins.  Never inherit its complete output and then append replay chunks a
+  // second time; only an already-live in-memory Cell may continue its stream.
+  const inheritLiveOutput = previous.live === true && previous.status === "running";
+  const cell = {
+    ...previous, producing_cell_id: String(id), cell_id: String(event.cell_id || previous.cell_id || id),
+    cell_index: event.cell_index != null ? event.cell_index : previous.cell_index,
+    kernel_id: event.kernel_id || previous.kernel_id || "python", language: event.language || previous.language || "python",
+    origin: event.origin || previous.origin || null,
+    source: event.source != null ? event.source : (previous.source || ""),
+    stdout: inheritLiveOutput ? (previous.stdout || "") : "", stderr: inheritLiveOutput ? (previous.stderr || "") : "", error: "",
+    status: "running", figures: previous.figures || [], files_written: previous.files_written || [], files_read: previous.files_read || [],
+    generation_id: event.generation_id || previous.generation_id, state_revision: event.state_revision != null ? event.state_revision : previous.state_revision,
+    attempt_group_id: event.attempt_group_id || previous.attempt_group_id, revision_of: event.revision_of || previous.revision_of,
+    replay_policy: event.replay_policy || previous.replay_policy, visibility: event.visibility || previous.visibility,
+    _seenChunks: inheritLiveOutput ? previous._seenChunks : undefined, live: true
+  };
+  // Replayed starts and reconnects upsert by the server identity; they never
+  // create a duplicate temporary Cell.
+  S.liveCells = mergeNotebookCells([cell], S.liveCells || []);
+  S.cells = (S.cells || []).filter(saved => nbCellKey(saved) !== String(id));
+  S._liveCell = nbFindCell(id);
+  nbRender();
+}
+function nbCellChunk(event) {
+  const producingCellId = event && (event.producing_cell_id || event.cell_id);
+  const cell = event && nbFindCell(producingCellId);
+  if (!cell) return;
+  const stream = event.stream === "stderr" ? "stderr" : "stdout";
+  const chunkId = event.chunk_id != null ? event.chunk_id : (event.sequence != null ? event.sequence : null);
+  if (chunkId != null) {
+    cell._seenChunks = cell._seenChunks || Object.create(null);
+    const seenKey = stream + ":" + String(chunkId); if (cell._seenChunks[seenKey]) return; cell._seenChunks[seenKey] = true;
+  }
+  cell[stream] = appendLiveOutput(cell[stream], event.chunk || "");
+  nbRender();
+}
+function nbCellFinished(event) {
+  const id = event && (event.producing_cell_id || event.cell_id);
+  if (!id) return;
+  const active = nbFindCell(id) || {};
+  const cell = {
+    ...active, ...event, producing_cell_id: String(id), cell_id: String(event.cell_id || active.cell_id || id),
+    source: event.source != null ? event.source : (active.source || ""),
+    stdout: event.stdout != null ? appendLiveOutput("", event.stdout) : (active.stdout || ""),
+    stderr: event.stderr != null ? appendLiveOutput("", event.stderr) : (active.stderr || ""),
+    error: event.error || "", status: event.status || (event.error ? "error" : "ok"),
+    figures: event.figures || active.figures || [],
+    files_written: event.files_written || active.files_written || [],
+    files_read: event.files_read || active.files_read || [],
+    live: false
+  };
+  S.liveCells = (S.liveCells || []).filter(candidate => nbCellKey(candidate) !== String(id));
+  S.cells = mergeNotebookCells([cell], S.cells || []);
+  S._liveCell = (S.liveCells || [])[S.liveCells.length - 1] || null;
+  nbRender();
+}
+
 const _NB_DIV = "----- output -----";
 function nbLiveStart(tool, raw, serverKernelId, serverCellIndex, serverLanguage) {
   const codeTools = /^(run_python|python|exec|run_bash|bash)/;
@@ -3315,6 +5446,35 @@ async function kernelCtl(action) {
   invalidateKernelCache();  // force a fresh read so the state chip reflects the action
   if (S.dock.open && S.activeTab === "notebook") renderNotebook();
 }
+async function executeNotebookCode(code, language, controls) {
+  code = String(code || ""); language = String(language || "python").toLowerCase() === "r" ? "r" : "python";
+  if (!code.trim() || !S.currentId) return false;
+  const runButton = controls && controls.runButton, input = controls && controls.input, stop = controls && controls.stop;
+  const randomId = (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") ? globalThis.crypto.randomUUID() : Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
+  const executionId = "repl-" + randomId, frameId = S.currentId;
+  S.pendingReplIdentity = { frame_id: frameId, execution_id: executionId, owner: { kind: "user_repl", id: executionId } };
+  if (runButton) runButton.disabled = true; if (input) input.disabled = true; if (stop) stop.classList.remove("hidden");
+  let accepted = false;
+  try {
+    const response = await api(`/frames/${frameId}/kernel/execute`, { method: "POST", body: JSON.stringify({ code, language, execution_id: executionId }) });
+    accepted = response && response.status === "accepted";
+    if (accepted && S.pendingReplIdentity && S.pendingReplIdentity.execution_id === executionId) {
+      S.pendingReplIdentity.owner = response.owner && response.owner.kind && response.owner.id ? response.owner : S.pendingReplIdentity.owner;
+    }
+    hint(t("nb.action.queued", language === "r" ? "R" : "Python"));
+    if (!accepted && S.currentId === frameId) { invalidateKernelCache(); await loadExecutionLog(frameId); loadArtifacts(frameId); scheduleWorkbenchRefresh(); }
+    else if (accepted && S.currentId === frameId) scheduleWorkbenchRefresh();
+    return true;
+  } catch (error) { hint(t("nb.repl.execFailed", error.message), true); return false; }
+  finally {
+    if (!accepted && S.pendingReplIdentity && S.pendingReplIdentity.execution_id === executionId) S.pendingReplIdentity = null;
+    if (!accepted) { if (runButton) runButton.disabled = false; if (input) input.disabled = false; if (stop) stop.classList.add("hidden"); }
+    // Execution-owner and live-cell events rebuild the Notebook while this
+    // request is pending, so the controls captured above may be detached.
+    // Repaint once more from authoritative queue/pending state after cleanup.
+    if (S.currentId === frameId && S.dock.open && S.activeTab === "notebook") renderNotebook();
+  }
+}
 // Cache for the Notebook header's kernel state + env list. renderNotebook rebuilds
 // the whole pane on every streaming frame; without a cache the state chip and env
 // <select> would refetch each frame and never settle (flickering "…" / t("nb.env.placeholder")).
@@ -3323,21 +5483,28 @@ async function kernelCtl(action) {
 const _kc = { id: null, st: null, stAt: 0, stBusy: false, envs: null, cur: null, envAt: 0, envBusy: false };
 function invalidateKernelCache() { _kc.id = null; _kc.st = null; _kc.stAt = 0; _kc.envs = null; _kc.cur = null; _kc.envAt = 0; }
 function _paintKernel(els, st) {
-  const { state, bStop, bStart, title, revive, strip } = els || {};
+  const { state, bStop, bStart, title, revive, strip, badge } = els || {};
   const label = st.turn_running ? t("dash.badge.running") : ({ running: t("nb.kernel.stateActive"), stopped: t("nb.kernel.stateStopped"), none: t("nb.kernel.stateNone") }[st.state] || st.state);
   if (state) {
     state.textContent = label + (st.generation ? t("nb.kernel.generation", st.generation) : "");
     state.className = "kstate " + (st.turn_running ? "run" : st.state);
   }
   const env = st.env || {};
-  if (title) title.textContent = (env.name || "python")
-    + (env.language ? " · " + env.language : "")
-    + (env.python_version ? " " + env.python_version : "") + " kernel"
+  if (title) title.textContent = kernelLabel(kernelIdFromEnv(env)) + " kernel · " + t("nb.kernel.shared")
     + (env.pending ? t("nb.kernel.pendingSwitch", env.pending) : "");
+  if (badge && badge.root && badge.label) {
+    const mode = runtimeSummary().status;
+    ["live", "busy", "ended", "restoring", "partial", "failed", "ready", "idle"].forEach(name => badge.root.classList.toggle(name, name === mode));
+    badge.label.textContent = t("runtime.status." + mode);
+  }
+  const quarantined = st.view_only === true && st.trust_state === "quarantined";
   if (bStop) bStop.disabled = !st.alive;
-  if (bStart) bStart.disabled = st.alive;
+  if (bStart) bStart.disabled = st.alive || quarantined;
   // Revive banner: only when the kernel is stopped/absent and no turn is running.
-  if (revive) revive.classList.toggle("hidden", st.alive || st.turn_running);
+  if (revive) {
+    revive.classList.toggle("hidden", st.alive || st.turn_running || quarantined);
+    revive.title = quarantined ? t("runtime.quarantineHint") : "";
+  }
   if (strip) _paintStatusStrip(strip, st);
 }
 // Read-only Notebook status strip: a passive live/ended indicator + runtime
@@ -3346,9 +5513,10 @@ function _paintStatusStrip(strip, st) {
   if (!strip || !strip.line) return;
   const env = st.env || {};
   const rt = kernelLabel(kernelIdFromEnv(env)) + (env.python_version ? " " + env.python_version : "");
-  const alive = !!(st.turn_running || st.alive);
-  strip.line.textContent = alive ? t("nb.status.live", rt) : t("nb.status.ended", rt);
-  strip.line.className = "nb-status-line " + (alive ? "live" : "ended");
+  const live = !!st.turn_running;
+  const ready = !live && !!st.alive;
+  strip.line.textContent = live ? t("nb.status.live", rt) : (ready ? t("nb.status.ready", rt) : t("nb.status.ended", rt));
+  strip.line.className = "nb-status-line " + (live ? "live" : (ready ? "ready" : "ended"));
 }
 async function refreshKernelState(els, _b, _c) {
   // Back-compat: old callers passed (stateEl, bStop, bStart).
@@ -3363,6 +5531,7 @@ async function refreshKernelState(els, _b, _c) {
   let st; try { st = await api(`/frames/${sid}/kernel`); } catch { _kc.stBusy = false; return; }
   _kc.stBusy = false;
   if (sid !== S.currentId) return;  // session switched during the fetch — drop the stale result
+  const previousRuntimeKey = _kc.st && [_kc.st.state, _kc.st.alive, _kc.st.turn_running, _kc.st.generation_id, _kc.st.generation, _kc.st.view_only, _kc.st.trust_state].join(":");
   if (_kc.id !== sid) { _kc.id = sid; _kc.envs = null; }
   _kc.st = st; _kc.stAt = Date.now();
   _paintKernel(els, st);  // els may be stale (a newer render replaced it); harmless — the next render repaints from cache
@@ -3371,7 +5540,8 @@ async function refreshKernelState(els, _b, _c) {
   // rebuild once now that `repl_enabled` is authoritative (and vice versa if a
   // runtime/config reload disabled it).
   const modeChanged = (!!st.repl_enabled && !!els.strip) || (!st.repl_enabled && !!els.state);
-  if (modeChanged && S.dock.open && S.activeTab === "notebook") requestAnimationFrame(renderNotebook);
+  const runtimeKey = [st.state, st.alive, st.turn_running, st.generation_id, st.generation, st.view_only, st.trust_state].join(":");
+  if ((modeChanged || runtimeKey !== previousRuntimeKey) && S.dock.open && S.activeTab === "notebook") requestAnimationFrame(renderNotebook);
 }
 
 async function nbPopulateEnvSelect(envSel) {
@@ -3430,6 +5600,120 @@ function kernelIdFromEnv(env) {  // stored kernel_id from a kernel-status env ob
   if (!n || n === "python" || n === "base") return "python";
   return "python — " + n;
 }
+function projectNotebookCells(rawEntries) {
+  const entries = (rawEntries || []).map(cell => ({ ...cell }));
+  let previous = null;
+  entries.forEach(cell => {
+    const previousFailed = previous && ["error", "failed"].includes(previous.status);
+    const agentRetry = previous && previous.origin === "agent" && cell.origin === "agent";
+    const sameRuntime = previous && (previous.kernel_id || "python") === (cell.kernel_id || "python")
+      && (previous.language || "python") === (cell.language || "python");
+    if (!cell.attempt_group_id) {
+      if (previousFailed && sameRuntime && agentRetry) {
+        cell.attempt_group_id = previous.attempt_group_id || nbCellKey(previous);
+        cell.revision_of = nbCellKey(previous);
+        cell.attempt = (previous.attempt || 1) + 1;
+      } else {
+        cell.attempt_group_id = nbCellKey(cell);
+        cell.revision_of = null;
+        cell.attempt = 1;
+      }
+    }
+    previous = cell;
+  });
+  const groups = new Map();
+  entries.forEach(cell => {
+    const group = String(cell.attempt_group_id || nbCellKey(cell));
+    if (!groups.has(group)) groups.set(group, []);
+    groups.get(group).push(cell);
+  });
+  return Array.from(groups.values()).map(attempts => {
+    const latest = attempts[attempts.length - 1];
+    return {
+      ...latest,
+      attempt: attempts.length,
+      attempt_count: attempts.length,
+      is_latest_attempt: true,
+      _revisions: attempts.slice(0, -1)
+    };
+  });
+}
+function notebookExportLink(frameId) {
+  const dl = el("a", "prov-dlbtn");
+  dl.appendChild(iconEl("download", 14));
+  dl.appendChild(el("span", null, t("prov.exec.downloadNotebook")));
+  dl.href = `/api/frames/${encodeURIComponent(frameId)}/notebook/export?language=bundle`;
+  dl.setAttribute("download", `${frameId}.notebooks.zip`);
+  return dl;
+}
+async function refreshVariableInspector() {
+  const inspector = S.variableInspector, frameId = S.currentId;
+  if (!inspector || !frameId || inspector.loading) return;
+  const language = inspector.language === "r" ? "r" : "python";
+  const request = inspector.request = (inspector.request || 0) + 1;
+  inspector.loading = language; inspector.error = ""; renderNotebook();
+  try {
+    const payload = await api(`/frames/${encodeURIComponent(frameId)}/kernel/variables?language=${language}`);
+    if (frameId !== S.currentId || request !== S.variableInspector.request) return;
+    S.variableInspector.results[language] = sanitizeVariableInspection(payload, frameId, language);
+  } catch (error) {
+    if (frameId === S.currentId && request === S.variableInspector.request) S.variableInspector.error = publicText(error && error.message, 240);
+  } finally {
+    if (frameId === S.currentId && request === S.variableInspector.request) {
+      S.variableInspector.loading = null; renderNotebook();
+    }
+  }
+}
+function variablePreviewText(value) {
+  if (typeof value === "string") return JSON.stringify(value);
+  if (value === null) return "null";
+  if (typeof value === "boolean" || typeof value === "number") return String(value);
+  return "";
+}
+function renderVariableInspector() {
+  const inspector = S.variableInspector || { language: "python", results: {}, loading: null, error: "" };
+  const language = inspector.language === "r" ? "r" : "python", data = (inspector.results || {})[language] || null;
+  const panel = el("section", "nb-variables"); panel.setAttribute("data-variable-inspector", language);
+  const head = el("div", "nb-variables-head"); head.appendChild(el("span", "nb-variables-title", t("nb.variables.title")));
+  const controls = el("div", "nb-variables-controls"), label = el("label", "nb-variables-language", t("nb.variables.language"));
+  const select = el("select", "nb-variables-select");
+  [["python", "Python"], ["r", "R"]].forEach(([value, text]) => { const option = el("option", null, text); option.value = value; select.appendChild(option); });
+  select.value = language; select.disabled = !!inspector.loading;
+  select.onchange = () => { inspector.language = select.value === "r" ? "r" : "python"; inspector.error = ""; renderNotebook(); };
+  label.appendChild(select); controls.appendChild(label);
+  const refresh = el("button", "outline-btn small", inspector.loading ? t("nb.variables.loading") : t("nb.variables.refresh"));
+  refresh.setAttribute("data-action", "refresh-variables"); refresh.disabled = !!inspector.loading || !S.currentId; refresh.onclick = refreshVariableInspector; controls.appendChild(refresh);
+  head.appendChild(controls); panel.appendChild(head);
+  if (inspector.loading === language) { panel.appendChild(el("div", "nb-variables-empty", t("nb.variables.loading"))); return panel; }
+  if (inspector.error) { panel.appendChild(el("div", "timeline-error", t("nb.variables.error", inspector.error))); return panel; }
+  if (!data) { panel.appendChild(el("div", "nb-variables-empty", t("nb.variables.notLoaded"))); return panel; }
+  const meta = el("div", "nb-variables-meta");
+  if (data.generation_id) meta.appendChild(el("span", "timeline-pill", t("nb.variables.generation", shortRuntime(data.generation_id))));
+  meta.appendChild(el("span", "timeline-pill", t("nb.variables.revision", data.state_revision)));
+  const runtime = runtimeSummary(), runtimeGeneration = language === "r" ? runtime.r : runtime.python;
+  const stale = (Number(runtime.revision) > Number(data.state_revision)) || !!(runtimeGeneration && data.generation_id && runtimeGeneration !== data.generation_id);
+  if (stale) meta.appendChild(el("span", "timeline-pill variable-stale", t("nb.variables.stale")));
+  panel.appendChild(meta);
+  if (!data.available) {
+    const key = "nb.variables.state." + data.state;
+    panel.appendChild(el("div", "nb-variables-empty", t(key) === key ? (data.reason || t("nb.variables.state.failed")) : t(key)));
+    return panel;
+  }
+  if (!(data.variables || []).length) { panel.appendChild(el("div", "nb-variables-empty", t("nb.variables.empty"))); return panel; }
+  const list = el("div", "nb-variable-list");
+  data.variables.forEach(variable => {
+    const row = el("div", "nb-variable-row"), identity = el("div", "nb-variable-identity");
+    identity.appendChild(el("span", "nb-variable-name", variable.name)); identity.appendChild(el("span", "nb-variable-type", variable.type)); row.appendChild(identity);
+    const details = el("div", "nb-variable-details"), preview = variablePreviewText(variable.preview);
+    if (preview) details.appendChild(el("span", "nb-variable-preview", preview));
+    if (variable.length != null) details.appendChild(el("span", "timeline-pill", t("nb.variables.length", variable.length)));
+    if (variable.fingerprint) details.appendChild(el("span", "timeline-pill", t("nb.variables.fingerprint", shortRuntime(variable.fingerprint))));
+    row.appendChild(details); list.appendChild(row);
+  });
+  panel.appendChild(list);
+  if (data.truncated) panel.appendChild(el("div", "nb-variables-truncated", t("nb.variables.truncated", data.variables.length)));
+  return panel;
+}
 function renderNotebook() {
   const nb = $("#dock-notebook"); if (!nb) return;
   // Live-follow: if the user is already parked near the bottom, keep the newest
@@ -3451,12 +5735,21 @@ function renderNotebook() {
   }
   nb.innerHTML = "";
   let entries = (S.cells || []).slice();
-  if (S.running && S.liveCells && S.liveCells.length) entries = entries.concat(S.liveCells);
+  if (S.liveCells && S.liveCells.length) entries = entries.concat(S.liveCells);
+  entries = projectNotebookCells(entries);
   const kernels = []; entries.forEach(e => { const k = e.kernel_id || "python"; if (!kernels.includes(k)) kernels.push(k); });
   const chips = el("div", "kernel-chips");
+  chips.appendChild(runtimeSummaryNode(true));
   const mk = (k, label) => { const c = el("button", "kchip" + (((S.kernelFilter || null) === k) ? " on" : ""), label); c.onclick = () => { S.kernelFilter = k; renderNotebook(); }; return c; };
-  chips.appendChild(mk(null, "All")); kernels.forEach(k => chips.appendChild(mk(k, kernelLabel(k))));
-  const badge = el("div", "nb-live-badge" + (S.running ? " live" : " idle")); badge.appendChild(el("span", "ld")); badge.appendChild(el("span", null, S.running ? "Live" : "Idle")); badge.appendChild(iconEl("chevron-down", 14)); chips.appendChild(badge);
+  chips.appendChild(mk(null, t("nb.chips.all"))); kernels.forEach(k => chips.appendChild(mk(k, kernelLabel(k))));
+  const cachedRunning = !!(S.running || (_kc.id === S.currentId && _kc.st && _kc.st.turn_running));
+  const cachedReady = !cachedRunning && !!(_kc.id === S.currentId && _kc.st && _kc.st.alive);
+  const runtimeMode = runtimeSummary().status;
+  const badgeMode = runtimeMode || (cachedRunning ? "busy" : (cachedReady ? "live" : "ended"));
+  const badge = el("div", "nb-live-badge " + badgeMode); badge.appendChild(el("span", "ld"));
+  const badgeLabel = el("span", null, t("runtime.status." + badgeMode)); badge.appendChild(badgeLabel); badge.appendChild(iconEl("chevron-down", 14)); chips.appendChild(badge);
+  if (S.currentId) chips.appendChild(notebookExportLink(S.currentId));
+  const badgeEls = { root: badge, label: badgeLabel };
   nb.appendChild(chips);
   let shown = entries; if (S.kernelFilter) shown = entries.filter(e => (e.kernel_id || "python") === S.kernelFilter);
   if (!shown.length) nb.appendChild(el("div", "dock-empty", t("nb.empty")));
@@ -3465,7 +5758,7 @@ function renderNotebook() {
   // stop/start/restart/interrupt) is built ONLY when the server explicitly
   // enables it (developer flag repl_enabled). Otherwise render a passive,
   // non-interactive status strip. refreshKernelState runs in BOTH branches.
-  const replEnabled = !!(_kc && _kc.st && _kc.st.repl_enabled);
+  const replEnabled = !!(_kc && _kc.st && _kc.st.repl_enabled && !(_kc.st.view_only && _kc.st.trust_state === "quarantined"));
   if (replEnabled) {
   const repl = el("div", "nb-repl");
   const rh = el("div", "nb-repl-head");
@@ -3491,25 +5784,43 @@ function renderNotebook() {
   const rbtn = el("button", "solid-btn small", t("nb.revive.startBtn")); rbtn.onclick = () => kernelCtl("start", bStart);
   revive.appendChild(rbtn);
   repl.appendChild(revive);
-  refreshKernelState({ state, bStop, bStart, title, revive });
+  refreshKernelState({ state, bStop, bStart, title, revive, badge: badgeEls });
   nbPopulateEnvSelect(envSel);
-  repl.appendChild(el("div", "nb-repl-body", t("nb.repl.body")));
-  const pr = el("div", "nb-repl-prompt"); pr.appendChild(el("span", "pmt", ">>>")); const inp = el("input"); inp.placeholder = "run code in this kernel…"; inp.disabled = !S.currentId; inp.value = S._replDraft || "";
-  const stop = el("button", "repl-stop hidden"); stop.title = t("nb.repl.interruptTitle"); stop.innerHTML = icon("stop", 15); stop.onclick = async () => { try { await api(`/frames/${S.currentId}/kernel/interrupt`, { method: "POST" }); hint(t("nb.repl.interruptSent")); } catch {} };
-  inp.onkeydown = async (e) => {
-    if (e.isComposing || e.keyCode === 229) return;
-    if (e.key !== "Enter" || e.shiftKey) return;
-    e.preventDefault(); const code = inp.value.trim(); if (!code || !S.currentId) return;
-    inp.disabled = true; stop.classList.remove("hidden"); S._replDraft = "";
-    try { await api(`/frames/${S.currentId}/kernel/execute`, { method: "POST", body: JSON.stringify({ code }) }); }
-    catch (err) { hint(t("nb.repl.execFailed", err.message), true); }
-    stop.classList.add("hidden");
-    invalidateKernelCache();  // running code may have started/advanced the kernel
-    await loadExecutionLog(S.currentId); loadArtifacts(S.currentId);
-    requestAnimationFrame(() => { const i2 = $("#dock-notebook input"); if (i2) { i2.disabled = false; i2.focus(); } });
+  repl.appendChild(el("div", "nb-repl-body", t("nb.repl.multilineHint")));
+  S._replDrafts = S._replDrafts || { python: S._replDraft || "", r: "" };
+  S._replLanguage = S._replLanguage === "r" ? "r" : "python";
+  const editor = el("div", "nb-live-input");
+  const editorBar = el("div", "nb-live-input-bar");
+  const languageLabel = el("label", "nb-language-label", t("nb.repl.language"));
+  const language = el("select", "nb-language-select");
+  [["python", "Python"], ["r", "R"]].forEach(([value, label]) => { const option = el("option", null, label); option.value = value; language.appendChild(option); });
+  const pendingRepl = S.pendingReplIdentity && S.pendingReplIdentity.frame_id === S.currentId ? S.pendingReplIdentity : null;
+  const replIdentity = pendingRepl || identityForOwner(S.executionQueue, "user_repl");
+  const replBusy = !!replIdentity;
+  language.value = S._replLanguage; language.disabled = replBusy; languageLabel.appendChild(language); editorBar.appendChild(languageLabel);
+  const editorActions = el("div", "nb-live-input-actions");
+  const run = el("button", "solid-btn small", t("nb.repl.run"));
+  run.disabled = replBusy || !S.currentId;
+  const stop = el("button", "repl-stop" + (replBusy ? "" : " hidden")); stop.title = t("nb.repl.interruptTitle"); stop.innerHTML = icon("stop", 15); stop.onclick = async () => {
+    try { const result = await scopedExecutionRequest(S.currentId, "kernel/interrupt", "notebook interrupt", "user_repl"); if (result && result.ok) hint(t("nb.repl.interruptSent")); }
+    catch (error) { hint(t("nb.action.failed", error.message), true); }
   };
-  inp.oninput = () => { S._replDraft = inp.value; };
-  pr.appendChild(inp); pr.appendChild(stop); repl.appendChild(pr);
+  editorActions.appendChild(run); editorActions.appendChild(stop); editorBar.appendChild(editorActions); editor.appendChild(editorBar);
+  const inp = el("textarea", "nb-repl-input"); inp.rows = 7; inp.spellcheck = false; inp.placeholder = t("nb.repl.inputPlaceholder"); inp.disabled = !S.currentId || replBusy; inp.value = S._replDrafts[S._replLanguage] || ""; editor.appendChild(inp);
+  const executeDraft = async () => {
+    const currentLanguage = language.value === "r" ? "r" : "python", code = inp.value;
+    if (await executeNotebookCode(code, currentLanguage, { runButton: run, input: inp, stop })) {
+      S._replDrafts[currentLanguage] = ""; inp.value = "";
+    }
+    requestAnimationFrame(() => inp.focus());
+  };
+  language.onchange = () => {
+    S._replDrafts[S._replLanguage] = inp.value; S._replLanguage = language.value === "r" ? "r" : "python";
+    inp.value = S._replDrafts[S._replLanguage] || ""; inp.placeholder = S._replLanguage === "r" ? "# R" : t("nb.repl.inputPlaceholder"); inp.focus();
+  };
+  inp.oninput = () => { S._replDrafts[S._replLanguage] = inp.value; };
+  inp.onkeydown = (event) => { if (event.isComposing || event.keyCode === 229) return; if (event.key === "Enter" && event.shiftKey) { event.preventDefault(); executeDraft(); } };
+  run.onclick = executeDraft; repl.appendChild(editor);
   nb.appendChild(repl);
   } else {
     // Passive status strip — no <input>, no <select>, no kernel-control buttons.
@@ -3519,9 +5830,10 @@ function renderNotebook() {
     const sline = el("div", "nb-status-line", "…");
     strip.appendChild(sline);
     strip.appendChild(el("div", "nb-status-hint", t("nb.status.hint")));
-    refreshKernelState({ strip: { line: sline } });
+    refreshKernelState({ strip: { line: sline }, badge: badgeEls });
     nb.appendChild(strip);
   }
+  nb.appendChild(renderVariableInspector());
   // Keep following the live output as new code/figures stream in.
   if (S.running && follow && body) requestAnimationFrame(() => { body.scrollTop = body.scrollHeight; });
 }
@@ -3568,21 +5880,81 @@ function highlightTraceback(txt) {
     return e;
   }).join("\n");
 }
+function notebookOutputBlock(cell, raw, isError) {
+  const text = String(raw == null ? "" : raw);
+  if (!text) return;
+  if (looksBinary(text)) { cell.appendChild(binElide(text.length)); return; }
+  const details = el("details", "nbc-disclosure" + (isError ? " error" : ""));
+  details.appendChild(el("summary", null, "output"));
+  const pre = el("pre", isError ? "nbc-err" : "nbc-out"); pre.textContent = text; details.appendChild(pre);
+  cell.appendChild(details);
+}
+function notebookCellState(cell) {
+  if (cell.draft) return { key: "drafting", cls: "drafting" };
+  if (String(cell.replay_policy || "").toLowerCase() === "never") return { key: "nonReplayable", cls: "non-replayable" };
+  if (cell._historicalRevision) return { key: "historical", cls: "historical" };
+  if (cell.stale === true) return { key: "stale", cls: "stale", reasons: Array.isArray(cell.stale_reasons) ? cell.stale_reasons : [] };
+  return { key: "current", cls: "current" };
+}
+function notebookCellButton(label, iconName, enabled, action) {
+  const button = el("button", "nbc-action"); button.appendChild(iconEl(iconName, 13)); button.appendChild(el("span", null, label));
+  button.disabled = !enabled; button.title = enabled ? label : t("nb.action.unavailable"); if (enabled) button.onclick = action; return button;
+}
+async function copyNotebookCell(source) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) await navigator.clipboard.writeText(String(source || ""));
+    else throw new Error("clipboard unavailable");
+    hint(t("nb.action.copied"));
+  } catch {
+    // The fallback still never touches history: place a copy in the live-input
+    // draft and let the user decide whether to run it.
+    const language = S._replLanguage === "r" ? "r" : "python"; S._replDrafts = S._replDrafts || { python: "", r: "" }; S._replDrafts[language] = String(source || ""); hint(t("nb.action.copied"));
+  }
+}
+async function forkNotebookCell(cell) {
+  const checkpointId = publicText(cell && cell.fork_checkpoint_id, 96);
+  if (!S.currentId || !branchCapability("fork_from_cell") || !checkpointId) return;
+  try {
+    await api(`/frames/${S.currentId}/branches/fork`, { method: "POST", body: JSON.stringify({ from_cell_id: nbCellKey(cell) }) });
+    await loadWorkbenchState(S.currentId, true);
+  } catch (error) { hint(t("nb.action.failed", error.message), true); }
+}
+async function promoteNotebookCell(cell) {
+  if (!S.currentId || !branchCapability("promote")) return;
+  try { await api(`/frames/${S.currentId}/artifacts/promote`, { method: "POST", body: JSON.stringify({ cell_id: nbCellKey(cell) }) }); loadArtifacts(S.currentId); scheduleWorkbenchRefresh(); }
+  catch (error) { hint(t("nb.action.failed", error.message), true); }
+}
 function cellNode(e) {
   const k = e.kernel_id || "python";
-  const c = el("div", "notebook-cell" + (e.live ? " live" : ""));
+  const c = el("div", "notebook-cell" + (e.live ? " live" : "") + (e.draft ? " draft" : ""));
   c.setAttribute("data-cell", e.cell_index != null ? e.cell_index : "");
   c.setAttribute("data-kernel", k);
+  c.setAttribute("data-producing-cell", e.producing_cell_id || "");
+  const revisions = e._revisions || [];
+  if (revisions.length) {
+    const history = el("details", "nbc-revisions");
+    history.appendChild(el("summary", null, t("nb.revisions.summary", revisions.length + 1, revisions.length)));
+    const attempts = el("div", "nbc-revision-list");
+    revisions.forEach(revision => attempts.appendChild(cellNode({ ...revision, _revisions: [], _historicalRevision: true })));
+    history.appendChild(attempts); c.appendChild(history);
+  }
   const st = e.status || (e.live ? "running" : "ok");
   const idx = e.cell_index != null ? e.cell_index : "…";
+  const cellState = notebookCellState(e), cellMeta = el("div", "nbc-cell-meta");
+  const statePill = el("span", "nbc-state " + cellState.cls, t("nb.cell." + cellState.key));
+  if ((cellState.reasons || []).length) statePill.title = cellState.reasons.map(reason => publicText(reason, 240)).filter(Boolean).join("\n");
+  cellMeta.appendChild(statePill);
+  if (e.state_revision != null) cellMeta.appendChild(el("span", "nbc-revision", "S" + e.state_revision));
+  if (e.generation_id) { const generation = el("span", "nbc-generation", shortRuntime(e.generation_id)); generation.title = publicText(e.generation_id, 160); cellMeta.appendChild(generation); }
+  c.appendChild(cellMeta);
   c.appendChild(codeBlock(e.source || "", {
     lang: e.language || k,
     langLabel: (e.language || k) + " [" + idx + "]",
     status: st,
     env: e.environment || e.env || undefined
   }));
-  if (e.stdout) { if (looksBinary(e.stdout)) c.appendChild(binElide(e.stdout.length)); else { const o = el("pre", "nbc-out"); o.textContent = e.stdout; c.appendChild(o); } }
-  if (e.stderr) { if (looksBinary(e.stderr)) c.appendChild(binElide(e.stderr.length)); else { const er = el("pre", "nbc-err"); er.textContent = e.stderr; c.appendChild(er); } }
+  notebookOutputBlock(c, e.stdout, false);
+  notebookOutputBlock(c, e.stderr, true);
   if (e.error) c.appendChild(nbErrorBlock(e.error));
   (e.figures || []).forEach(f => { const im = el("img", "nbc-fig"); im.src = artUrlByName(f); im.onerror = () => im.remove(); c.appendChild(im); });
   // Inline-render tabular outputs (CSV/TSV the cell produced) as real tables, so
@@ -3595,6 +5967,16 @@ function cellNode(e) {
   (e.files_written || []).forEach(f => { const s = el("span", "io-w"); s.appendChild(iconEl("pencil", 12)); s.appendChild(el("span", null, f)); io.appendChild(s); });
   (e.files_read || []).forEach(f => { const s = el("span", "io-r"); s.appendChild(iconEl("arrow-down", 12)); s.appendChild(el("span", null, f)); io.appendChild(s); });
   if (io.children.length) c.appendChild(io);
+  if (!e.draft) {
+    const actions = el("div", "nbc-actions");
+    actions.appendChild(notebookCellButton(t("nb.action.copy"), "copy", true, () => copyNotebookCell(e.source || "")));
+    const replEnabled = !!(_kc.st && _kc.st.repl_enabled), appendable = replEnabled && !e.live && !!String(e.source || "").trim();
+    actions.appendChild(notebookCellButton(t("nb.action.rerun"), "refresh", appendable, () => executeNotebookCode(e.source || "", e.language || "python")));
+    const canForkCell = !e.live && branchCapability("fork_from_cell") && !!publicText(e.fork_checkpoint_id, 96);
+    if (canForkCell) actions.appendChild(notebookCellButton(t("nb.action.fork"), "provenance", true, () => forkNotebookCell(e)));
+    actions.appendChild(notebookCellButton(t("nb.action.promote"), "star", branchCapability("promote"), () => promoteNotebookCell(e)));
+    c.appendChild(actions);
+  }
   return c;
 }
 function scrollToCell(idx, kernel) {
@@ -3618,7 +6000,14 @@ function provRow(label, files) {
 function showProvenance(a) {
   S.dockArtifact = a; S.provMode = true; S.provSub = S.provSub || "code";
   addOpenTab(a); setActiveTab(a.id);
-  if (!S.lineage || S._lineageFor !== a.id) { loadLineage(a).then(l => { S.lineage = l; S._lineageFor = a.id; if (S.provMode && S.dockArtifact === a) renderViewer(); }); }
+  const key = artifactCacheKey(a);
+  if (!S.lineage || S._lineageFor !== key) {
+    const request = S._lineageReq = (S._lineageReq || 0) + 1;
+    loadLineage(a).then(l => {
+      if (request !== S._lineageReq || !S.provMode || !S.dockArtifact || S.dockArtifact.id !== a.id || artifactCacheKey(S.dockArtifact) !== key) return;
+      S.lineage = l; S._lineageFor = key; renderViewer();
+    });
+  }
 }
 function renderProvenanceInto(v, a) {
   const tabs = el("div", "prov-subtabs");
@@ -3627,14 +6016,14 @@ function renderProvenanceInto(v, a) {
   });
   v.appendChild(tabs);
   const body = el("div", "prov-body"); v.appendChild(body);
-  const lin = (S._lineageFor === a.id) ? S.lineage : null;
+  const lin = (S._lineageFor === artifactCacheKey(a)) ? S.lineage : null;
   const cell = lin && (lin.interactions || []).find(i => i.kind === "cell");
   if (S.provSub === "code") {
     if (cell && cell.source) { body.appendChild(codeBlock(cell.source, { lang: cell.language || "python", langLabel: cell.language || "python", env: cell.environment })); }
     else if (!lin) body.appendChild(el("div", "dock-empty", t("common.loading")));
     else body.appendChild(el("div", "dock-empty", "Generating reproduction code…"));
   } else if (S.provSub === "exec") {
-    const dl = el("a", "prov-dlbtn"); dl.appendChild(iconEl("download", 14)); dl.appendChild(el("span", null, "Download notebook")); dl.href = `/api/frames/${S.currentId}/execution-log`; dl.setAttribute("download", "notebook.json"); body.appendChild(dl);
+    if (S.currentId) body.appendChild(notebookExportLink(S.currentId));
     const cells = (S.cells || []); if (!cells.length) body.appendChild(el("div", "dock-empty", t("prov.exec.noRecords")));
     cells.forEach(e => body.appendChild(cellNode(e)));
   } else if (S.provSub === "environment") {
@@ -3649,10 +6038,11 @@ function renderProvenanceInto(v, a) {
 // produced this artifact (Python version + every installed dist → version), like
 // the reference daemon's Environment tab. Prefers the snapshot CAPTURED at the
 // artifact's production run (bound per-version); falls back to a live freeze for
-// uploads / pre-feature artifacts. Cached per artifact id so tab-flips don't refetch.
+// uploads / pre-feature artifacts. Cached per artifact version so overwrites and
+// restores cannot reuse a stale production environment.
 async function renderProvEnvironment(body, a) {
   body.appendChild(el("div", "dock-empty", t("prov.env.loadingSnapshot")));
-  const key = (a && a.id) || "_live";
+  const key = artifactCacheKey(a);
   S._envSnapById = S._envSnapById || {};
   let env;
   try {
@@ -3660,7 +6050,7 @@ async function renderProvEnvironment(body, a) {
       a && a.id ? api(`/artifacts/${a.id}/environment`) : api("/kernel/environment")));
   }
   catch (e) { if (S.provMode && S.provSub === "environment") { body.innerHTML = ""; body.appendChild(el("div", "dock-empty", t("prov.env.loadFailed", e.message))); } return; }
-  if (!S.provMode || S.provSub !== "environment") return;  // tab changed while loading
+  if (!S.provMode || S.provSub !== "environment" || (a && artifactCacheKey(S.dockArtifact) !== key)) return;  // tab or version changed while loading
   body.innerHTML = "";
   const chip = (k, val) => { const c = el("span", "env-chip"); c.appendChild(el("span", "env-chip-k", k)); c.appendChild(el("span", "env-chip-v", val)); return c; };
   const pkgs = env.packages || [];
@@ -3728,15 +6118,15 @@ async function renderProvMessages(body) {
 function renderProvReview(body, a, lin) {
   if (!lin) { body.appendChild(el("div", "dock-empty", t("common.loading"))); return; }
   const inter = lin.interactions || []; const cell = inter.find(i => i.kind === "cell");
-  const inputs = (lin.dependency_mappings && lin.dependency_mappings.inputs) || (cell && cell.files_read) || [];
+  const mapped = lin.dependency_mappings && lin.dependency_mappings.inputs;
+  const inputs = Array.isArray(mapped) ? mapped : (cell && cell.files_read) || [];
   if (!cell && !inputs.length) { body.appendChild(el("div", "dock-empty", t("prov.review.noLineage"))); return; }
   const card = el("div", "prov-card");
   if (cell) {
     card.appendChild(el("div", "prov-h", t("prov.review.producedBy", (cell.cell_index != null ? cell.cell_index : "?"))));
     card.appendChild(el("div", "prov-meta", (cell.language || "python") + " · " + (cell.exit_status || cell.status || "ok") + (cell.kernel_id ? (" · " + cell.kernel_id) : "")));
     if ((cell.files_written || []).length) card.appendChild(provRow("wrote", cell.files_written));
-    const reads = (cell.files_read && cell.files_read.length) ? cell.files_read : inputs;
-    if (reads.length) card.appendChild(provRow("reads / inputs", reads));
+    if (inputs.length) card.appendChild(provRow("reads / inputs", inputs));
     const link = el("a", "prov-link"); link.appendChild(iconEl("arrow-left", 14)); link.appendChild(el("span", null, t("prov.review.viewCode"))); link.onclick = () => { S.provMode = false; setActiveTab("notebook"); scrollToCell(cell.cell_index, cell.kernel_id); }; card.appendChild(link);
   } else if (inputs.length) card.appendChild(provRow("reads / inputs", inputs));
   body.appendChild(card);
@@ -3812,7 +6202,7 @@ function closePalette() { if (PAL.el) PAL.el.remove(); PAL.el = null; PAL.open =
 function palActions() {
   return [
     { group: t("palette.group.commands"), label: t("palette.action.newSession"), icon: "plus", run: () => newSession() },
-    { group: t("palette.group.commands"), label: t("palette.action.newProject"), icon: "plus", run: () => $("#proj-modal").classList.remove("hidden") },
+    { group: t("palette.group.commands"), label: t("palette.action.newProject"), icon: "plus", run: () => openProjectModal() },
     { group: t("palette.group.commands"), label: t("palette.action.openNotebook"), icon: "notebook", run: () => setActiveTab("notebook") },
     { group: t("palette.group.commands"), label: t("palette.action.customize"), icon: "sliders", run: () => openCust() },
     { group: t("palette.group.commands"), label: t("palette.action.backHome"), icon: "arrow-left", run: () => showDashboard() },
@@ -3941,18 +6331,68 @@ async function custGeneral(c) {
   const kr = el("div", "cust-row"); const ki = el("div", "info"); ki.appendChild(el("div", "nm", t("cust.general.modelKeyName"))); ki.appendChild(el("div", "ds", conf.has_api_key ? (t("cust.general.apiKeyConfigured") + (conf.model ? "（" + conf.model + "）" : "")) : t("cust.models.key.missing"))); kr.appendChild(ki); const go = el("button", "outline-btn small", t("cust.general.configureBtn")); go.onclick = () => custTab("models"); kr.appendChild(go); c.appendChild(kr);
 }
 function setLayout(name) { localStorage.setItem("os-layout", name); applyLayout(name); hint(t("toast.layout", ({ comfortable: t("cust.general.layout.comfortable"), compact: t("cust.general.layout.compact"), wide: t("cust.general.layout.wide") }[name] || name))); }
-async function custSkills(c) { try { const d = await api("/skills/catalog"); const skills = (d && d.skills) || []; c.innerHTML = ""; c.appendChild(hdr(t("palette.group.skills"), t("cust.skills.desc", skills.length)));
-  const bar = el("div", "cust-row"); const bi = el("div", "info"); const acts = el("div", "cust-actrow");
-  const nb = el("button", "outline-btn small", t("cust.skills.newBtn")); nb.onclick = () => skillEditor(null);
-  const ib = el("button", "outline-btn small", t("cust.skills.importBtn")); ib.onclick = () => skillImport();
-  acts.appendChild(nb); acts.appendChild(ib); bi.appendChild(el("div", "nm", t("cust.skills.yourSkills"))); bi.appendChild(acts); bar.appendChild(bi); c.appendChild(bar);
-  skills.forEach(s => { const row = el("div", "cust-row"); const info = el("div", "info"); const nm = el("div", "nm"); nm.appendChild(el("span", null, s.displayName || s.name)); if (s.origin === "user") { nm.appendChild(document.createTextNode(" ")); nm.appendChild(el("span", "pill", "user")); } info.appendChild(nm); info.appendChild(el("div", "ds", s.description || "")); row.appendChild(info);
-    // "Use in chat" — insert /skillname into the composer so the skill can be
-    // invoked directly from Customize (previously there was no way to run one).
-    const useBtn = el("button", "icon-ghost"); useBtn.title = t("skill.useInChat"); useBtn.innerHTML = icon("message-square", 15); useBtn.onclick = () => insertSkillMention(s.name); row.appendChild(useBtn);
-    if (s.editable) { const eb = el("button", "icon-ghost"); eb.title = t("common.edit"); eb.innerHTML = icon("pencil", 15); eb.onclick = () => skillEditor(s.name); row.appendChild(eb); const db = el("button", "icon-ghost"); db.title = t("common.delete"); db.innerHTML = icon("trash-2", 15); db.onclick = async () => { if (!confirm(t("cust.skills.deleteConfirm", s.name))) return; try { await api(`/skills/${encodeURIComponent(s.name)}`, { method: "DELETE" }); S.skillsCatalog = null; custTab("skills"); } catch (e) { hint(t("toast.deleteFailed", e.message), true); } }; row.appendChild(db); }
-    const tg = el("button", "toggle" + (s.enabled !== false ? " on" : "")); tg.onclick = async () => { const on = tg.classList.toggle("on"); try { await api(`/skills/catalog/${encodeURIComponent(s.name)}/enabled`, { method: "PUT", body: JSON.stringify({ enabled: on }) }); } catch {} }; row.appendChild(tg); c.appendChild(row); });
-} catch (e) { c.innerHTML = t("versions.load.err", e.message); } }
+async function custSkills(c) {
+  try {
+    const pid = (typeof effProject === "function" ? effProject() : S.project) || null;
+    const personalRequest = api("/skills/catalog");
+    const projectRequest = pid ? api(`/projects/${encodeURIComponent(pid)}/skills/catalog`).catch(() => ({ skills: [] })) : Promise.resolve({ skills: [] });
+    const [personalData, projectData] = await Promise.all([personalRequest, projectRequest]);
+    const personalSkills = Array.isArray(personalData && personalData.skills) ? personalData.skills : [];
+    const projectSkills = Array.isArray(projectData && projectData.skills) ? projectData.skills : [];
+    const skills = [...personalSkills, ...projectSkills];
+    c.innerHTML = "";
+    c.appendChild(hdr(t("palette.group.skills"), t("cust.skills.desc", skills.length)));
+    const bar = el("div", "cust-row"); const bi = el("div", "info"); const acts = el("div", "cust-actrow");
+    const nb = el("button", "outline-btn small", t("cust.skills.newBtn")); nb.onclick = () => skillEditor(null);
+    const ib = el("button", "outline-btn small", t("cust.skills.importBtn")); ib.onclick = () => skillImport();
+    acts.appendChild(nb); acts.appendChild(ib); bi.appendChild(el("div", "nm", t("cust.skills.yourSkills"))); bi.appendChild(acts); bar.appendChild(bi); c.appendChild(bar);
+    skills.forEach(s => {
+      const scope = s.scope === "project" ? "project" : (s.scope === "bundled" ? "bundled" : "personal");
+      const row = el("div", "cust-row"); const info = el("div", "info"); const nm = el("div", "nm");
+      nm.appendChild(el("span", null, s.displayName || s.name)); nm.appendChild(document.createTextNode(" ")); nm.appendChild(el("span", "pill", t(`skill.scope.${scope}`)));
+      info.appendChild(nm); info.appendChild(el("div", "ds", s.description || "")); row.appendChild(info);
+      const useBtn = el("button", "icon-ghost"); useBtn.title = t("skill.useInChat"); useBtn.innerHTML = icon("message-square", 15); useBtn.onclick = () => insertSkillMention(s.name); row.appendChild(useBtn);
+      if (s.versioned) { const vb = el("button", "icon-ghost"); vb.title = t("skill.historyBtn"); vb.innerHTML = icon("clock", 15); vb.onclick = () => skillVersionHistory(s.name, scope, scope === "project" ? pid : null); row.appendChild(vb); }
+      if (s.editable && scope === "personal") { const eb = el("button", "icon-ghost"); eb.title = t("common.edit"); eb.innerHTML = icon("pencil", 15); eb.onclick = () => skillEditor(s.name); row.appendChild(eb); const db = el("button", "icon-ghost"); db.title = t("common.delete"); db.innerHTML = icon("trash-2", 15); db.onclick = async () => { if (!confirm(t("cust.skills.deleteConfirm", s.name))) return; try { await api(`/skills/${encodeURIComponent(s.name)}`, { method: "DELETE" }); S.skillsCatalog = null; custTab("skills"); } catch (e) { hint(t("toast.deleteFailed", e.message), true); } }; row.appendChild(db); }
+      if (scope !== "project") { const tg = el("button", "toggle" + (s.enabled !== false ? " on" : "")); tg.onclick = async () => { const on = tg.classList.toggle("on"); try { await api(`/skills/catalog/${encodeURIComponent(s.name)}/enabled`, { method: "PUT", body: JSON.stringify({ enabled: on }) }); } catch {} }; row.appendChild(tg); }
+      c.appendChild(row);
+    });
+  } catch (e) { c.textContent = t("versions.load.err", e.message); }
+}
+function skillVersionPath(name, scope, projectId) {
+  const encodedName = encodeURIComponent(name);
+  if (scope === "project") {
+    if (!projectId) throw new Error("project scope is unavailable");
+    return `/projects/${encodeURIComponent(projectId)}/skills/${encodedName}`;
+  }
+  return `/skills/${encodedName}`;
+}
+async function skillVersionHistory(name, scope, projectId) {
+  S._modalMode = "skill-history";
+  $("#modal-title").textContent = t("skill.historyTitle", name);
+  $("#modal-download").style.display = "none";
+  const body = $("#modal-body"); body.innerHTML = "";
+  body.appendChild(el("div", "subtle", t(`skill.scope.${scope}`)));
+  $("#modal").classList.remove("hidden");
+  let data;
+  try { data = await api(skillVersionPath(name, scope, projectId) + "/versions?limit=100"); }
+  catch (e) { body.appendChild(el("div", "empty", e.message)); return; }
+  const versions = Array.isArray(data && data.versions) ? data.versions : [];
+  if (!versions.length) { body.appendChild(el("div", "empty", t("skill.historyEmpty"))); return; }
+  const list = el("div", "skill-version-list");
+  versions.forEach(version => {
+    const versionId = String(version.version_id || ""); const manifest = version.manifest && typeof version.manifest === "object" ? version.manifest : {};
+    const card = el("div", "skill-version-card"), head = el("div", "skill-version-head"), meta = el("div", "info");
+    const title = el("div", "nm", versionId.slice(0, 20) + (versionId.length > 20 ? "…" : "")); title.title = versionId; meta.appendChild(title);
+    const when = Number(version.created_at || 0); meta.appendChild(el("div", "ds", when ? new Date(when).toLocaleString() : ""));
+    const sidecar = manifest.sidecar && manifest.sidecar.present ? String(manifest.sidecar.sha256 || "").slice(0, 12) : "—"; meta.appendChild(el("div", "ds", t("skill.versionSidecar", sidecar)));
+    head.appendChild(meta);
+    if (version.active) head.appendChild(el("span", "pill", t("skill.versionActive")));
+    else if (!(data.status && data.status.read_only)) { const rollback = el("button", "outline-btn small", t("skill.rollbackBtn")); rollback.onclick = async () => { if (!confirm(t("skill.rollbackConfirm", name, versionId.slice(0, 18)))) return; rollback.disabled = true; try { await api(skillVersionPath(name, scope, projectId) + "/rollback", { method: "POST", body: JSON.stringify({ version_id: versionId }) }); hint(t("skill.rollbackDone", name)); await skillVersionHistory(name, scope, projectId); custTab("skills"); } catch (e) { rollback.disabled = false; hint(t("toast.failed", e.message), true); } }; head.appendChild(rollback); }
+    card.appendChild(head); list.appendChild(card);
+  });
+  body.appendChild(list);
+}
 // Insert a "/skillname" mention into the composer from the Skills settings tab,
 // close settings, and focus the composer so the skill can be invoked directly.
 function insertSkillMention(name) {
@@ -3964,9 +6404,9 @@ function insertSkillMention(name) {
   grow(); c.focus(); c.setSelectionRange(c.value.length, c.value.length);
   hint(t("skill.insertedToast", name));
 }
-async function skillEditor(name) {
+async function skillEditor(name, seed) {
   S._modalMode = "skill";
-  let cur = { name: "", description: "", body: "" };
+  let cur = seed || { name: "", description: "", body: "" };
   if (name) { try { cur = await api(`/skills/${encodeURIComponent(name)}`); } catch {} }
   $("#modal-title").textContent = name ? t("skill.editTitle", name) : t("skill.newTitle");
   $("#modal-download").style.display = "none";
@@ -4003,7 +6443,7 @@ async function custSpecialists(c) { try {
   custom.forEach(s => { const row = el("div", "cust-row"); const info = el("div", "info"); const nm = el("div", "nm"); nm.appendChild(el("span", null, s.name)); nm.appendChild(document.createTextNode(" ")); nm.appendChild(el("span", "pill", "custom")); info.appendChild(nm); info.appendChild(el("div", "ds", s.description || "")); row.appendChild(info); const eb = el("button", "icon-ghost"); eb.title = t("common.edit"); eb.innerHTML = icon("pencil", 15); eb.onclick = () => specialistEditor(s.name); row.appendChild(eb); const db = el("button", "icon-ghost"); db.title = t("common.delete"); db.innerHTML = icon("trash-2", 15); db.onclick = async () => { if (!confirm(t("cust.specialists.deleteConfirm", s.name))) return; try { await api(`/specialists/${encodeURIComponent(s.name)}`, { method: "DELETE" }); custTab("specialists"); } catch (e) { hint(t("toast.deleteFailed", e.message), true); } }; row.appendChild(db); c.appendChild(row); });
   c.appendChild(el("div", "cust-subhead", t("cust.specialists.builtinRoles")));
   builtin.forEach(ag => { const row = el("div", "cust-row"); const info = el("div", "info"); const nm = el("div", "nm"); nm.appendChild(el("span", null, ag.name)); nm.appendChild(document.createTextNode(" ")); nm.appendChild(el("span", "pill", ag.mode || "agent")); if (ag.supportsPlanMode) { nm.appendChild(document.createTextNode(" ")); nm.appendChild(el("span", "pill", "plan")); } info.appendChild(nm); info.appendChild(el("div", "ds", ag.description || "")); row.appendChild(info); const tg = el("button", "toggle" + (ag.enabled !== false ? " on" : "")); tg.onclick = async () => { const on = tg.classList.toggle("on"); try { await api(`/agents/${encodeURIComponent(ag.name)}/enabled`, { method: "PUT", body: JSON.stringify({ enabled: on }) }); } catch {} }; row.appendChild(tg); c.appendChild(row); });
-} catch (e) { c.innerHTML = t("versions.load.err", e.message); } }
+} catch (e) { c.textContent = t("versions.load.err", e.message); } }
 async function specialistEditor(name) {
   S._modalMode = "specialist";
   let cur = { name: "", description: "", system_prompt: "" };
@@ -4030,7 +6470,7 @@ async function custConnectors(c) { try {
   (dir.directory || []).forEach(item => { if (conns.some(k => k.connector_id === item.id)) return; const row = el("div", "cust-row"); const info = el("div", "info"); info.appendChild(el("div", "nm", item.name)); info.appendChild(el("div", "ds", item.description || "")); row.appendChild(info); const add = el("button", "outline-btn small", t("common.add")); add.onclick = async () => { try { await api("/connectors", { method: "POST", body: JSON.stringify({ connector_id: item.id, name: item.name, description: item.description, command: item.command }) }); hint(t("toast.connectors.added", item.name)); custTab("connectors"); } catch (e) { hint(t("toast.addFailed", e.message), true); } }; row.appendChild(add); c.appendChild(row); });
   // custom add
   const add = el("div", "cust-row"); const ai = el("div", "info"); ai.appendChild(el("div", "nm", t("cust.connectors.customAddName"))); const ad = el("div", "job-submit"); const nameIn = el("input", "cust-input"); nameIn.placeholder = t("cust.connectors.namePlaceholder"); nameIn.style.flex = "0 0 120px"; const cmdIn = el("input", "cust-input"); cmdIn.placeholder = t("cust.connectors.cmdPlaceholder"); const go = el("button", "solid-btn small", t("common.add")); go.onclick = async () => { const nm = nameIn.value.trim(); const cmd = cmdIn.value.trim(); if (!nm || !cmd) return; try { await api("/connectors", { method: "POST", body: JSON.stringify({ name: nm, command: cmd.split(/\s+/) }) }); nameIn.value = cmdIn.value = ""; custTab("connectors"); } catch (e) { hint(t("toast.addFailed", e.message), true); } }; ad.appendChild(nameIn); ad.appendChild(cmdIn); ad.appendChild(go); ai.appendChild(ad); add.appendChild(ai); c.appendChild(add);
-} catch (e) { c.innerHTML = t("versions.load.err", e.message); } }
+} catch (e) { c.textContent = t("versions.load.err", e.message); } }
 async function renderRemoteGPU(c) {
   let info; try { info = await api("/compute/remote"); } catch (e) { return; }
   const hd = el("div", "cust-row"); hd.innerHTML = `<div class="info"><div class="nm">${t("cust.remote.title")}</div><div class="ds">${t("cust.remote.desc")}</div></div>`; c.appendChild(hd);
@@ -4055,7 +6495,7 @@ async function renderRemoteGPU(c) {
   add.onclick = async () => { const alias = sel.value; if (!alias) return; add.disabled = true; add.textContent = t("cust.remote.testing"); try { const r = await api("/compute/remote", { method: "POST", body: JSON.stringify({ alias }) }); hint(r.reachable ? t("cust.remote.added", alias, r.gpus || "") : t("cust.remote.addedUnreachable", alias)); custTab("compute"); } catch (e) { hint(e.message, true); add.disabled = false; add.textContent = t("common.add"); } };
   ds.appendChild(sel); ds.appendChild(add); ai.appendChild(ds); addRow.appendChild(ai); c.appendChild(addRow);
 }
-async function custCompute(c) { try { const gpu = await api("/compute/gpu"); const env = await api("/environments/status").catch(() => ({ environments: [] })); const host = await api("/compute/local/hostinfo").catch(() => ({})); c.innerHTML = ""; c.appendChild(hdr(t("cust.compute.title"), t("cust.compute.desc"))); const hostRow = el("div", "cust-row"); hostRow.innerHTML = `<div class="info"><div class="nm">${t("cust.compute.host")}</div><div class="ds">${t("cust.compute.hostDetail", host.python || "?", host.machine || "", host.cpu_count || "?", host.ram_gb || "?", host.disk_free_gb || "?")}</div></div>`; c.appendChild(hostRow); const g = el("div", "cust-row"); g.innerHTML = `<div class="info"><div class="nm">GPU</div><div class="ds">${gpu.available ? (gpu.gpu_name || t("cust.compute.gpuAvailable")) : t("cust.compute.gpuUnavailable")}</div></div>`; c.appendChild(g); await renderRemoteGPU(c); const envs = env.environments || []; envs.forEach(e => { const row = el("div", "cust-row"); const inst = (e.packages || []).filter(p => p.installed); row.innerHTML = `<div class="info"><div class="nm">${t("cust.compute.kernelLabel", e.language, e.status === "installing" ? t("cust.compute.kernelInstalling") : t("cust.compute.kernelReady"))}</div><div class="ds">${t("cust.compute.preinstalledDetail", e.package_count, inst.slice(0, 18).map(p => p.name).join("、") + (inst.length > 18 ? " …" : ""))}</div></div>`; c.appendChild(row); }); const ins = el("div", "cust-row"); const info = el("div", "info"); info.appendChild(el("div", "nm", t("cust.compute.installExtraName"))); const dsc = el("div", "ds"); const inp = el("input"); inp.placeholder = t("cust.compute.installPlaceholder"); inp.className = "cust-input"; const btn = el("button", "outline-btn small", t("cust.compute.installBtn")); btn.onclick = async () => { const pkgs = inp.value.trim().split(/\s+/).filter(Boolean); if (!pkgs.length) return; btn.disabled = true; btn.textContent = t("cust.compute.installingBtn"); try { const r = S.currentId ? await api(`/frames/${S.currentId}/kernel/install`, { method: "POST", body: JSON.stringify({ packages: pkgs, restart: true }) }) : await api(`/kernel/install`, { method: "POST", body: JSON.stringify({ packages: pkgs }) }); hint(r.ok ? (t("step.env.installed", (r.installed || []).join("、") + (r.restarted ? t("cust.compute.kernelRestarted") : ""))) : (t("toast.compute.installFailed", ((r.failed && r.failed[0] && r.failed[0].error) || t("toast.compute.installSeeLogs"))))); if (r.ok) S._envSnapById = {}; custTab("compute"); } catch (e) { hint(t("toast.compute.installFailed", e.message), true); } btn.disabled = false; btn.textContent = t("cust.compute.installBtn"); }; dsc.appendChild(inp); dsc.appendChild(btn); info.appendChild(dsc); ins.appendChild(info); c.appendChild(ins); await renderJobs(c); } catch (e) { c.innerHTML = t("versions.load.err", e.message); } }
+async function custCompute(c) { try { const gpu = await api("/compute/gpu"); const env = await api("/environments/status").catch(() => ({ environments: [] })); const host = await api("/compute/local/hostinfo").catch(() => ({})); c.innerHTML = ""; c.appendChild(hdr(t("cust.compute.title"), t("cust.compute.desc"))); const hostRow = el("div", "cust-row"); hostRow.innerHTML = `<div class="info"><div class="nm">${t("cust.compute.host")}</div><div class="ds">${t("cust.compute.hostDetail", host.python || "?", host.machine || "", host.cpu_count || "?", host.ram_gb || "?", host.disk_free_gb || "?")}</div></div>`; c.appendChild(hostRow); const g = el("div", "cust-row"); g.innerHTML = `<div class="info"><div class="nm">GPU</div><div class="ds">${gpu.available ? (gpu.gpu_name || t("cust.compute.gpuAvailable")) : t("cust.compute.gpuUnavailable")}</div></div>`; c.appendChild(g); await renderRemoteGPU(c); const envs = env.environments || []; envs.forEach(e => { const row = el("div", "cust-row"); const inst = (e.packages || []).filter(p => p.installed); row.innerHTML = `<div class="info"><div class="nm">${t("cust.compute.kernelLabel", e.language, e.status === "installing" ? t("cust.compute.kernelInstalling") : t("cust.compute.kernelReady"))}</div><div class="ds">${t("cust.compute.preinstalledDetail", e.package_count, inst.slice(0, 18).map(p => p.name).join("、") + (inst.length > 18 ? " …" : ""))}</div></div>`; c.appendChild(row); }); const ins = el("div", "cust-row"); const info = el("div", "info"); info.appendChild(el("div", "nm", t("cust.compute.installExtraName"))); const dsc = el("div", "ds"); const inp = el("input"); inp.placeholder = t("cust.compute.installPlaceholder"); inp.className = "cust-input"; const btn = el("button", "outline-btn small", t("cust.compute.installBtn")); btn.onclick = async () => { const pkgs = inp.value.trim().split(/\s+/).filter(Boolean); if (!pkgs.length) return; btn.disabled = true; btn.textContent = t("cust.compute.installingBtn"); try { const r = S.currentId ? await api(`/frames/${S.currentId}/kernel/install`, { method: "POST", body: JSON.stringify({ packages: pkgs, restart: true }) }) : await api(`/kernel/install`, { method: "POST", body: JSON.stringify({ packages: pkgs }) }); hint(r.ok ? (t("step.env.installed", (r.installed || []).join("、") + (r.restarted ? t("cust.compute.kernelRestarted") : ""))) : (t("toast.compute.installFailed", ((r.failed && r.failed[0] && r.failed[0].error) || t("toast.compute.installSeeLogs"))))); if (r.ok) S._envSnapById = {}; custTab("compute"); } catch (e) { hint(t("toast.compute.installFailed", e.message), true); } btn.disabled = false; btn.textContent = t("cust.compute.installBtn"); }; dsc.appendChild(inp); dsc.appendChild(btn); info.appendChild(dsc); ins.appendChild(info); c.appendChild(ins); await renderJobs(c); } catch (e) { c.textContent = t("versions.load.err", e.message); } }
 async function renderJobs(c) {
   c.appendChild(hdr(t("cust.jobs.title"), t("cust.jobs.desc")));
   const sub = el("div", "cust-row"); const si = el("div", "info"); si.appendChild(el("div", "nm", t("cust.jobs.submitName")));
@@ -4106,7 +6546,7 @@ async function searchKeyRow(c) {
   const sub = el("div", "job-submit"); sub.appendChild(kin); sub.appendChild(sv); info.appendChild(sub);
   row.appendChild(info); c.appendChild(row);
 }
-async function custNetwork(c) { try { const d = await api("/preferences/builtin-allowlist"); c.innerHTML = ""; c.appendChild(hdr(t("cust.network.title"), t("cust.network.desc"))); const master = el("div", "cust-row"); const mi = el("div", "info"); mi.appendChild(el("div", "nm", t("cust.network.allowName"))); mi.appendChild(el("div", "ds", d.enabled ? t("cust.network.enabledDesc") : t("cust.network.disabledDesc"))); master.appendChild(mi); const tg = el("button", "toggle" + (d.enabled ? " on" : "")); tg.onclick = async () => { const on = tg.classList.toggle("on"); try { const r = await api("/network/status", { method: "PUT", body: JSON.stringify({ enabled: on }) }); hint(r.enabled ? t("toast.network.enabled") : t("toast.network.disabled")); } catch {} }; master.appendChild(tg); c.appendChild(master); await searchKeyRow(c); ((d && d.groups) || []).forEach(g => { const row = el("div", "cust-row"); const info = el("div", "info"); const nm = el("div", "nm"); nm.appendChild(el("span", null, g.name || g.label)); info.appendChild(nm); const box = el("div", "ds"); (g.domains || []).slice(0, 12).forEach(dm => box.appendChild(el("span", "pill", dm))); info.appendChild(box); row.appendChild(info); c.appendChild(row); }); } catch (e) { c.innerHTML = t("versions.load.err", e.message); } }
+async function custNetwork(c) { try { const d = await api("/preferences/builtin-allowlist"); c.innerHTML = ""; c.appendChild(hdr(t("cust.network.title"), t("cust.network.desc"))); const master = el("div", "cust-row"); const mi = el("div", "info"); mi.appendChild(el("div", "nm", t("cust.network.allowName"))); mi.appendChild(el("div", "ds", d.enabled ? t("cust.network.enabledDesc") : t("cust.network.disabledDesc"))); master.appendChild(mi); const tg = el("button", "toggle" + (d.enabled ? " on" : "")); tg.onclick = async () => { const on = tg.classList.toggle("on"); try { const r = await api("/network/status", { method: "PUT", body: JSON.stringify({ enabled: on }) }); hint(r.enabled ? t("toast.network.enabled") : t("toast.network.disabled")); } catch {} }; master.appendChild(tg); c.appendChild(master); await searchKeyRow(c); ((d && d.groups) || []).forEach(g => { const row = el("div", "cust-row"); const info = el("div", "info"); const nm = el("div", "nm"); nm.appendChild(el("span", null, g.name || g.label)); info.appendChild(nm); const box = el("div", "ds"); (g.domains || []).slice(0, 12).forEach(dm => box.appendChild(el("span", "pill", dm))); info.appendChild(box); row.appendChild(info); c.appendChild(row); }); } catch (e) { c.textContent = t("versions.load.err", e.message); } }
 async function custMemory(c) { try {
   const m = await api("/memory/enabled");
   const mem = await api("/memory?project_id=all").catch(() => ({ memories: [] }));
@@ -4129,12 +6569,91 @@ async function custMemory(c) { try {
     groups[block].forEach(x => { const row = el("div", "cust-row"); const info = el("div", "info"); info.appendChild(el("div", "ds", x.content || "")); row.appendChild(info); const del = el("button", "icon-ghost"); del.appendChild(iconEl("trash-2", 14)); del.onclick = async () => { try { await api(`/memory/${x.memory_id}`, { method: "DELETE" }); custTab("memory"); } catch {} }; row.appendChild(del); c.appendChild(row); });
   });
   if (!(mem.memories || []).length) c.appendChild(el("div", "dock-empty", t("cust.memory.empty")));
-} catch (e) { c.innerHTML = t("versions.load.err", e.message); } }
+} catch (e) { c.textContent = t("versions.load.err", e.message); } }
+const LOCAL_MODEL_KINDS = new Set(["ollama", "lm_studio", "vllm", "llama_cpp"]);
+function loopbackModelBase(value) {
+  const text = publicText(value, 600);
+  try {
+    const parsed = new URL(text);
+    const host = parsed.hostname.toLowerCase();
+    const safeHost = host === "127.0.0.1" || host === "::1" || host === "[::1]";
+    return ["http:", "https:"].includes(parsed.protocol) && safeHost && !parsed.username && !parsed.password && !parsed.search && !parsed.hash ? parsed.toString().replace(/\/$/, "") : "";
+  } catch { return ""; }
+}
+function sanitizeLocalModelDiscovery(payload) {
+  const source = payload && typeof payload === "object" ? payload : {};
+  const endpoints = [];
+  (Array.isArray(source.endpoints) ? source.endpoints : []).slice(0, 20).forEach(raw => {
+    if (!raw || typeof raw !== "object") return;
+    const kind = publicText(raw.kind, 32), baseUrl = loopbackModelBase(raw.base_url);
+    if (!LOCAL_MODEL_KINDS.has(kind) || !baseUrl || raw.local !== true || raw.provider !== "chatgpt") return;
+    const models = [];
+    (Array.isArray(raw.models) ? raw.models : []).slice(0, 500).forEach(value => {
+      if (typeof value !== "string") return;
+      const model = publicText(value, 512); if (model && !models.includes(model)) models.push(model);
+    });
+    endpoints.push({
+      kind, label: publicText(raw.label, 80) || kind, provider: "chatgpt", base_url: baseUrl,
+      models, default_model: models.includes(raw.default_model) ? raw.default_model : (models[0] || ""),
+      requires_api_key: false
+    });
+  });
+  return { endpoints, probed: Math.max(0, Math.min(20, Number(source.probed) || 0)), mutated_settings: false };
+}
+function renderLocalModelEndpoints(root, discovery, profiles) {
+  root.innerHTML = "";
+  const endpoints = discovery && discovery.endpoints || [];
+  if (!endpoints.length) { root.appendChild(el("div", "dock-empty", t("cust.models.local.none"))); return; }
+  endpoints.forEach(endpoint => {
+    const row = el("div", "cust-row local-model-row"), info = el("div", "info");
+    info.appendChild(el("div", "nm", endpoint.label));
+    info.appendChild(el("div", "ds", endpoint.base_url + " · " + t("cust.models.local.models", endpoint.models.length)));
+    row.appendChild(info);
+    const modelSelect = el("select", "cust-input local-model-select");
+    if (!endpoint.models.length) { const option = el("option", null, t("models.none")); option.value = ""; modelSelect.appendChild(option); }
+    endpoint.models.forEach(model => { const option = el("option", null, model); option.value = model; option.selected = model === endpoint.default_model; modelSelect.appendChild(option); });
+    row.appendChild(modelSelect);
+    const configured = () => (profiles || []).some(profile => loopbackModelBase(profile.base_url) === endpoint.base_url && profile.model === modelSelect.value);
+    const add = el("button", "outline-btn small", configured() ? t("cust.models.local.configured") : t("cust.models.local.add"));
+    add.disabled = configured() || !modelSelect.value;
+    modelSelect.onchange = () => { add.disabled = configured() || !modelSelect.value; add.textContent = configured() ? t("cust.models.local.configured") : t("cust.models.local.add"); };
+    add.onclick = async () => {
+      const model = publicText(modelSelect.value, 512); if (!model || configured()) return;
+      add.disabled = true;
+      try {
+        await api("/model-profiles", { method: "POST", body: JSON.stringify({
+          name: endpoint.label + " · " + model, provider: endpoint.provider,
+          base_url: endpoint.base_url, model
+        }) });
+        hint(t("cust.models.local.added", model)); custTab("models");
+      } catch (error) { add.disabled = false; hint(t("artifact.save.err", publicText(error && error.message, 240)), true); }
+    };
+    row.appendChild(add); root.appendChild(row);
+  });
+}
 async function custModels(c) {
   c.innerHTML = ""; c.appendChild(hdr(t("cust.tab.models"), t("cust.models.subtitle2")));
   let data = { profiles: [], active_id: "", known_providers: [] };
   try { data = await api("/model-profiles"); } catch (e) { c.appendChild(el("div", "dock-empty", t("versions.load.err", e.message))); return; }
   let editing = null;  // set to a profile object when editing that row
+
+  // Local discovery is a read-only, fixed-loopback scan. The endpoint must be
+  // explicitly added before it can affect model settings.
+  c.appendChild(el("div", "cust-subhead", t("cust.models.local.title")));
+  const localInfo = el("div", "cust-sub", t("cust.models.local.desc")), localActions = el("div", "form-actions");
+  const localResults = el("div", "local-model-results"), scanLocal = el("button", "outline-btn small", t("cust.models.local.scan"));
+  const runLocalScan = async force => {
+    scanLocal.disabled = true; scanLocal.textContent = t("cust.models.local.scanning");
+    localResults.innerHTML = ""; localResults.appendChild(el("div", "dock-empty", t("cust.models.local.scanning")));
+    try {
+      const result = sanitizeLocalModelDiscovery(await api("/model-endpoints/discover" + (force ? "?force=1" : "")));
+      renderLocalModelEndpoints(localResults, result, data.profiles || []);
+    } catch (error) {
+      localResults.innerHTML = ""; localResults.appendChild(el("div", "timeline-error", t("cust.models.local.error", publicText(error && error.message, 240))));
+    } finally { scanLocal.disabled = false; scanLocal.textContent = t("cust.models.local.scan"); }
+  };
+  scanLocal.onclick = () => runLocalScan(true); localActions.appendChild(scanLocal);
+  c.appendChild(localInfo); c.appendChild(localActions); c.appendChild(localResults); runLocalScan(false);
 
   // --- add / edit form ---
   const head = el("div", "cust-subhead", t("cust.models.addHeading"));
@@ -4182,7 +6701,7 @@ async function custModels(c) {
     const isActive = p.id === data.active_id;
     if (isActive) { nm.appendChild(document.createTextNode(" ")); nm.appendChild(el("span", "pill", t("cust.models.activePill"))); }
     info.appendChild(nm);
-    const bits = []; if (p.provider) bits.push(p.provider); if (p.model) bits.push(p.model); bits.push(p.has_api_key ? t("cust.models.hasKey") : t("cust.models.noKey"));
+    const bits = []; if (p.provider) bits.push(p.provider); if (p.model) bits.push(p.model); bits.push(p.has_api_key ? t("cust.models.hasKey") : (loopbackModelBase(p.base_url) ? t("cust.models.local.keyless") : t("cust.models.noKey")));
     info.appendChild(el("div", "ds", bits.join(" · ") + (p.base_url ? "  ·  " + p.base_url : "")));
     row.appendChild(info);
     if (!isActive) { const use = el("button", "outline-btn small", t("cust.models.setActive")); use.onclick = async () => { use.disabled = true; try { await api(`/model-profiles/${p.id}/activate`, { method: "POST" }); hint(t("toast.models.switched", (p.name || p.id))); S.defaultModel = p.model || S.defaultModel; await loadModels(); refreshKeyBanner(); custTab("models"); } catch (e) { use.disabled = false; hint(t("toast.switchFailed", e.message), true); } }; row.appendChild(use); } else { row.appendChild(el("div", "col-spacer")); }
@@ -4632,8 +7151,20 @@ async function init() {
   applyLayout(localStorage.getItem("os-layout") || "comfortable");
   restoreColWidths(); initColResizers();
   connectWS(); await loadModels(); refreshKeyBanner();
-  $("#dash-new-project").onclick = () => $("#proj-modal").classList.remove("hidden");
+  $("#dash-new-project").onclick = () => openProjectModal();
+  $("#dash-import-session").onclick = chooseSessionPackage;
+  $("#session-package-input").onchange = async (event) => {
+    const input = event.currentTarget, file = input.files && input.files[0];
+    input.value = "";
+    await importSessionPackage(file);
+  };
+  $("#pm-delete").onclick = async () => {
+    const id = S.editingProject;
+    if (!id || !confirm(t("proj.delete.confirm"))) return;
+    await deleteProject(id);
+  };
   $("#back-home").onclick = showDashboard;
+  $("#search-btn").onclick = openPalette;
   $("#new-session").onclick = newSession;
   $("#tab-new").onclick = newSession;
   $("#tab-close").onclick = (e) => { e.stopPropagation(); showDashboard(); };
@@ -4658,7 +7189,7 @@ async function init() {
     // sidebar can always be brought back even if the expand icon is missed.
     if ((e.metaKey || e.ctrlKey) && (e.key === "b" || e.key === "B")) { e.preventDefault(); setSidebar(!document.body.classList.contains("sidebar-collapsed")); }
   });
-  // Composer "Notebook" tray opens the live notebook panel (claude-science parity)
+  // Composer "Notebook" tray opens the live notebook panel
   const nbTray = $(".nb-tray");
   if (nbTray) nbTray.onclick = () => { if (S.dock.open && S.activeTab === "notebook") dockClose(); else setActiveTab("notebook"); };
   $("#jump-pill").onclick = () => down(true);
@@ -4669,13 +7200,14 @@ async function init() {
   document.querySelectorAll(".cust-tab").forEach(t => t.onclick = () => custTab(t.dataset.tab));
   $("#modal-close").onclick = () => $("#modal").classList.add("hidden");
   $("#modal").onclick = (e) => { if (e.target.id === "modal") $("#modal").classList.add("hidden"); };
-  $("#attach-btn").onclick = () => $("#file-input").click();
+  $("#attach-btn").onclick = (e) => addToMessageMenu(e.currentTarget);
+  $("#session-options-btn").onclick = (e) => sessionOptionsMenu(e.currentTarget);
   $("#file-input").onchange = (e) => uploadFiles(e.target.files);
   $("#plan-toggle").onclick = () => { S.planMode = !S.planMode; if (S.planMode) { S.exploreMode = false; $("#explore-toggle").classList.remove("on"); } $("#plan-toggle").classList.toggle("on", S.planMode); hint(S.planMode ? t("plan.toggle.on") : ""); };
   $("#explore-toggle").onclick = () => { S.exploreMode = !S.exploreMode; if (S.exploreMode) { S.planMode = false; $("#plan-toggle").classList.remove("on"); } $("#explore-toggle").classList.toggle("on", S.exploreMode); hint(S.exploreMode ? t("explore.toggle.on") : ""); };
   $("#note-save").onclick = addNote;
-  $("#proj-modal-close").onclick = $("#pm-cancel").onclick = () => $("#proj-modal").classList.add("hidden");
-  $("#pm-create").onclick = async () => { const n = $("#pm-name").value.trim() || t("palette.action.newProject"); await createProject(n, $("#pm-desc").value, $("#pm-ctx").value); $("#proj-modal").classList.add("hidden"); $("#pm-name").value = $("#pm-desc").value = $("#pm-ctx").value = ""; };
+  $("#proj-modal-close").onclick = $("#pm-cancel").onclick = closeProjectModal;
+  $("#pm-create").onclick = submitProjectModal;
   const c = $("#composer");
   c.addEventListener("input", () => { grow(); acUpdate(); });
   c.addEventListener("keydown", (e) => {

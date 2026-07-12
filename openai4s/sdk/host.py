@@ -11,6 +11,23 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from openai4s.sdk.bash import BashExecutor
+from openai4s.sdk.compute import (
+    SessionConcurrencyFull,
+    _Compute,
+    _compute_call,
+    _ComputeInstance,
+    _ComputeJob,
+    _normalize_provider_params,
+    _relativize_local,
+)
+
+# Version of the worker-side Host RPC capability contract recorded in every
+# Kernel bootstrap manifest.  Bump this only for a compatibility-affecting
+# surface change; recovery compares the value observed inside the candidate
+# worker with the frozen checkpoint value.
+HOST_CAPABILITY_VERSION = "1"
+
 # --- wire codec: SDK snake_case <-> wire camelCase (strict) -----
 #
 # openai4s's SDK layer speaks snake_case, but the host-side schema validator
@@ -145,6 +162,32 @@ class _Skills:
         """Delete a skill dir. Read-only origins (openai4s) are rejected."""
         return self._call("skills_delete", [name])
 
+    def status(self, name: str, scope: str = "personal") -> dict:
+        """Inspect the active version for a personal/current-project Skill."""
+
+        return self._call("skills_status", [{"name": name, "scope": scope}])
+
+    def history(
+        self,
+        name: str,
+        scope: str = "personal",
+        limit: int = 50,
+    ) -> dict:
+        """List immutable manifests and lifecycle events without source bytes."""
+
+        return self._call(
+            "skills_history",
+            [{"name": name, "scope": scope, "limit": int(limit)}],
+        )
+
+    def rollback(self, name: str, version_id: str, scope: str = "personal") -> dict:
+        """Request approval, then activate an exact retained writable version."""
+
+        return self._call(
+            "skills_rollback",
+            [{"name": name, "scope": scope, "version_id": version_id}],
+        )
+
 
 class _Query:
     """host.query — read-only SQL over the SQLite data model.
@@ -264,7 +307,23 @@ class _Credentials:
         return self._call("credentials_set", [{"name": name, "value": value}])
 
     def get(self, name: str) -> str:
-        return self._call("credentials_get", [name])["value"]
+        lease = self.issue(name)
+        return self.redeem(lease["token"])["value"]
+
+    def issue(
+        self,
+        name: str,
+        *,
+        purpose: str = "host credential access",
+        ttl_seconds: float = 30.0,
+    ) -> dict:
+        return self._call(
+            "credentials_issue",
+            [{"name": name, "purpose": purpose, "ttl_seconds": ttl_seconds}],
+        )
+
+    def redeem(self, token: str) -> dict:
+        return self._call("credentials_redeem", [token])
 
     def list(self) -> list[str]:
         return self._call("credentials_list", [])
@@ -283,6 +342,39 @@ class _Mcp:
     def tools(self, server: str) -> Any:
         """Discover a connector's tools: {tools: [{name, description, inputSchema}]}."""
         return self._call("mcp_tools", [server])
+
+    def resources(self, server: str, *, cursor: str | None = None) -> dict:
+        """Discover URI-addressed resources and an optional nextCursor."""
+        return self._call(
+            "mcp_resources",
+            [{"server": server, "cursor": cursor}],
+        )
+
+    def read_resource(self, server: str, uri: str) -> dict:
+        """Read one MCP resource as its standard ``contents`` blocks."""
+        return self._call(
+            "mcp_resource_read",
+            [{"server": server, "uri": uri}],
+        )
+
+    def prompts(self, server: str, *, cursor: str | None = None) -> dict:
+        """Discover reusable prompts and an optional nextCursor."""
+        return self._call(
+            "mcp_prompts",
+            [{"server": server, "cursor": cursor}],
+        )
+
+    def get_prompt(
+        self,
+        server: str,
+        name: str,
+        arguments: dict[str, str] | None = None,
+    ) -> dict:
+        """Render one MCP prompt into its standard message blocks."""
+        return self._call(
+            "mcp_prompt_get",
+            [{"server": server, "name": name, "arguments": arguments or {}}],
+        )
 
     def call(self, server: str, tool: str, args: dict | None = None) -> Any:
         """Invoke a connector tool → {is_error, text, raw}."""
@@ -353,567 +445,31 @@ class _App:
 # back to the host-side dispatcher, which owns the real remote work.
 
 
-class SessionConcurrencyFull(RuntimeError):
-    """Raised by submit_job(on_full="raise") when this session's
-    set_concurrency_limit is reached. Carries .live and .limit."""
-
-    def __init__(self, live: Any, limit: Any):
-        self.live = live
-        self.limit = limit
-        super().__init__(f"session concurrency limit reached (live={live}/{limit})")
-
-
-class _ComputeJob:
-    """One submitted job. Returned by ComputeInstance.submit_job(); recover
-    later via host.compute.create(provider).attach_job(job_id)."""
-
-    def __init__(
-        self,
-        call: Callable[[str, list], Any],
-        provider: str,
-        job_id: str,
-        workdir: str | None = None,
-    ):
-        self._call = call
-        self._provider = provider
-        self._job_id = job_id
-        self._workdir = workdir
-        self.result_dict: dict | None = None
-        self.output_files: list = []
-        self.featured_files: list = []
-        # byoc only — the egress posture the job's sandbox was CREATED with
-        # (e.g. "allowlist (2 domains)" or "blocked (no outbound network)"),
-        # host-authored at submit time. It describes THIS sandbox for its
-        # whole life: changing the provider's Egress setting later affects
-        # only sandboxes created afterwards, never this one. None for
-        # non-byoc providers and for sandboxes that predate the policy stamp.
-        self.egress = None
-
-    def __repr__(self) -> str:
-        eg = f" egress={self.egress!r}" if self.egress else ""
-        return (
-            f"<host.compute.Job {self._provider}/{self._job_id} "
-            f"state={self.status}{eg} — recover with "
-            f"host.compute.create({self._provider!r})"
-            f".attach_job({self._job_id!r})>"
-        )
-
-    def _compute_call(self, op: str, kw: dict) -> Any:
-        return _compute_call(self._call, op, kw)
-
-    @property
-    def job_id(self) -> str:
-        return self._job_id
-
-    # Alias — .id is what callers reach for.
-    id = job_id
-
-    @property
-    def exit_code(self):
-        """None until the job is terminal. Call .result() after the
-        compute_done notification to populate."""
-        r = self.result_dict or {}
-        ec = r.get("exit_code")
-        if ec is None and r.get("status") in (
-            None,
-            "submitted",
-            "running",
-            "queued",
-            "harvesting",
-            "pending",
-        ):
-            if not getattr(self, "_exit_code_warned", False):
-                self._exit_code_warned = True
-                import sys
-
-                print(
-                    "[host.compute] .exit_code is None until the job is "
-                    "terminal — call .result() after wait_for_notification",
-                    file=sys.stderr,
-                )
-        return ec
-
-    @property
-    def status(self) -> str:
-        return (self.result_dict or {}).get("status", "submitted")
-
-    @property
-    def workdir(self):
-        """Absolute job workdir on the remote host (under scratch). Populated
-        from the submit/result() response; None for an attached job until
-        result() is called."""
-        return self._workdir
-
-    def result(self) -> dict:
-        """Non-blocking read of the job's result dict for all provider
-        families (``ssh:*`` and ``byoc:*``). Returns the persisted result if
-        the daemon's poller has already harvested it; otherwise
-        ``{'status': 'running', ...}`` with guidance to use the
-        ``wait_for_notification`` brain-tool.
-
-        The daemon's background poller polls the remote, harvests into
-        ``hpc/<job_id>/``, and emits a ``compute_done`` notification when done
-        — exit this cell and use ``wait_for_notification``; the payload
-        includes ``featured_files`` so you can ``save_artifacts(...)`` without
-        re-entering the kernel. Returns ``{status, exit_code, output_files,
-        featured_files, left_on_remote, remote_workdir, stdout_tail?,
-        stderr_tail?, job_wall_s?, ...}`` once terminal. Does NOT raise on
-        ``status='failed'`` or ``status='timed_out'`` — read ``exit_code`` /
-        ``error_kind``.
-        """
-        if self.result_dict and self.result_dict.get("status") not in (
-            "running",
-            "timeout",
-            "harvesting",
-        ):
-            return self.result_dict
-        r = self._compute_call(
-            "result", {"job_id": self._job_id, "provider": self._provider}
-        )
-        self.result_dict = r
-        self.output_files = r.get("output_files", [])
-        self.featured_files = r.get("featured_files", [])
-        if not self._workdir:
-            self._workdir = r.get("remote_workdir")
-        # A job recovered with attach_job() never saw a submit reply, so
-        # backfill the birth-egress line from the persisted result: None must
-        # keep meaning "no fence", never "we lost track of one".
-        if self.egress is None and r.get("egress"):
-            self.egress = r["egress"]
-        # Host-authored egress attribution: present only when this job ran
-        # under an egress fence AND its outcome looks like the fence. Printed
-        # once so it lands in the transcript next to the output.
-        hint = r.get("egress_hint")
-        if hint and not getattr(self, "_egress_hint_printed", False):
-            self._egress_hint_printed = True
-            print(hint)
-        return r
-
-    def cancel(self) -> Any:
-        """Terminate the running job (scheduler cancel / process-group
-        SIGTERM / sandbox terminate). This is the ONLY thing that kills a job
-        — the user's Stop button, a kernel crash, or exiting the ``repl`` cell
-        never auto-cancel; the daemon's poller keeps tracking and will harvest
-        the job when it finishes. Call this (or ``c.close()``) when you
-        actually want to stop the remote work and free the allocation."""
-        return self._compute_call(
-            "cancel", {"job_id": self._job_id, "provider": self._provider}
-        )
-
-
-class _ComputeInstance:
-    """Dispatch to one provider. Bind once with create(); each method's
-    approval modal still gates the actual remote exec. For byoc:* providers,
-    pass provider_params to create() — e.g.
-    create('byoc:nvidia', provider_params={'nvidia': {'model': 'boltz2',
-    'gpu': 'A100'}}). ``timeout`` (container lifetime, seconds) is optional;
-    omitted, it fills from the provider's Settings default."""
-
-    def __init__(
-        self,
-        call: Callable[[str, list], Any],
-        provider: str,
-        provider_params: dict | None = None,
-    ):
-        self._call = call
-        self._provider = provider
-        self._provider_params = _normalize_provider_params(provider, provider_params)
-        self._jobs: list[_ComputeJob] = []
-        self._reuse_via: str | None = None
-
-    def __enter__(self) -> "_ComputeInstance":
-        return self
-
-    def __exit__(self, *_) -> None:
-        try:
-            self.close()
-        except Exception:
-            pass
-
-    def __repr__(self) -> str:
-        pp = self._provider_params or {}
-        pid = self._provider.split(":")[-1]
-        bits = []
-        for k in ("image", "gpu", "model"):
-            v = (pp.get(pid) or {}).get(k)
-            if v:
-                bits.append(f"{k}={v!r}")
-        extra = (" " + " ".join(bits)) if bits else ""
-        return f"<host.compute {self._provider}{extra}>"
-
-    def _compute_call(self, op: str, kw: dict) -> Any:
-        return _compute_call(self._call, op, kw)
-
-    def submit_job(
-        self,
-        *,
-        command,
-        intent,
-        inputs=None,
-        outputs=None,
-        environment=None,
-        harvest=None,
-        timeout_seconds=None,
-        scheduler=None,
-        tier=None,
-        credentials=None,
-        on_full="wait",
-        timeout=None,
-        timeout_s=None,
-        env=None,
-    ):
-        """Stage inputs, write the job script, dispatch. Approval-gated.
-        Returns immediately after dispatch. When a session
-        ``set_concurrency_limit`` is in effect and the cap is full, the host
-        refuses with ``error_kind="session_concurrency_full"`` and this call's
-        ``on_full`` decides what happens: ``"wait"`` (default) retries with
-        jittered exponential backoff until a slot opens; ``"raise"`` raises
-        ``SessionConcurrencyFull(live, limit)`` immediately.
-
-        Print the returned Job (its repr is the recovery handle), end the
-        cell, and use the ``wait_for_notification`` brain-tool to park until
-        the daemon's poller emits the ``compute_done`` notification. Call
-        ``.result()`` for a non-blocking read of the harvested result dict.
-        For byoc providers, the FIRST submit_job() on a handle creates the
-        container; subsequent calls reuse it (weights/caches stay warm).
-        Sequential only — submit job N+1 AFTER job N's ``compute_done``
-        notification arrives, since each submit wipes /work.
-
-          intent — REQUIRED one-line approval-modal headline; name tool,
-            target, scale, e.g. ``intent='run boltz2 on 3 seqs (A100, ~8min)'``.
-          command — job script. Scheduler directives at the top; cwd is a
-            fresh per-job workdir; address inputs as './<dst_filename>'.
-          inputs — list of {src, dst_filename} (workspace-relative path or
-            {{artifact:ID}}, staged from this machine), {version_id,
-            dst_filename} (artifact by version id, staged), or {remote_path,
-            dst_filename} (absolute path already on the host, symlinked). A
-            bare string entry ``'path/to/file'`` is coerced to
-            ``{'src': 'path/to/file'}``. dst_filename is a bare filename (no
-            '/'); inputs stage flat into the workdir root.
-          outputs — glob list. Bare string = featured; {glob, visibility:
-            'hidden'} = diagnostic; {glob, residency:'remote'} = leave on host
-            (SSH providers only).
-          harvest — {exclude:['work/**'], max_file_mb, max_total_mb}.
-          timeout_seconds — optional per-job runaway guard (aliases:
-            ``timeout=``, ``timeout_s=``).
-          environment — remote env name (alias: ``env=``).
-          credentials — list of credential NAMES (e.g. ['HF_TOKEN']) to
-            forward from the host's credential store into the remote job's
-            env. Host-resolved; the agent never sees the values. byoc only.
-          on_full — "wait" (default) | "raise".
-        """
-        import itertools as _itertools
-        import random as _random
-        import time as _time
-
-        # kwarg aliases normalized here, never sent.
-        if timeout_seconds is None:
-            timeout_seconds = timeout if timeout is not None else timeout_s
-        if environment is None:
-            environment = env
-        if inputs:
-            # Bare string -> {'src': str}; _relativize_local on src.
-            # Container-type guard: a top-level string/dict would otherwise
-            # iterate chars/keys.
-            if isinstance(inputs, (str, dict)):
-                inputs = [inputs]
-            norm = []
-            for inp in inputs:
-                if isinstance(inp, str):
-                    inp = {"src": inp}
-                if isinstance(inp, dict) and "src" in inp:
-                    inp = {**inp, "src": _relativize_local(inp["src"])}
-                norm.append(inp)
-            inputs = norm
-        for attempt in _itertools.count():
-            try:
-                r = self._compute_call(
-                    "submit",
-                    {
-                        "provider": self._provider,
-                        "command": command,
-                        "intent": intent,
-                        "inputs": inputs,
-                        "outputs": outputs,
-                        "environment": environment,
-                        "harvest": harvest,
-                        "timeout_seconds": timeout_seconds,
-                        "scheduler": scheduler,
-                        "tier": tier,
-                        "credentials": credentials,
-                        "provider_params": self._provider_params,
-                        "reuse_job_id": self._reuse_via,
-                    },
-                )
-                break
-            except RuntimeError as e:
-                ek = getattr(e, "error_kind", None)
-                if ek == "session_concurrency_full":
-                    c = getattr(e, "concurrency", None) or {}
-                    live, limit = c.get("live"), c.get("limit")
-                    if on_full == "raise":
-                        raise SessionConcurrencyFull(live, limit) from None
-                    if attempt == 0:
-                        print(
-                            f"[concurrency] {live}/{limit} full — "
-                            f"waiting for a slot"
-                        )
-                    _time.sleep(
-                        min(2 * 1.5 ** min(attempt, 20), 20) + _random.uniform(0, 2)
-                    )
-                    continue
-                # Only drop the warm-container anchor if the error suggests
-                # the container itself is gone — pre-create failures (declined
-                # approval, at-cap, not-configured, bad params) shouldn't cost
-                # the user a cold start on retry.
-                if ek in {
-                    "not_found",
-                    "ownership_mismatch",
-                    "provider_degraded",
-                    "result_rejected",
-                    "reuse_not_found",
-                    "transient",
-                    "reuse_window_exhausted",
-                }:
-                    self._reuse_via = None
-                raise
-        if "job_id" not in r:
-            raise RuntimeError(r.get("message") or "submit cancelled")
-        job = _ComputeJob(
-            self._call, self._provider, r["job_id"], r.get("remote_workdir")
-        )
-        job._concurrency = r.get("concurrency")
-        conc = r.get("concurrency") or {}
-        if conc.get("limit") is not None:
-            print(f"[concurrency] live={conc.get('live')}/{conc.get('limit')}")
-        self._jobs.append(job)
-        self._reuse_via = r["job_id"]
-        note = r.get("system_note")
-        if note:
-            print(f"[note] {note}")
-        job.egress = r.get("egress")
-        if job.egress:
-            print(f"[egress] sandbox egress at creation: {job.egress}")
-        # Print the recovery handle so it survives in the transcript even if a
-        # later line in this cell raises before the agent prints it.
-        print(job)
-        return job
-
-    def call_command(
-        self, command, *, intent, login_shell=False, timeout_seconds=60
-    ) -> dict:
-        """One synchronous command on the host (60s, 64KB cap). Approval-gated.
-        For introspection — not job dispatch (use .submit_job()). Set
-        login_shell=True when you need module/conda on PATH.
-        Returns {stdout, stderr, exit_code}."""
-        return self._compute_call(
-            "ssh",
-            {
-                "provider": self._provider,
-                "command": command,
-                "intent": intent,
-                "login_shell": login_shell,
-                "timeout_seconds": timeout_seconds,
-            },
-        )
-
-    def download(self, remote, local=None) -> Any:
-        """Copy one file from the host to your workspace. ``remote`` is ANY
-        readable absolute path on the host. Paths inside scratch_root/
-        data_roots transfer silently; any other path raises an approval card
-        the user clicks Allow/Deny on. local=None saves as the basename."""
-        return self._compute_call(
-            "scp",
-            {
-                "provider": self._provider,
-                "direction": "down",
-                "remote": remote,
-                "local": local,
-            },
-        )
-
-    def upload(self, local, remote) -> Any:
-        """Copy one workspace file to the host's scratch tree (256MB cap).
-        Path-jailed at both ends. For job inputs, DON'T upload first —
-        submit_job(inputs=[...]) stages for you. This is for one-off
-        placement."""
-        return self._compute_call(
-            "scp",
-            {
-                "provider": self._provider,
-                "direction": "up",
-                "local": _relativize_local(local),
-                "remote": remote,
-            },
-        )
-
-    def close(self) -> Any:
-        """Terminate this handle's container (byoc) and cancel any
-        still-running jobs, then remove their workdirs (ssh). Every handle
-        ends with close() — after its last job. For byoc the container bills
-        until close(), ~30 min of idle, or the container timeout — whichever
-        comes first. Close once compute_done has arrived, the harvest is
-        confirmed, and you've saved anything the globs missed."""
-        self._reuse_via = None
-        return self._compute_call(
-            "close",
-            {"provider": self._provider, "job_ids": [j._job_id for j in self._jobs]},
-        )
-
-    def attach_job(self, job_id) -> _ComputeJob:
-        """Recover a job submitted in an earlier cell. Tracked by this
-        instance so .close() cleans it up too; subsequent submit_job() reuses
-        its container."""
-        job = _ComputeJob(self._call, self._provider, job_id)
-        self._jobs.append(job)
-        self._reuse_via = job_id
-        return job
-
-
-class _Compute:
-    """host.compute — remote compute dispatch. host.compute.create(target) ->
-    ComputeInstance. Lifecycle: prepare input files in a ``python`` cell ->
-    switch to the ``repl`` tool -> c = host.compute.create("<provider>")
-    (e.g. "ssh:myhost", "byoc:nvidia") -> c.submit_job(command=..., intent=...,
-    inputs=[{src, dst_filename}, ...]) or c.call_command(cmd, intent=...).
-    submit_job is keyword-only and ``command`` is required. Jobs run remotely;
-    the cell returns immediately and the daemon posts a ``compute_done``
-    notification when outputs are harvested into your workspace."""
-
-    def __init__(self, host_call: Callable[[str, list], Any]):
-        self._call = host_call
-
-    def create(
-        self, provider: str, provider_params: dict | None = None
-    ) -> _ComputeInstance:
-        """Create a Compute handle for a registered provider target.
-        provider — target string, e.g. "ssh:<alias>" or "byoc:nvidia".
-        provider_params — optional provider-specific dict (image, gpu, model,
-        volumes, ...). Returns a ComputeInstance with submit_job /
-        call_command / download / upload / attach_job methods."""
-        return _ComputeInstance(self._call, provider, provider_params)
-
-    def set_concurrency_limit(self, max_concurrent: int) -> Any:
-        """Cap LIVE compute jobs across this whole session (the frame tree
-        rooted at the orchestrator). Any frame may LOWER it; only the
-        orchestrator (root frame) may RAISE it. Sub-agents inherit
-        automatically. Submits past the cap are refused with
-        ``error_kind="session_concurrency_full"``; ``submit_job`` retries with
-        jittered backoff by default (``on_full="wait"``)."""
-        return _compute_call(
-            self._call, "set_concurrency", {"max_concurrent": int(max_concurrent)}
-        )
-
-    def status(self) -> dict:
-        """{live, limit, daemon_live, provider_caps} for this session's root.
-        ``limit`` is None when no cap is set. ``provider_caps`` is each enabled
-        provider's own max-concurrent ceiling."""
-        return _compute_call(self._call, "status", {})
-
-    def __repr__(self) -> str:
-        return (
-            "<host.compute — create(target) -> ComputeInstance; "
-            "set_concurrency_limit(n); status(); "
-            "help(host.compute) for the lifecycle>"
-        )
-
-
-def _relativize_local(p: Any) -> Any:
-    """Agent often passes os.path.abspath(...) which is the VM-side path the
-    host can't see. Strip the cwd prefix so the host gets a workspace-relative
-    path it can resolve. Absolute paths under one of the host-allowlisted
-    artifact roots (env: OPENAI4S_ARTIFACTS_ROOTS, colon-separated) pass
-    through as-is — the host resolves them through the artifact-store DB and
-    never opens the agent-supplied path directly."""
-    import os
-
-    if not isinstance(p, str):
-        return p
-    cwd_prefix = os.getcwd() + "/"
-    if p.startswith(cwd_prefix):
-        return p[len(cwd_prefix) :]
-    if p.startswith("/"):
-        # Legacy VM-side bind-mount of the artifact store.
-        if "/mnt/artifacts/" in p:
-            return p
-        roots = [
-            os.path.realpath(x)
-            for x in os.environ.get("OPENAI4S_ARTIFACTS_ROOTS", "").split(":")
-            if x
-        ]
-        real = os.path.realpath(p)
-        for root in roots:
-            try:
-                if os.path.commonpath([real, root]) == root:
-                    return p
-            except ValueError:
-                continue
-        raise ValueError(
-            "local path must be workspace-relative, {'version_id': ...}, "
-            "{{artifact:ID}}, or under OPENAI4S_ARTIFACTS_ROOTS "
-            f"(got absolute path {p!r}; roots={roots or 'unset'})"
-        )
-    return p
-
-
-def _normalize_provider_params(provider: str, pp: Any) -> dict | None:
-    """None-drop inside the nested family block ({'nvidia':{'gpu':None}} ->
-    {'nvidia':{}}). Anything outside the family key is passed through verbatim
-    so the host's stray-param check rejects it loudly. No flat->nested
-    auto-wrap — a flat {'gpu':'A100'} lands as a stray at the host check.
-    Idempotent."""
-    if not pp:
-        return None
-    if not isinstance(pp, dict):
-        raise TypeError(
-            "provider_params must be a dict ({'%s': {'gpu':'A100', ...}}); "
-            "got %r" % (provider.split(":", 1)[-1], pp)
-        )
-    fam = provider.split(":", 1)[-1]
-    strays = {k: v for k, v in pp.items() if k != fam and v is not None}
-    inner = pp.get(fam)
-    if inner is None:
-        return strays or None
-    if not isinstance(inner, dict):
-        raise TypeError("provider_params['%s'] must be a dict; got %r" % (fam, inner))
-    inner = {k: v for k, v in inner.items() if v is not None}
-    out = ({fam: inner} if inner else {}) | strays
-    return out or None
-
-
-def _compute_call(host_call: Callable[[str, list], Any], op: str, kw: dict) -> Any:
-    """Route a compute op through host_call("compute_<op>", [kw]).
-
-    Drops None kwargs (same shape as a tool call where optional params were
-    omitted). Handlers return {error: "..."} for soft failures (decline, bad
-    arg); surface as an exception unless it's a status-carrying result the
-    caller is expected to inspect (.result()'s exit_code != 0)."""
-    kw = {k: v for k, v in kw.items() if v is not None and k != "self"}
-    r = host_call(f"compute_{op}", [kw])
-    if isinstance(r, dict) and r.get("error") and "status" not in r:
-        e = RuntimeError(f"host.compute.{op}: {r['error']}")
-        e.error_kind = r.get("error_kind")
-        e.concurrency = r.get("concurrency")
-        raise e
-    return r
-
-
 class _Host:
     def __init__(
         self,
         host_call: Callable[[str, list], Any],
         denied: frozenset[str] = frozenset(),
+        bash_authorizer: Callable[[str, list], Any] | None = None,
     ):
         # Wrap the raw RPC so every SDK call encodes its args for the wire
         # (snake->camel + drop-None) exactly once, transparently to accessors.
         def _encoded_call(method: str, args: list) -> Any:
             return host_call(method, encode_args(args))
 
+        def _encoded_bash_authorizer(method: str, args: list) -> Any:
+            target = bash_authorizer or host_call
+            return target(method, encode_args(args))
+
         # `_denied` is the set of control-plane symbols this kernel was NOT
         # spliced with. Set FIRST so __getattribute__ can consult it
         # while the rest of __init__ runs.
         object.__setattr__(self, "_denied", frozenset(denied))
         self._call = _encoded_call
+        self._bash = BashExecutor(
+            self._call,
+            authorization_call=_encoded_bash_authorizer,
+        )
         self.skills = _Skills(self._call)
         # query/mcp are control-plane; only attach when not denied so that a
         # denied kernel has no such attribute at all (genuine AttributeError).
@@ -1136,6 +692,12 @@ class _Host:
         name: str | None = None,
         context_summary: str | None = None,
         output_schema: dict | None = None,
+        steps: int | None = None,
+        max_steps: int | None = None,
+        max_turns: int | None = None,
+        permissions: dict[str, str] | None = None,
+        capabilities: list[str] | None = None,
+        unrestricted: bool | None = None,
         wait: bool = True,
     ) -> Any:
         """Spawn sub-agent(s). str/dict -> single; list -> list of results.
@@ -1153,6 +715,12 @@ class _Host:
                     "name": name,
                     "context_summary": context_summary,
                     "output_schema": output_schema,
+                    "steps": steps,
+                    "max_steps": max_steps,
+                    "max_turns": max_turns,
+                    "permissions": permissions,
+                    "capabilities": capabilities,
+                    "unrestricted": unrestricted,
                     "wait": wait,
                 }
             ],
@@ -1192,9 +760,11 @@ class _Host:
     ) -> dict:
         """Submit the task's structured result + human-facing completion bullets.
 
-        completion_bullets must be 1-4 past-tense, verb-first strings. If
-        output_schema is given, `output` is validated against it. A validation
-        failure returns {"error":...} so the model can retry.
+        completion_bullets must be 1-4 completed-action strings. English uses
+        past-tense, verb-first wording; CJK verb phrases are accepted without
+        English tense morphology. If output_schema is given, `output` is
+        validated against it. A validation failure returns {"error":...} so
+        the model can retry.
         """
         return self._call(
             "submit_output",
@@ -1230,16 +800,20 @@ class _Host:
 
     # --- opencode-parity harness tools -----------------------------------
     # A Code-as-Action cell can call these directly; they mirror opencode's
-    # bash/read/write/edit/glob/grep/list/webfetch/websearch/todo tools. File +
-    # shell ops are confined to your working directory (the session workspace).
+    # bash/read/write/edit/glob/grep/list/webfetch/websearch/todo tools. File
+    # ops are confined to your working directory (the session workspace).
     def bash(
         self, command: str, *, timeout: float = 120, workdir: str | None = None
     ) -> dict:
-        """Run a shell command in the workspace. Returns
-        {exit_code, stdout, stderr}. Networking is available."""
-        return self._call(
-            "bash", [{"command": command, "timeout": timeout, "workdir": workdir}]
-        )
+        """Run a shell command INSIDE the kernel process. Returns
+        {exit_code, stdout, stderr, workdir}. Networking is available.
+
+        The host executes only python/R cells — shell work happens here in the
+        worker, whose cwd is the session workspace and whose PATH already
+        carries the active prebuilt env's bin/ (so pip/mafft/iqtree resolve).
+        The static shell precheck and the egress fence still apply.
+        """
+        return self._bash.run(command, timeout=timeout, workdir=workdir)
 
     def read_file(self, path: str, *, offset: int = 0, limit: int = 2000) -> dict:
         """Read a workspace file (optionally a line window). Returns {content,...}."""
@@ -1427,7 +1001,7 @@ class _Host:
         )
 
     def request_network_access(self, domain: str, *, reason: str | None = None) -> dict:
-        """Ask the user to widen the outbound domain allowlist (report §5.1).
+        """Ask the user to widen the outbound domain allowlist.
 
         When OPENAI4S_EGRESS=allowlist, host.web_fetch / host.bash to a domain
         outside the science / package-index / data-repo allowlist return a proxy
@@ -1462,13 +1036,22 @@ class _Host:
         """Read the current session's approved plan (steps + live status)."""
         return self._call("plan_read", [])
 
+    def review_status(self) -> dict:
+        """Read evidence-review configuration and recent bounded verdicts."""
+        return self._call("review_status", [])
+
     def remember(self, content: str, *, block: str = "general") -> dict:
         """Persist a durable fact the daemon re-injects into future sessions
         (takes effect when Memory is enabled in Customize → Memory)."""
         return self._call("remember", [{"content": content, "block": block}])
 
 
-def build_host(host_call: Callable[[str, list], Any], mode: str = "repl") -> _Host:
+def build_host(
+    host_call: Callable[[str, list], Any],
+    mode: str = "repl",
+    *,
+    bash_authorizer: Callable[[str, list], Any] | None = None,
+) -> _Host:
     """Assemble the host.* facade for a kernel.
 
     capability gate = splice trimming, not a runtime if-check. The `repl`
@@ -1481,7 +1064,11 @@ def build_host(host_call: Callable[[str, list], Any], mode: str = "repl") -> _Ho
     ./handoff/*.json instead of host.query/host.frames.
     """
     if mode == "repl":
-        return _Host(host_call)
+        return _Host(host_call, bash_authorizer=bash_authorizer)
     if mode in ("python", "analysis", "r", "R"):
-        return _Host(host_call, denied=_ANALYSIS_DENY)
+        return _Host(
+            host_call,
+            denied=_ANALYSIS_DENY,
+            bash_authorizer=bash_authorizer,
+        )
     raise ValueError(f"build_host: unknown kernel mode {mode!r}")

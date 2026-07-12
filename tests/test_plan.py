@@ -195,7 +195,7 @@ def test_approve_runs_execution_and_marks_completed(monkeypatch, tmp_path):
             "usage": {},
         }
 
-    def fake_exec(st, code, origin, emit, stream=True):
+    def fake_exec(st, code, origin, emit, stream=True, language="python"):
         st.dispatcher.last_output = {"output": {"ok": True}}
         return {"result": {"stdout": "", "stderr": "", "error": None}}
 

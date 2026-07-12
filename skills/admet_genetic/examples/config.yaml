@@ -1,0 +1,38 @@
+filters:
+  mw_min: 120
+  mw_max: 500
+  logp_min: -0.5
+  logp_max: 5.0
+  tpsa_min: 20
+  tpsa_max: 140
+  hbd_max: 5
+  hba_max: 10
+  rotb_max: 10
+  sa_score_max: 5.0
+  qed_min: 0.30
+  risk_flags_max: 6
+
+scoring:
+  qed_weight: 0.25
+  admet_weight: 0.45
+  sa_weight: 0.25
+  property_weight: 0.05
+  sa_transform: clipped (10 - sa_score) / 9
+  property_window_terms: 6
+
+admet:
+  use_admet_ai: true
+  risk_threshold: 0.5
+  positive_keywords:
+    - hia
+    - caco
+    - bioavailability
+    - solubility
+  negative_keywords:
+    - herg
+    - ames
+    - dili
+    - cyp
+    - pgp
+    - p-gp
+    - tox

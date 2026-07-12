@@ -2,29 +2,114 @@
 
 > ⚠️ Read this before exposing the daemon beyond `localhost`.
 
-The daemon runs agent-authored code with **no OS-level sandbox** (no Seatbelt / bubblewrap) — `kernel/execute`, `compute/jobs`, and `host.bash` are equivalent to a shell on the host. This is fine for a single-user local tool bound to `127.0.0.1` (the default). On top of that, [`openai4s.security`](../openai4s/security) adds software layers reverse-engineered from Claude Science — all **opt-out via env**, all **fail-open** when no base model is set:
+Python/R scientific workers now have an OS-sandbox adapter at their spawn
+boundary. On macOS it uses Seatbelt (`sandbox-exec`); on Linux it uses
+bubblewrap. The default `OPENAI4S_KERNEL_SANDBOX=auto` performs a real startup
+self-test, enforces the boundary when available, and otherwise continues with a
+high-visibility **degraded** status. Use `enforce` to fail closed before a worker
+starts, or `off` for an explicit trusted-host opt-out. Unsupported/degraded is
+not equivalent to sandboxed; keep the default loopback bind even when the
+self-test passes.
+
+The sandbox makes the host filesystem read-only to a worker except for the
+session workspace and its private temporary directory. Raw worker network is
+blocked unless the trusted host-global
+`OPENAI4S_KERNEL_ALLOW_RAW_NETWORK=1` escape hatch is set. Host-side Web/MCP
+services remain available through audited Host RPC. This boundary covers
+Python/R kernels and their subprocesses; the separate local `compute/jobs`
+surface remains a privileged local operation and must not be treated as an
+untrusted multi-tenant sandbox.
+
+[`openai4s.security`](../openai4s/security) adds independent policy layers:
 
 | layer | env (default) | what it does |
 |---|---|---|
-| **Pre-exec classifier** | `OPENAI4S_SAFETY` (`heuristic`) | screens every *agent-authored* cell before it runs (`heuristic` / `llm` / `off`); your own Notebook cells are never screened |
+| **OS kernel sandbox** | `OPENAI4S_KERNEL_SANDBOX` (`auto`) | Seatbelt/bubblewrap detection + write/network self-test; `enforce` fails closed, `auto` reports degradation |
+| **Child environment allowlist** | always on | rebuilds the Python/R environment from explicit runtime names; daemon LLM/API/cloud/OAuth secrets and loader-injection variables are not inherited |
+| **Pre-exec classifier** | `OPENAI4S_SAFETY` (`heuristic`) | screens every *agent-authored* Python/R cell (`heuristic` / `llm` / `off`); an opted-in user's REPL Cell skips this classifier but still enters the worker sandbox and audit path |
 | **`dlopen` audit hook** | `OPENAI4S_SAFETY_AUDIT_HOOK` (on) | `sys.addaudithook` refuses `ctypes.dlopen` of a `.so` from an agent-writable path |
 | **Biosecurity screener** | `OPENAI4S_BIOSECURITY` (on) | trajectory screener (ALLOW / ESCALATE / BLOCK) on biosecurity-relevant content |
 | **Injection detector** | `OPENAI4S_INJECTION_SCAN` (on) | annotates tool-returned content (web / PDF / MCP) so the model treats it as **data, not instructions** |
-| **Egress allowlist** | `OPENAI4S_EGRESS` (`off`) | fences `web_fetch` / `web_search` / `bash` to science APIs & package indexes; blocked domains recover via `host.request_network_access(domain=…)`, which **you** approve |
+| **Egress allowlist** | `OPENAI4S_EGRESS` (`off`) | application policy for `web_fetch` / `web_search` and authorized `host.bash`; the OS sandbox is the separate raw-network boundary |
 
-Additional enforcement: an opencode-style **permission broker** gates risk-bearing tools, a **secret-file guard** blocks `.env` / `*.key` / `id_rsa` from all file tools, and every file/shell op is **workspace-jailed**.
+`web_fetch` rejects loopback and private-network targets by default to reduce
+SSRF risk. `OPENAI4S_ALLOW_PRIVATE_FETCH=1` is an explicit trusted-local
+override (useful for testing a service on `127.0.0.1`); it does not weaken the
+kernel OS sandbox or authorize arbitrary worker networking.
+
+Additional enforcement: an opencode-style **permission broker** gates
+risk-bearing tools, a **secret-file guard** blocks `.env` / `*.key` / `id_rsa`
+from file tools, and file-tool paths are workspace-confined. `host.bash` binds
+its canonical working directory to the workspace or an explicitly trusted
+extra root, but it does not parse every command argument as a path jail:
+outside reads can remain possible, and outside writes are not an OS guarantee
+when the sandbox is off or degraded. Approval requests are durable SQLite
+records. They survive broker/daemon recreation and are resolvable by ID; the
+absence of a browser subscriber never silently allows a request. Headless
+execution defaults to deny unless the operator explicitly sets
+`OPENAI4S_UNATTENDED_APPROVAL=allow`.
+
+A durable card is not a replay token. While the daemon is still running, a
+decision wakes the exact blocked call. After a daemon restart that thread is
+gone: approving the surviving card records that the old operation **did not
+execute**, appends an argument-free `permission_resolution` marker to the
+Action Ledger, and returns `requires_continue=true`. The browser then requires
+an explicit **Continue and replan** action. Conversation/project/global choices
+persist the selected standing rule. A `once` choice instead creates one exact
+`root_frame_id` + tool + permission-target grant, expires after 15 minutes, and
+is consumed atomically only when a fresh matching action reaches an `ask`
+decision. Stored/redacted approval payloads are never executed as arguments.
 
 ### The Notebook REPL is off by default
 
-The web UI's right-hand Notebook is a **read-only execution trace** by default. The developer REPL — arbitrary kernel code execution from the right panel — is **disabled** and only comes back when you set `OPENAI4S_NOTEBOOK_REPL=1`. With it off, the mutating `kernel/*` routes (`execute`, `env`, `restart`, `stop`, `start`, `interrupt`) return `403`; the classifier note above about "your own Notebook cells" applies only once you have opted the REPL back in. `kernel/install` remains available because it backs Customize → Compute rather than the Notebook REPL.
+The web UI's right-hand Notebook is a **read-only execution trace** by default.
+The developer REPL is disabled and only appears when
+`OPENAI4S_NOTEBOOK_REPL=1`. With it off, the mutating `kernel/*` routes
+(`execute`, `env`, `restart`, `stop`, `start`, `interrupt`) return `403`;
+`kernel/install` remains available because it backs Customize → Compute. When
+enabled, the input is multiline, selects Python/R, and appends a new immutable
+Cell through the same FIFO execution coordinator as Agent work. Interrupts
+must carry the exact `execution_id`, `owner.kind`, and `owner.id`; broad
+session-level SIGINT is rejected.
 
-ReAct **tool calls** — the deterministic `list` / `read` / `glob` / `grep` / `web` / `env` / `edit` / `write` / `bash` ops the model can invoke as ` ```tool ` JSON — route through the **same** `HostDispatcher` as `host.*` cell calls, so they pass the same permission broker, egress fence, injection screen, and pre-exec (dangerous-command) static gate. The ReAct surface adds no bypass around any of these layers.
+Provider-native JSON control tools — deterministic list/read/glob/grep/web/env/
+edit/write and orchestration capabilities — route through the same policy
+envelope as `host.*` Cell calls. Their public schema, approval metadata, and
+real behavior live together in named `Tool` subclasses. The legacy fenced
+`tool`-block syntax is compatibility-only and is not the advertised action
+surface.
+
+There is no registered shell tool. `host.bash` asks the Host to authorize the
+exact command hash, canonical cwd, active worker generation, challenge, and
+short expiry; detected domains are checked during authorization. The session
+frame ID is retained for audit, not as an additional consume-time token
+binding. The worker validates and consumes that random token once before it
+starts `subprocess`; the Host never executes the shell. Static command/egress
+checks remain defense in depth, and the redacted result plus a bounded
+workspace diff enter the audit/step records. A missing, expired, reused,
+wrong-generation, or mismatched token fails closed.
+
+User-authored Skills are likewise separated from bundled trust. Host/Web writes
+are confined to `<data_dir>/user-skills`, reject symlink/path escapes, and
+cannot shadow a bundled directory. User-space frontmatter cannot promote a
+document to the trusted `openai4s` origin; the normal Host authoring workflow
+uses an explicit publish transition from `draft` to `personal`.
 
 ### Secret reads and secret logs
 
-The agent can introspect its own SQLite store through the read-only `host.query`, so secret-bearing tables are **denylisted** and never reach it:
+The agent can introspect its own SQLite store through the read-only `host.query`,
+so secret-bearing and internal-control tables are **denylisted** and never reach
+it:
 
-- `host.query` refuses any statement that references `settings` (the live LLM API key + saved model profiles), `connectors` (MCP server env / launch command), `memories`, `host_call_log`, or `permission_rules`. `host.query.schema()` also hides these tables. The check runs against a copy with single-quoted string literals and comments stripped, so a denied word appearing only inside a literal (e.g. `SELECT 'settings' AS note`) is not falsely rejected, while an identifier-quoted table reference (`FROM "settings"`) still trips it.
+- The denylist covers `settings` (live/saved model credentials), `connectors`,
+  `memories`, `host_call_log`, permission rules/requests, raw Action Ledger and
+  execution-attempt tables, kernel generations, capability state/manifests,
+  branches/checkpoints/snapshot operations, and the Recovery Journal.
+  `host.query.schema()` hides the same set. The check runs against a copy with
+  single-quoted string literals and comments stripped, so a denied word only
+  inside a literal (for example `SELECT 'settings' AS note`) is not falsely
+  rejected, while an identifier-quoted table reference (`FROM "settings"`)
+  still trips it.
 - Because the denylist is a table-name match, a query that reads the unrelated `agents.connectors` *column* is also refused; no bundled skill relies on that read.
 
 Credential values passed to `host.credentials.set(name, value)` are held only in an in-memory vault (never persisted). To keep that true end to end, the **RPC audit log** redacts them: `credentials_get` / `credentials_list` are not logged at all, and `credentials_set` is logged for audit **with its args redacted** — the plaintext value never enters `host_call_log`. The replay tape recorder likewise skips `credentials_set`, so an exported notebook cannot carry a plaintext credential.

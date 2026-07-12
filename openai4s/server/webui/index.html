@@ -21,6 +21,8 @@
           <button class="lang-btn" data-lang="en">EN</button>
         </div>
         <button id="dash-settings" class="icon-ghost lg" data-i18n-title="common.settings" title="设置" data-icon="settings" data-icon-size="20"></button>
+        <button id="dash-import-session" class="outline-btn"><span class="ic" data-icon="cloud-upload" data-icon-size="16"></span><span data-i18n="sessionPackage.import">Import session</span></button>
+        <input id="session-package-input" type="file" accept=".zip,.openai4s-session.zip,application/vnd.openai4s.session+zip" style="display:none" />
         <button id="dash-new-project" class="outline-btn"><span class="ic" data-icon="plus" data-icon-size="16"></span><span data-i18n="palette.action.newProject">New project</span></button>
       </div>
     </header>
@@ -47,6 +49,7 @@
       </div>
       <div id="proj-menu" class="proj-menu hidden"></div>
       <nav class="side-nav">
+        <button id="search-btn" class="side-nav-item"><span class="ic" data-icon="search" data-icon-size="16"></span><span data-i18n="palette.action.search">Search</span></button>
         <button id="new-session" class="side-nav-item"><span class="ic" data-icon="plus" data-icon-size="16"></span><span data-i18n="ws.nav.new">New</span></button>
         <button id="customize-btn" class="side-nav-item"><span class="ic" data-icon="sliders" data-icon-size="16"></span><span data-i18n="palette.action.customize">Customize</span></button>
         <button id="files-btn" class="side-nav-item"><span class="ic" data-icon="files" data-icon-size="16"></span><span data-i18n="ws.nav.files">Files</span></button>
@@ -87,10 +90,11 @@
               <textarea id="composer" rows="1" data-i18n-ph="composer.placeholder" placeholder="Ask anything — @ for artifacts, # for sessions, / for skills, ⌘K to search…"></textarea>
               <div class="nb-foot">
                 <div class="nb-left">
-                  <button id="attach-btn" class="nb-icon" data-i18n-title="composer.attach" title="上传文件" data-icon="plus" data-icon-size="20"></button>
+                  <button id="attach-btn" class="nb-icon" data-i18n-title="composer.addToMessage" title="添加到消息" data-icon="plus" data-icon-size="20"></button>
                   <input type="file" id="file-input" style="display:none" multiple />
-                  <button id="plan-toggle" class="nb-icon" data-i18n-title="composer.planMode" title="计划模式" data-icon="grid" data-icon-size="20"></button>
-                  <button id="explore-toggle" class="nb-icon" data-i18n-title="composer.exploreMode" title="自主探索" data-icon="compass" data-icon-size="20"></button>
+                  <button id="session-options-btn" class="nb-icon" data-i18n-title="composer.sessionOptions" title="会话选项" data-icon="sliders" data-icon-size="18"></button>
+                  <button id="plan-toggle" class="nb-icon hidden" data-i18n-title="composer.planMode" title="计划模式" data-icon="grid" data-icon-size="20"></button>
+                  <button id="explore-toggle" class="nb-icon hidden" data-i18n-title="composer.exploreMode" title="自主探索" data-icon="compass" data-icon-size="20"></button>
                 </div>
                 <div class="nb-right">
                   <button id="cancel-btn" class="nb-icon hidden" data-i18n-title="nb.kernel.stopLabel" title="停止" data-icon="stop" data-icon-size="18"></button>
@@ -116,6 +120,7 @@
       <div class="dock-body">
         <div id="dock-viewer" class="dock-pane"></div>
         <div id="dock-notebook" class="dock-pane hidden"></div>
+        <div id="dock-timeline" class="dock-pane hidden" aria-live="polite"></div>
         <div id="dock-files" class="dock-pane hidden">
           <div class="files-head"><span data-i18n="dock.files.heading">Files · Artifacts</span><span id="results-count" class="count">0</span><span class="seg files-scope" id="files-scope"><button class="seg-btn active" data-scope="frame" data-i18n="dock.files.scope.frame">本会话</button><button class="seg-btn" data-scope="project" data-i18n="dock.files.scope.project">本项目</button></span></div>
           <div id="results-list" class="files-grid"></div>
@@ -141,10 +146,11 @@
     <label data-i18n="skill.label.name">Name</label><input id="pm-name" type="text" data-i18n-ph="projModal.name.placeholder" placeholder="Project name" />
     <label data-i18n="skill.label.desc">Description</label><textarea id="pm-desc" rows="2" data-i18n-ph="projModal.desc.placeholder" placeholder="Shown in the project list"></textarea>
     <label data-i18n="projModal.ctx.label">Agent Context</label><textarea id="pm-ctx" rows="3" data-i18n-ph="projModal.ctx.placeholder" placeholder="Included in every agent's prompt for this project"></textarea>
-    <div class="form-actions"><button id="pm-cancel" class="outline-btn" data-i18n="common.cancel">Cancel</button><button id="pm-create" class="solid-btn" data-i18n="projModal.create">Create</button></div>
+    <div class="form-actions"><button id="pm-delete" class="outline-btn danger hidden" data-i18n="common.delete">Delete</button><span class="form-actions-spacer"></span><button id="pm-cancel" class="outline-btn" data-i18n="common.cancel">Cancel</button><button id="pm-create" class="solid-btn" data-i18n="projModal.create">Create</button></div>
   </div></div></div>
 
   <script src="/static/favicon.js"></script>
+  <script src="/static/scientific_renderers.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

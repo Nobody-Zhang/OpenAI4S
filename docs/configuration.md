@@ -4,18 +4,19 @@ Config is via env vars (all have working defaults), read from the environment or
 
 ## Model providers
 
-One `OPENAI4S_LLM_PROVIDER` selects a wire adapter; each ships a default `base_url` and `model`, so usually you only set the key. Three wire formats live behind one normalized `host.llm`: OpenAI-compatible `/chat/completions`, Anthropic `/v1/messages`, and Gemini `generateContent`.
+One `OPENAI4S_LLM_PROVIDER` selects a wire adapter; each ships a default `base_url` and `model`, so usually you only set the key. Four wire formats live behind one normalized `host.llm`: OpenAI-compatible `/chat/completions`, OpenAI `/responses`, Anthropic `/v1/messages`, and Gemini `generateContent`.
 
 | provider | wire | default model | vision |
 |---|---|---|:---:|
 | `ark` | openai | `doubao-seed-2.0-pro` (+10 more via plan/v3) | ✅ |
 | `chatgpt` | openai | `gpt-5` | ✅ |
+| `openai_responses` | responses | `gpt-5` | — |
 | `claude` | anthropic | `claude-sonnet-4-5` | ✅ |
 | `gemini` | gemini | `gemini-2.5-flash` | ✅ |
 
 `ark` is Volcengine's plan/v3 gateway — one endpoint + key serving `doubao-seed-2.0-{pro,code,lite,mini}`, `glm-5.2`, `kimi-k2.7-code`, `kimi-k2.6`, `deepseek-v4-{pro,flash}`, `minimax-{m3,m2.7}` — all pre-registered as switchable model profiles. Without a key the daemon still starts; the UI shows a *"configure your API key"* banner until you set one.
 
-Each of api_key / base_url / model resolves **per-provider var → generic var → provider default** (e.g. `OPENAI4S_CLAUDE_API_KEY` → `OPENAI4S_LLM_API_KEY` → default). An OpenAI Responses / Codex-style wire (`openai_responses`) is also supported via a proxy.
+Each of api_key / base_url / model resolves **per-provider var → generic var → provider default** (e.g. `OPENAI4S_CLAUDE_API_KEY` → `OPENAI4S_LLM_API_KEY` → default). The `openai_responses` provider uses the stateless Responses API wire and preserves function-call/reasoning output items across turns; its current adapter is text/tool-only.
 
 ## Kernel environments (conda)
 
@@ -30,7 +31,28 @@ The agent kernel uses a scientific stack (numpy / pandas / scipy / matplotlib / 
 
 `OPENAI4S_HOST` (`127.0.0.1`) · `OPENAI4S_PORT` (`8760`) · `OPENAI4S_DATA_DIR` (`~/.openai4s`, holds the SQLite db, artifacts, logs, pidfile). See [Security](security.md) for remote / SSH-tunnel access.
 
+`OPENAI4S_SEED_DEMO` (`1`) — set to `0` to skip the first-boot live
+UniProt/RCSB demo. This is useful for CI, air-gapped deployments, or an
+intentionally empty workbench; it does not affect existing sessions.
+
 `OPENAI4S_NOTEBOOK_REPL` (`off`) — set to `1` to re-enable the web UI's in-Notebook developer REPL (arbitrary kernel code from the right panel); off by default, so the Notebook is a read-only execution trace (see [Security](security.md)).
+
+## Optional Jupyter adapter
+
+The daemon and KernelSpec tooling remain zero-dependency. Install the optional
+wire stack only when an external Jupyter client should launch a standalone
+OpenAI4S Python/R worker:
+
+```bash
+python -m pip install 'ipykernel>=7,<8'
+openai4s jupyter describe
+openai4s jupyter install
+```
+
+`openai4s jupyter export <directory>` writes specs without installing them;
+`install --prefix <prefix>` targets `<prefix>/share/jupyter/kernels`. See
+[Optional Jupyter compatibility](jupyter.md) for the independent-namespace and
+Host-RPC limitations.
 
 ## CLI
 
@@ -40,4 +62,7 @@ openai4s status    # is it up?
 openai4s stop      # stop the daemon
 openai4s run "…"   # one Code-as-Action task in-process, no daemon
 openai4s setup     # build the four conda kernel environments
+openai4s jupyter describe               # inspect optional bridge availability
+openai4s jupyter export ./kernel-specs  # pure-stdlib KernelSpec export
+openai4s jupyter install                # install user KernelSpecs
 ```

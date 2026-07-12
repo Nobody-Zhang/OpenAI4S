@@ -47,6 +47,8 @@ _TAPE_EXCLUDE = frozenset(
         "prov_resolve_path",
         "prov_record",
         "credentials_get",
+        "credentials_issue",
+        "credentials_redeem",
         "credentials_list",
         "view_image",
         "app_render",

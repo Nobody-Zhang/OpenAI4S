@@ -28,9 +28,11 @@ Protocol (JSON-per-line):
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import linecache
+import math
 import os
 import resource
 import signal
@@ -216,6 +218,29 @@ def _peak_rss_kb() -> int:
 # --- synchronous host RPC ---------------------------------
 
 _HOST_CALL_SEQ = 0
+_ACTIVE_CELL_ID: list[str | None] = [None]
+
+
+def _attach_cell_context(method: str, args: list) -> list:
+    """Add worker-owned cell identity to cell-scoped host calls.
+
+    The model may still pass an explicit ``producing_cell_id`` for backwards
+    compatibility. The hidden execution id remains authoritative for capture
+    identity, while the public value is preserved on the wire. Keep both on
+    the existing argument rather than adding another frame reader or protocol
+    message type.
+    """
+    cell_id = _ACTIVE_CELL_ID[0]
+    if method != "save_artifact" or not cell_id or not args:
+        return args
+    spec = args[0]
+    if not isinstance(spec, dict):
+        return args
+    enriched = dict(spec)
+    enriched["executionCellId"] = cell_id
+    if "producingCellId" not in spec and "producing_cell_id" not in spec:
+        enriched["producingCellId"] = cell_id
+    return [enriched, *args[1:]]
 
 
 def host_call(method: str, args: list) -> object:
@@ -227,6 +252,7 @@ def host_call(method: str, args: list) -> object:
     global _HOST_CALL_SEQ
     _HOST_CALL_SEQ += 1
     call_id = f"hc-{int(time.time())}-{_HOST_CALL_SEQ}"
+    args = _attach_cell_context(method, args)
     payload = json.dumps(
         {"type": "host_call", "id": call_id, "method": method, "args": args},
         ensure_ascii=False,
@@ -279,6 +305,7 @@ def host_call(method: str, args: list) -> object:
 _NS: dict = {"__name__": "__openai4s__", "__builtins__": __builtins__}
 _CELL_SEQ = 0
 _LIVE_TAGS: list[str] = []
+_SKILL_LOAD_EVENT_STATE: list[object] = [None, 0]
 
 # SIGINT discipline
 _in_user_code = [False]
@@ -327,6 +354,32 @@ def _error_lineno(tb, tag: str) -> tuple[int | None, str | None]:
     return lineno, (None if call in (None, "<module>") else call)
 
 
+def _drain_skill_sidecar_loads() -> list[dict]:
+    """Return worker-generated successful imports not reported by prior Cells.
+
+    Bootstrap can replace its event list when a generation is reinitialized;
+    list identity resets the cursor.  This is result metadata only—no extra
+    protocol reader, Host call, or sidecar execution happens here.
+    """
+
+    events = _NS.get("__openai4s_skill_load_events__")
+    if type(events) is not list:
+        _SKILL_LOAD_EVENT_STATE[:] = [None, 0]
+        return []
+    identity = id(events)
+    if _SKILL_LOAD_EVENT_STATE[0] != identity:
+        _SKILL_LOAD_EVENT_STATE[:] = [identity, 0]
+    cursor = _SKILL_LOAD_EVENT_STATE[1]
+    if type(cursor) is not int or cursor < 0 or cursor > len(events):
+        cursor = 0
+    pending = events[cursor:]
+    captured = [dict(item) for item in pending if type(item) is dict]
+    if len(captured) != len(pending):
+        captured.append({"event": "invalid_sidecar_event"})
+    _SKILL_LOAD_EVENT_STATE[1] = len(events)
+    return captured
+
+
 def _install_host(ns: dict) -> None:
     try:
         from openai4s.sdk.host import build_host
@@ -368,6 +421,7 @@ def _run_cell(code: str, cell_id: str, origin: str = "agent") -> dict:
     _CELL_SEQ += 1
     tag = f"<kernel:{_CELL_SEQ}>"
     _register_cell(code, tag)
+    _ACTIVE_CELL_ID[0] = cell_id
 
     if "host" not in _NS:
         _install_host(_NS)
@@ -465,7 +519,7 @@ def _run_cell(code: str, cell_id: str, origin: str = "agent") -> dict:
             return s
         return s[:MAX_OUTPUT] + f"\n...(truncated at {MAX_OUTPUT} bytes)"
 
-    return {
+    response = {
         "type": "response",
         "id": cell_id,
         "stdout": _cap(out_buf.getvalue()),
@@ -480,10 +534,251 @@ def _run_cell(code: str, cell_id: str, origin: str = "agent") -> dict:
             "peak_rss_kb": _peak_rss_kb(),
         },
     }
+    sidecar_loads = _drain_skill_sidecar_loads()
+    if sidecar_loads:
+        response["skill_sidecar_loads"] = sidecar_loads
+    return response
+
+
+# --- read-only variable inspection -----------------------------------------
+
+_INSPECT_HIDDEN = frozenset({"__name__", "__builtins__", "host", "openai4s"})
+_SAFE_SCALAR_TYPES = (type(None), bool, int, float, str, bytes)
+_SAFE_CONTAINER_TYPES = (list, tuple, dict, set, frozenset)
+_INSPECT_SAMPLE_ITEMS = 12
+_INSPECT_HASH_BYTES = 32_768
+
+
+def _safe_type_name(value: object) -> str:
+    """Return a type name without invoking the value or its metaclass hooks."""
+
+    value_type = type(value)
+    try:
+        name = type.__getattribute__(value_type, "__name__")
+    except BaseException:  # noqa: BLE001 - even hostile metaclasses stay opaque
+        return "object"
+    return name[:160] if type(name) is str and name else "object"
+
+
+def _bounded_bytes(value: bytes) -> bytes:
+    if len(value) <= _INSPECT_HASH_BYTES * 2:
+        return value
+    return (
+        value[:_INSPECT_HASH_BYTES]
+        + b"<...>"
+        + value[-_INSPECT_HASH_BYTES:]
+        + str(len(value)).encode("ascii")
+    )
+
+
+def _primitive_token(value: object) -> bytes | None:
+    value_type = type(value)
+    if value is None:
+        return b"none"
+    if value_type is bool:
+        return b"bool:1" if value else b"bool:0"
+    if value_type is int:
+        bits = int.bit_length(value)
+        if bits > 4096:
+            tail = value & ((1 << 256) - 1)
+            return (
+                b"int-bounded:"
+                + str(bits).encode("ascii")
+                + b":"
+                + str(tail).encode("ascii")
+                + (b":negative" if value < 0 else b":positive")
+            )
+        return b"int:" + str(value).encode("ascii")
+    if value_type is float:
+        if math.isnan(value):
+            return b"float:nan"
+        if math.isinf(value):
+            return b"float:+inf" if value > 0 else b"float:-inf"
+        return b"float:" + value.hex().encode("ascii")
+    if value_type is str:
+        if len(value) > _INSPECT_HASH_BYTES * 2:
+            raw = (
+                value[:_INSPECT_HASH_BYTES].encode("utf-8", "surrogatepass")
+                + b"<...>"
+                + value[-_INSPECT_HASH_BYTES:].encode("utf-8", "surrogatepass")
+                + str(len(value)).encode("ascii")
+            )
+        else:
+            raw = value.encode("utf-8", "surrogatepass")
+        return b"str:" + _bounded_bytes(raw)
+    if value_type is bytes:
+        return b"bytes:" + _bounded_bytes(value)
+    return None
+
+
+def _primitive_preview(value: object) -> object:
+    value_type = type(value)
+    if value is None or value_type is bool:
+        return value
+    if value_type is int:
+        bits = int.bit_length(value)
+        return value if bits <= 4096 else f"<integer {bits} bits>"
+    if value_type is float:
+        if math.isnan(value):
+            return "NaN"
+        if math.isinf(value):
+            return "+Infinity" if value > 0 else "-Infinity"
+        return value
+    if value_type is str:
+        return value if len(value) <= 240 else value[:239] + "…"
+    if value_type is bytes:
+        head = value[:48].hex()
+        return "0x" + head + ("…" if len(value) > 48 else "")
+    raise TypeError("unsafe primitive preview")
+
+
+def _container_sample(value: object) -> tuple[list[object], int]:
+    """Sample exact built-in containers without calling subclass hooks."""
+
+    value_type = type(value)
+    if value_type is list:
+        length = list.__len__(value)
+        return [
+            list.__getitem__(value, i)
+            for i in range(min(length, _INSPECT_SAMPLE_ITEMS))
+        ], length
+    if value_type is tuple:
+        length = tuple.__len__(value)
+        return [
+            tuple.__getitem__(value, i)
+            for i in range(min(length, _INSPECT_SAMPLE_ITEMS))
+        ], length
+    if value_type is dict:
+        length = dict.__len__(value)
+        items = []
+        iterator = dict.items(value).__iter__()
+        for _ in range(min(length, _INSPECT_SAMPLE_ITEMS)):
+            try:
+                items.append(next(iterator))
+            except StopIteration:
+                break
+        return items, length
+    if value_type is set:
+        length = set.__len__(value)
+        iterator = set.__iter__(value)
+    elif value_type is frozenset:
+        length = frozenset.__len__(value)
+        iterator = frozenset.__iter__(value)
+    else:
+        raise TypeError("unsafe container")
+    items = []
+    for _ in range(min(length, _INSPECT_SAMPLE_ITEMS)):
+        try:
+            items.append(next(iterator))
+        except StopIteration:
+            break
+    return items, length
+
+
+def _safe_container_summary(value: object) -> tuple[str, int, str, str] | None:
+    sample, length = _container_sample(value)
+    value_type = type(value)
+    tokens: list[bytes] = []
+    previews: list[str] = []
+    for item in sample:
+        if value_type is dict:
+            key, member = item
+            key_token = _primitive_token(key)
+            member_token = _primitive_token(member)
+            if key_token is None or member_token is None:
+                return None
+            tokens.append(key_token + b"=>" + member_token)
+            previews.append(
+                json.dumps(_primitive_preview(key), ensure_ascii=False)
+                + ": "
+                + json.dumps(_primitive_preview(member), ensure_ascii=False)
+            )
+        else:
+            token = _primitive_token(item)
+            if token is None:
+                return None
+            tokens.append(token)
+            previews.append(json.dumps(_primitive_preview(item), ensure_ascii=False))
+    if value_type in {set, frozenset}:
+        tokens.sort()
+        previews.sort()
+    opening, closing = {
+        list: ("[", "]"),
+        tuple: ("(", ")"),
+        dict: ("{", "}"),
+        set: ("{", "}"),
+        frozenset: ("frozenset({", "})"),
+    }[value_type]
+    suffix = ", …" if length > len(sample) else ""
+    preview = opening + ", ".join(previews) + suffix + closing
+    canonical = (
+        _safe_type_name(value).encode("ascii", "backslashreplace")
+        + b":"
+        + str(length).encode("ascii")
+        + b":"
+        + b"|".join(tokens)
+    )
+    kind = (
+        "mapping"
+        if value_type is dict
+        else ("set" if value_type in {set, frozenset} else "sequence")
+    )
+    return kind, length, preview[:240], hashlib.sha256(canonical).hexdigest()
+
+
+def _inspect_one(name: str, value: object) -> dict:
+    entry = {"name": name[:160], "type": _safe_type_name(value)}
+    value_type = type(value)
+    if value_type in _SAFE_SCALAR_TYPES:
+        token = _primitive_token(value)
+        entry["kind"] = (
+            "scalar"
+            if value_type not in {str, bytes}
+            else ("text" if value_type is str else "bytes")
+        )
+        if value_type in {str, bytes}:
+            entry["length"] = len(value)
+        entry["preview"] = _primitive_preview(value)
+        if token is not None:
+            entry["fingerprint"] = hashlib.sha256(token).hexdigest()
+    elif value_type in _SAFE_CONTAINER_TYPES:
+        summary = _safe_container_summary(value)
+        if summary is not None:
+            kind, length, preview, fingerprint = summary
+            entry.update(
+                kind=kind,
+                length=length,
+                preview=preview,
+                fingerprint=fingerprint,
+            )
+        else:
+            # The top-level exact built-in remains safe to size.  A custom
+            # member makes preview/fingerprint unavailable, never executable.
+            _sample, length = _container_sample(value)
+            entry.update(kind="container", length=length)
+    return entry
+
+
+def _inspect_namespace(limit: int) -> dict:
+    names = sorted(
+        name
+        for name in _NS
+        if type(name) is str
+        and name not in _INSPECT_HIDDEN
+        and not name.startswith("__")
+    )
+    selected = names[:limit]
+    return {
+        "variables": [
+            _inspect_one(name, dict.__getitem__(_NS, name)) for name in selected
+        ],
+        "truncated": len(names) > len(selected),
+        "limit": limit,
+    }
 
 
 def _install_audit_hook() -> None:
-    """Arm the in-kernel `_operon_audit` dlopen guard (report layer 3).
+    """Arm the in-kernel dlopen guard (defense layer 3).
 
     Runs inside THIS worker process — an audit hook only sees events raised in
     its own interpreter. Opt out with OPENAI4S_SAFETY_AUDIT_HOOK=0. Best-effort:
@@ -541,6 +836,41 @@ def main() -> None:
                 req.get("origin", "agent"),
             )
             _write_frame(resp)
+        elif rtype == "inspect_variables":
+            request_id = req.get("id", "unknown")
+            limit = req.get("limit", 200)
+            if type(limit) is not int or not 1 <= limit <= 500:
+                _write_frame(
+                    {
+                        "type": "variables_response",
+                        "id": request_id,
+                        "variables": [],
+                        "truncated": False,
+                        "limit": 0,
+                        "error": "invalid variable inspection limit",
+                    }
+                )
+                continue
+            try:
+                inspected = _inspect_namespace(limit)
+                _write_frame(
+                    {
+                        "type": "variables_response",
+                        "id": request_id,
+                        **inspected,
+                    }
+                )
+            except BaseException:  # noqa: BLE001 - fail closed, keep worker alive
+                _write_frame(
+                    {
+                        "type": "variables_response",
+                        "id": request_id,
+                        "variables": [],
+                        "truncated": False,
+                        "limit": limit,
+                        "error": "variable inspection failed closed",
+                    }
+                )
         # host_response frames only arrive inside host_call's read loop; a
         # leak to the main loop is stale desync — ignore.
 

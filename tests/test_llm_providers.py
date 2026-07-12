@@ -1,6 +1,6 @@
 """Offline unit tests for the multi-provider, multimodal LLM client.
 
-No network: `llm._post_json` is monkeypatched to capture the outbound URL,
+No network: `llm.transport.post_json` is monkeypatched to capture the outbound URL,
 payload and headers and to return a canned per-wire response. This lets us
 assert, deterministically, that:
 
@@ -19,7 +19,7 @@ from openai4s.config import LLMConfig
 
 
 class _Capture:
-    """Replaces llm._post_json; records the last call, returns a canned body."""
+    """Replaces transport.post_json and returns a canned wire response."""
 
     def __init__(self):
         self.url = None
@@ -70,7 +70,7 @@ def _hermetic_env(monkeypatch):
 @pytest.fixture
 def cap(monkeypatch):
     c = _Capture()
-    monkeypatch.setattr(llm, "_post_json", c)
+    monkeypatch.setattr(llm.transport, "post_json", c)
     return c
 
 
@@ -87,6 +87,7 @@ def _cfg(provider, **kw):
     [
         ("ark", "openai", True),
         ("chatgpt", "openai", True),
+        ("openai_responses", "responses", False),
         ("claude", "anthropic", True),
         ("gemini", "gemini", True),
     ],
@@ -140,6 +141,46 @@ def test_missing_api_key_raises(monkeypatch):
         llm.chat([{"role": "user", "content": "hi"}], c)
 
 
+def test_loopback_openai_endpoint_can_run_without_fake_api_key(cap):
+    c = LLMConfig(
+        provider="chatgpt",
+        api_key="",
+        base_url="http://127.0.0.1:11434/v1",
+        model="qwen3:8b",
+    )
+
+    llm.chat([{"role": "user", "content": "hi"}], c)
+
+    assert cap.url == "http://127.0.0.1:11434/v1/chat/completions"
+    assert "Authorization" not in cap.headers
+
+
+def test_loopback_endpoint_does_not_inherit_unverified_vendor_tool_support(cap):
+    c = LLMConfig(
+        provider="chatgpt",
+        api_key="",
+        base_url="http://127.0.0.1:1234/v1",
+        model="local-model",
+    )
+    tools = [
+        {
+            "name": "external_write",
+            "description": "must not be sent without a capability override",
+            "parameters": {"type": "object", "properties": {}},
+        }
+    ]
+
+    llm.chat([{"role": "user", "content": "hi"}], c, tools=tools)
+
+    assert "tools" not in cap.payload
+    assert (
+        llm.get_model_capabilities(
+            "chatgpt", "local-model", base_url=c.base_url
+        ).tool_calling
+        is False
+    )
+
+
 # --- wire selection + auth headers ---------------------------------------
 
 
@@ -162,7 +203,7 @@ def test_anthropic_wire_url_and_auth(cap):
     )
     assert cap.url == "https://api.anthropic.com/v1/messages"
     assert cap.headers["x-api-key"] == "test-key"
-    assert cap.headers["anthropic-version"] == llm._ANTHROPIC_VERSION
+    assert cap.headers["anthropic-version"] == llm.ANTHROPIC_VERSION
     # system message is hoisted to a top-level field, not in messages
     assert cap.payload["system"] == "be brief"
     assert all(m["role"] != "system" for m in cap.payload["messages"])

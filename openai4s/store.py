@@ -4,12 +4,17 @@ openai4s exposes these tables read-only through `host.query`; the host writes th
 as turns/cells/artifacts/compactions happen. Schema and write paths:
 
   frames            turn tree (self-referential), per-turn model/effort/token/cost
+  action_groups     canonical provider/action groups, ordered per branch
+  action_events     append-only proposed/result/lifecycle events within a group
+  execution_attempts  attempt-first code execution lifecycle records
   execution_log     per-cell record (code + usage wall/cpu/rss + error)
   artifacts         logical artifact (filename, content_type)
   artifact_versions versioned bytes (version_id, checksum) -> artifacts
   compaction_archives  compacted history slices
   agents            agent profile definitions
   custom_skills     user-authored SKILL.md bodies
+  skill_*           immutable Skill blobs/versions and activation history
+  capability_*      scoped enablement events/state + bootstrap manifests
   memories          memory blocks (scope/block-listed in host.query)
   managed_endpoints local model endpoints
   notes             project notes
@@ -26,16 +31,54 @@ All timestamps are epoch-ms. Booleans are 0/1. One DB per data_dir.
 """
 from __future__ import annotations
 
-import fnmatch
-import hashlib
 import json
 import re
 import sqlite3
 import threading
 import time
-import uuid
 from pathlib import Path
 from typing import Any
+
+from openai4s.capabilities import CapabilityStateService, SpecialistProfileService
+from openai4s.execution.dependencies import (
+    analyze_code,
+    default_replay_policy,
+    default_visibility,
+)
+from openai4s.storage.actions import ActionLedgerRepository
+from openai4s.storage.activation import SessionActivationRepository
+from openai4s.storage.agents import AgentProfileRepository
+from openai4s.storage.annotations import AnnotationRepository
+from openai4s.storage.artifacts import ArtifactRepository
+from openai4s.storage.artifacts import file_identity as _file_identity
+from openai4s.storage.artifacts import same_file_path as _same_file_path
+from openai4s.storage.branch_projection import count_cursor, project_branch_records
+from openai4s.storage.capabilities import CapabilityStateRepository
+from openai4s.storage.checkpoint_state import CheckpointStateRepository
+from openai4s.storage.connectors import ConnectorRepository
+from openai4s.storage.delegation import DelegationProjectionRepository
+from openai4s.storage.frames import FrameRepository
+from openai4s.storage.kernels import KernelGenerationRepository
+from openai4s.storage.memories import MemoryRepository
+from openai4s.storage.metadata import (
+    DERIVABLE_HOST_CALLS,
+    SECRET_ARG_HOST_CALLS,
+    CompactionRepository,
+    EndpointRepository,
+    FolderRepository,
+    HostCallRepository,
+    NotesRepository,
+)
+from openai4s.storage.permissions import (
+    DEFAULT_PERMISSION_RULES as _DEFAULT_PERMISSION_RULES,
+)
+from openai4s.storage.permissions import PermissionRuleRepository
+from openai4s.storage.permissions import perm_match as _perm_match
+from openai4s.storage.plans import PlanRepository
+from openai4s.storage.recovery import RecoveryJournalRepository
+from openai4s.storage.settings import SettingsRepository
+from openai4s.storage.skills import SkillVersionRepository
+from openai4s.storage.snapshots import SessionSnapshotRepository
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS frames (
@@ -73,6 +116,7 @@ CREATE TABLE IF NOT EXISTS projects (
 CREATE TABLE IF NOT EXISTS messages (
     message_id    TEXT PRIMARY KEY,
     root_frame_id TEXT NOT NULL,
+    branch_id     TEXT,
     frame_id      TEXT,
     seq           INTEGER NOT NULL,
     role          TEXT NOT NULL,      -- 'user' | 'assistant'
@@ -89,11 +133,23 @@ CREATE TABLE IF NOT EXISTS execution_log (
     project_id    TEXT NOT NULL DEFAULT 'default',
     cell_seq      INTEGER,
     cell_index    INTEGER,
+    state_revision INTEGER,
     kernel_id     TEXT,
     language      TEXT,
     status        TEXT,
     origin        TEXT,
     code          TEXT NOT NULL,
+    code_hash     TEXT NOT NULL,
+    visibility    TEXT NOT NULL DEFAULT 'scientific'
+                  CHECK (visibility IN ('scientific','scratch','recovery','system')),
+    pin           INTEGER NOT NULL DEFAULT 0 CHECK (pin IN (0,1)),
+    replay_policy TEXT NOT NULL DEFAULT 'conditional'
+                  CHECK (replay_policy IN ('safe','conditional','never')),
+    variable_reads TEXT NOT NULL DEFAULT '[]',
+    variable_writes TEXT NOT NULL DEFAULT '[]',
+    variable_deletes TEXT NOT NULL DEFAULT '[]',
+    mutation_uncertain INTEGER NOT NULL DEFAULT 0
+                  CHECK (mutation_uncertain IN (0,1)),
     stdout        TEXT,
     stderr        TEXT,
     error         TEXT,
@@ -156,9 +212,18 @@ CREATE TABLE IF NOT EXISTS compaction_archives (
     archive_id    TEXT PRIMARY KEY,
     frame_id      TEXT,
     project_id    TEXT NOT NULL DEFAULT 'default',
+    branch_id     TEXT,
+    ledger_cursor TEXT,
+    recovery_pointer TEXT,
+    generation_id TEXT,
+    metadata      TEXT,
     summary       TEXT,
+    handoff       TEXT,
     compacted     TEXT,               -- JSON of the raw slice
     n_messages    INTEGER,
+    context_before TEXT,
+    context_after TEXT,
+    artifact_refs TEXT,
     created_at    INTEGER NOT NULL
 );
 
@@ -179,6 +244,47 @@ CREATE TABLE IF NOT EXISTS custom_skills (
     created_at    INTEGER NOT NULL,
     updated_at    INTEGER NOT NULL
 );
+
+-- Shared enablement policy for Skills, Specialists, and future capability
+-- kinds.  ``capability_events`` is append-only; ``capability_states`` is its
+-- efficient current-state projection.  Session state overrides project state,
+-- which overrides global state.
+CREATE TABLE IF NOT EXISTS capability_states (
+    kind            TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    normalized_name TEXT NOT NULL,
+    scope           TEXT NOT NULL,       -- global | project | session
+    scope_id        TEXT NOT NULL DEFAULT '',
+    enabled         INTEGER NOT NULL,
+    metadata        TEXT,                -- JSON, non-secret manifest hints
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    PRIMARY KEY(kind, normalized_name, scope, scope_id)
+);
+CREATE TABLE IF NOT EXISTS capability_events (
+    event_id        TEXT PRIMARY KEY,
+    kind            TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    normalized_name TEXT NOT NULL,
+    scope           TEXT NOT NULL,
+    scope_id        TEXT NOT NULL DEFAULT '',
+    event           TEXT NOT NULL,       -- enabled | disabled | sidecar_loaded
+    enabled         INTEGER,
+    metadata        TEXT,
+    created_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_capability_events_lookup
+    ON capability_events(kind, normalized_name, created_at);
+CREATE TABLE IF NOT EXISTS capability_manifests (
+    manifest_id TEXT PRIMARY KEY,
+    session_id  TEXT NOT NULL,
+    project_id  TEXT,
+    kind        TEXT NOT NULL,
+    entries     TEXT NOT NULL,            -- JSON snapshot, loaded=false initially
+    created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_capability_manifest_session
+    ON capability_manifests(session_id, kind, created_at);
 
 CREATE TABLE IF NOT EXISTS memories (
     memory_id     TEXT PRIMARY KEY,
@@ -224,8 +330,15 @@ CREATE INDEX IF NOT EXISTS ix_edge_in  ON lineage_edges(input_version_id);
 CREATE TABLE IF NOT EXISTS host_call_log (
     call_id       TEXT PRIMARY KEY,
     frame_id      TEXT,
+    action_group_id TEXT,
+    action_id     TEXT,
+    permission_decision_id TEXT,
     method        TEXT NOT NULL,
     args_preview  TEXT,
+    result_preview TEXT,
+    result_digest TEXT,
+    side_effect_class TEXT,
+    resource_keys TEXT,
     ok            INTEGER NOT NULL DEFAULT 1,
     created_at    INTEGER NOT NULL
 );
@@ -316,18 +429,38 @@ CREATE TABLE IF NOT EXISTS permission_rules (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_perm ON permission_rules(scope, scope_id, tool, pattern);
 CREATE INDEX IF NOT EXISTS ix_perm_scope ON permission_rules(scope, scope_id);
+
+-- Durable approval requests. Unlike permission_rules (standing policy), each
+-- row is one concrete action decision and remains auditable across reconnects
+-- and daemon restarts. Terminal requests are immutable.
+CREATE TABLE IF NOT EXISTS permission_requests (
+    decision_id    TEXT PRIMARY KEY,
+    root_frame_id  TEXT,
+    frame_id       TEXT,
+    project_id     TEXT,
+    action_group_id TEXT,
+    action_id      TEXT,
+    tool_call_id   TEXT,
+    tool           TEXT NOT NULL,
+    target         TEXT NOT NULL DEFAULT '',
+    side_effect_class TEXT,
+    resource_keys  TEXT,
+    payload        TEXT,
+    state          TEXT NOT NULL DEFAULT 'pending',
+    scope          TEXT,
+    pattern        TEXT,
+    message        TEXT,
+    resolution_context TEXT,
+    continuation_required INTEGER NOT NULL DEFAULT 0,
+    continuation_expires_at INTEGER,
+    continuation_consumed_at INTEGER,
+    created_at     INTEGER NOT NULL,
+    expires_at     INTEGER,
+    resolved_at    INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_permission_request_root
+    ON permission_requests(root_frame_id, state, created_at);
 """
-
-# host.* methods that must NEVER be persisted to host_call_log (credential
-# reads: the value is already returned to the caller, logging it only duplicates
-# the secret at rest).
-DERIVABLE_HOST_CALLS = frozenset({"credentials_get", "credentials_list"})
-
-# host.* methods whose ARGS carry a raw secret value. The method name is still
-# logged for audit, but the args preview is redacted before it reaches
-# host_call_log (and such calls are excluded from the replay tape) so a plaintext
-# credential can never be serialized into SQLite or an exported notebook.
-SECRET_ARG_HOST_CALLS = frozenset({"credentials_set"})
 
 # Tables host.query must refuse to read. These hold secrets or
 # internal audit/memory state that is not part of the agent-visible data model:
@@ -336,8 +469,37 @@ SECRET_ARG_HOST_CALLS = frozenset({"credentials_set"})
 #   memories          -> memory blocks (surfaced through host.remember, not SQL)
 #   host_call_log     -> RPC audit trail
 #   permission_rules  -> permission broker state
+#   action_* / execution_attempts -> provider wire state and raw action audit
 QUERY_DENYLIST = frozenset(
-    {"settings", "connectors", "memories", "host_call_log", "permission_rules"}
+    {
+        "settings",
+        "connectors",
+        "memories",
+        "host_call_log",
+        "permission_rules",
+        "permission_requests",
+        "action_groups",
+        "action_events",
+        "execution_attempts",
+        "kernel_generations",
+        "capability_states",
+        "capability_events",
+        "capability_manifests",
+        "skill_blobs",
+        "skill_versions",
+        "skill_version_files",
+        "skill_installations",
+        "skill_installation_events",
+        "delegation_sessions",
+        "delegation_children",
+        "delegation_steering",
+        "session_branches",
+        "session_branch_selection",
+        "session_checkpoints",
+        "checkpoint_state_snapshots",
+        "snapshot_operations",
+        "recovery_journal",
+    }
 )
 
 # Single-quoted string literals and SQL comments are stripped before the denylist
@@ -363,66 +525,12 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _perm_match(text: str, pattern: str) -> bool:
-    """opencode-style wildcard match: '*' = any chars (spans '/'), '?' = one
-    char, case-sensitive. '' and '*' match anything. An EXACT string equality is
-    always a match FIRST — so a remembered literal target that itself contains
-    fnmatch metacharacters (e.g. a command with '[', '?' or '*') still matches
-    itself instead of being reinterpreted as a glob."""
-    text = text or ""
-    pattern = pattern or "*"
-    if pattern in ("*", ""):
-        return True
-    if text == pattern:
-        return True
-    try:
-        return fnmatch.fnmatchcase(text, pattern)
-    except Exception:  # noqa: BLE001
-        return False
-
-
-# security-first defaults, mirroring opencode: read-only tools run silently,
-# .env reads are denied, everything that writes/executes/reaches-out asks.
-# Gentle-by-default policy. This is a LOCAL, single-user research daemon whose
-# kernel already runs arbitrary Python UN-gated, so gating the normal in-workspace
-# research workflow adds friction without real protection. We therefore ALLOW the
-# safe, confined, or already-guarded tools (file reads/writes/edits stay inside the
-# session workspace, .env/secrets are hard-blocked, web_* is SSRF-guarded) and keep
-# an approval prompt ONLY for genuinely risky / external / irreversible actions:
-# arbitrary shell, external MCP connectors, long-running background procs, writing
-# credentials, and deleting/publishing skills. (And an UNWATCHED turn allows
-# everything anyway — the gate only ever prompts when a human is actively viewing.)
-_DEFAULT_PERMISSION_RULES = (
-    # secrets: absolute veto regardless of anything else
-    ("read_file", "*.env", "deny"),
-    # safe in-workspace / guarded research workflow -> allow (no prompt)
-    ("read_file", "*", "allow"),
-    ("write_file", "*", "allow"),
-    ("edit_file", "*", "allow"),
-    ("glob", "*", "allow"),
-    ("grep", "*", "allow"),
-    ("list_dir", "*", "allow"),
-    ("save_artifact", "*", "allow"),
-    ("delegate", "*", "allow"),
-    ("env_setup", "*", "allow"),
-    ("web_fetch", "*", "allow"),
-    ("web_search", "*", "allow"),
-    ("skills_edit", "*", "allow"),
-    # genuinely risky / external / irreversible -> ask (only when a human is watching)
-    ("bash", "*", "ask"),
-    ("mcp_call", "*", "ask"),
-    ("exec_background", "*", "ask"),
-    ("credentials_set", "*", "ask"),
-    ("skills_delete", "*", "ask"),
-    ("skills_publish", "*", "ask"),
-)
-
-
 class Store:
     """Thread-safe SQLite wrapper. One per data_dir; created lazily."""
 
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path)
+        self._closed = False
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
@@ -430,9 +538,151 @@ class Store:
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
         self._migrate()
+        self._actions = ActionLedgerRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
+        self._kernel_generations = KernelGenerationRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
+        self._checkpoint_states = CheckpointStateRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
+        self._session_snapshots = SessionSnapshotRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+            checkpoint_state=self._checkpoint_states,
+        )
+        self._session_activation = SessionActivationRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+            checkpoint_state=self._checkpoint_states,
+        )
+        self._recovery_journal = RecoveryJournalRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
+        self._delegations = DelegationProjectionRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
+        self._plans = PlanRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
+        self._annotations = AnnotationRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
+        self._memories = MemoryRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
+        self._settings = SettingsRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
+        self._permissions = PermissionRuleRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+            get_setting=self.get_setting,
+            set_setting=self.set_setting,
+        )
+        self._connectors = ConnectorRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
+        self._agents = AgentProfileRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
+        self._capability_repository = CapabilityStateRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
+        self._capabilities = CapabilityStateService(self._capability_repository)
+        self._skill_versions = SkillVersionRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
+        self._specialists = SpecialistProfileService(
+            self._agents,
+            self._capabilities,
+        )
+        self._frames = FrameRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+            get_frame=lambda frame_id: self.get_frame(frame_id),
+            resolve_frame_scope=lambda frame_id, **kwargs: self.resolve_frame_scope(
+                frame_id, **kwargs
+            ),
+            get_project=lambda project_id: self.get_project(project_id),
+        )
+        self._artifacts = ArtifactRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+            get_frame=lambda frame_id: self.get_frame(frame_id),
+            resolve_frame_scope=lambda frame_id, **kwargs: self.resolve_frame_scope(
+                frame_id, **kwargs
+            ),
+            resolve_artifact_write_scope=lambda **kwargs: self._artifact_write_scope(
+                **kwargs
+            ),
+            execute=lambda sql, params=(): self._exec(sql, params),
+            get_artifact=lambda artifact_id: self.get_artifact(artifact_id),
+            get_env_snapshot=lambda snapshot_id: self.get_env_snapshot(snapshot_id),
+            identify_file=lambda path: _file_identity(path),
+            paths_match=lambda left, right: _same_file_path(left, right),
+        )
+        self._notes = NotesRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
+        self._folders = FolderRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
+        self._endpoints = EndpointRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
+        self._compactions = CompactionRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
+        self._host_calls = HostCallRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
 
     # --- migration (add columns missing from a pre-existing DB) -----------
     _MIGRATIONS = {
+        "messages": [("branch_id", "TEXT")],
         "frames": [
             ("task_summary", "TEXT"),
             ("folder_id", "TEXT"),
@@ -444,12 +694,52 @@ class Store:
         "execution_log": [
             ("root_frame_id", "TEXT"),
             ("cell_index", "INTEGER"),
+            ("state_revision", "INTEGER"),
             ("kernel_id", "TEXT"),
             ("language", "TEXT"),
             ("status", "TEXT"),
+            ("code_hash", "TEXT"),
+            ("visibility", "TEXT NOT NULL DEFAULT 'scientific'"),
+            ("pin", "INTEGER NOT NULL DEFAULT 0"),
+            ("replay_policy", "TEXT NOT NULL DEFAULT 'conditional'"),
+            ("variable_reads", "TEXT NOT NULL DEFAULT '[]'"),
+            ("variable_writes", "TEXT NOT NULL DEFAULT '[]'"),
+            ("variable_deletes", "TEXT NOT NULL DEFAULT '[]'"),
+            ("mutation_uncertain", "INTEGER NOT NULL DEFAULT 0"),
             ("figures", "TEXT"),
             ("files_read", "TEXT"),
             ("files_written", "TEXT"),
+        ],
+        "permission_requests": [
+            ("resolution_context", "TEXT"),
+            ("continuation_required", "INTEGER NOT NULL DEFAULT 0"),
+            ("continuation_expires_at", "INTEGER"),
+            ("continuation_consumed_at", "INTEGER"),
+            ("action_group_id", "TEXT"),
+            ("action_id", "TEXT"),
+            ("tool_call_id", "TEXT"),
+            ("side_effect_class", "TEXT"),
+            ("resource_keys", "TEXT"),
+        ],
+        "host_call_log": [
+            ("action_group_id", "TEXT"),
+            ("action_id", "TEXT"),
+            ("permission_decision_id", "TEXT"),
+            ("result_preview", "TEXT"),
+            ("result_digest", "TEXT"),
+            ("side_effect_class", "TEXT"),
+            ("resource_keys", "TEXT"),
+        ],
+        "compaction_archives": [
+            ("branch_id", "TEXT"),
+            ("ledger_cursor", "TEXT"),
+            ("recovery_pointer", "TEXT"),
+            ("generation_id", "TEXT"),
+            ("metadata", "TEXT"),
+            ("handoff", "TEXT"),
+            ("context_before", "TEXT"),
+            ("context_after", "TEXT"),
+            ("artifact_refs", "TEXT"),
         ],
     }
 
@@ -470,6 +760,83 @@ class Store:
                             )
                         except sqlite3.OperationalError:
                             pass
+            # Historical child frames inherited the root id but silently kept
+            # project_id='default'. Historical artifacts also used their actor
+            # frame as root_frame_id. Repair both idempotently when the frame
+            # tree still exists; unframed legacy uploads remain untouched.
+            self._conn.execute(
+                "UPDATE frames SET project_id=COALESCE((SELECT root.project_id "
+                "FROM frames AS root WHERE root.frame_id=frames.root_frame_id),"
+                "project_id) WHERE root_frame_id IS NOT NULL"
+            )
+            self._conn.execute(
+                "UPDATE artifacts SET project_id=COALESCE((SELECT root.project_id "
+                "FROM frames AS actor JOIN frames AS root "
+                "ON root.frame_id=actor.root_frame_id "
+                "WHERE actor.frame_id=artifacts.root_frame_id),project_id) "
+                "WHERE root_frame_id IN (SELECT frame_id FROM frames)"
+            )
+            self._conn.execute(
+                "UPDATE artifacts SET root_frame_id=COALESCE((SELECT "
+                "actor.root_frame_id FROM frames AS actor "
+                "WHERE actor.frame_id=artifacts.root_frame_id),root_frame_id) "
+                "WHERE root_frame_id IN (SELECT frame_id FROM frames)"
+            )
+            # Messages written before branch-aware history belonged to the
+            # canonical root.  Keep the rows immutable and backfill only their
+            # newly-added routing projection.
+            self._conn.execute(
+                "UPDATE messages SET branch_id=root_frame_id "
+                "WHERE branch_id IS NULL OR branch_id=''"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_msg_branch "
+                "ON messages(root_frame_id,branch_id,seq)"
+            )
+            # ``cell_index`` was already the session-monotonic allocation for
+            # historical Web Cells.  Backfill the explicitly named runtime
+            # revision without pretending that rows which never had an index
+            # carry recoverable state.
+            self._conn.execute(
+                "UPDATE execution_log SET state_revision=cell_index "
+                "WHERE state_revision IS NULL AND cell_index IS NOT NULL"
+            )
+            # Capture the same immutable dependency metadata for historical
+            # Cells as for newly recorded ones.  Rows are selected by the hash
+            # sentinel, making the additive migration idempotent.
+            legacy_cells = self._conn.execute(
+                "SELECT producing_cell_id,code,language,origin,visibility,"
+                "replay_policy FROM execution_log WHERE code_hash IS NULL"
+            ).fetchall()
+            for cell in legacy_cells:
+                visibility = cell["visibility"] or default_visibility(cell["origin"])
+                if visibility == "scientific" and str(cell["origin"] or "").lower() in {
+                    "system",
+                    "recovery",
+                }:
+                    visibility = default_visibility(cell["origin"])
+                replay_policy = cell["replay_policy"]
+                if not replay_policy or visibility in {"system", "recovery"}:
+                    replay_policy = default_replay_policy(visibility)
+                metadata = analyze_code(
+                    cell["code"] or "", cell["language"] or "python"
+                )
+                self._conn.execute(
+                    "UPDATE execution_log SET code_hash=?,visibility=?,"
+                    "replay_policy=?,variable_reads=?,variable_writes=?,"
+                    "variable_deletes=?,mutation_uncertain=? "
+                    "WHERE producing_cell_id=?",
+                    (
+                        metadata.code_hash,
+                        visibility,
+                        replay_policy,
+                        json.dumps(metadata.reads, ensure_ascii=False),
+                        json.dumps(metadata.writes, ensure_ascii=False),
+                        json.dumps(metadata.deletes, ensure_ascii=False),
+                        1 if metadata.uncertain else 0,
+                        cell["producing_cell_id"],
+                    ),
+                )
             self._conn.commit()
 
     # --- low-level -------------------------------------------------------
@@ -480,7 +847,11 @@ class Store:
 
     def close(self) -> None:
         with self._lock:
+            if self._closed:
+                return
             self._conn.close()
+            self._closed = True
+        _discard_store(self)
 
     # --- frames ----------------------------------------------------------
     def new_frame(
@@ -494,44 +865,29 @@ class Store:
         depth: int = 0,
         status: str = "processing",
     ) -> str:
-        frame_id = f"f-{uuid.uuid4().hex[:12]}"
-        root = frame_id if parent_id is None else self._root_of(parent_id, frame_id)
-        now = _now_ms()
-        self._exec(
-            "INSERT INTO frames(frame_id,parent_id,project_id,root_frame_id,kind,"
-            "name,model,status,depth,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                frame_id,
-                parent_id,
-                project_id,
-                root,
-                kind,
-                name,
-                model,
-                status,
-                depth,
-                now,
-                now,
-            ),
+        return self._frames.new_frame(
+            parent_id=parent_id,
+            project_id=project_id,
+            kind=kind,
+            name=name,
+            model=model,
+            depth=depth,
+            status=status,
         )
-        return frame_id
 
-    def _root_of(self, parent_id: str, fallback: str) -> str:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT root_frame_id FROM frames WHERE frame_id=?", (parent_id,)
-            ).fetchone()
-        return row["root_frame_id"] if row and row["root_frame_id"] else fallback
+    def resolve_frame_scope(
+        self,
+        frame_id: str | None,
+        *,
+        fallback_project: str = "default",
+    ) -> dict:
+        return self._frames.resolve_frame_scope(
+            frame_id,
+            fallback_project=fallback_project,
+        )
 
     def update_frame(self, frame_id: str, **fields: Any) -> None:
-        if not fields:
-            return
-        fields["updated_at"] = _now_ms()
-        cols = ", ".join(f"{k}=?" for k in fields)
-        self._exec(
-            f"UPDATE frames SET {cols} WHERE frame_id=?", (*fields.values(), frame_id)
-        )
+        self._frames.update_frame(frame_id, **fields)
 
     def add_frame_tokens(
         self,
@@ -541,14 +897,12 @@ class Store:
         output_tokens: int = 0,
         cost_usd: float = 0.0,
     ) -> None:
-        with self._lock:
-            self._conn.execute(
-                "UPDATE frames SET input_tokens=COALESCE(input_tokens,0)+?,"
-                "output_tokens=COALESCE(output_tokens,0)+?,"
-                "cost_usd=COALESCE(cost_usd,0)+?,updated_at=? WHERE frame_id=?",
-                (input_tokens, output_tokens, cost_usd, _now_ms(), frame_id),
-            )
-            self._conn.commit()
+        self._frames.add_frame_tokens(
+            frame_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_usd=cost_usd,
+        )
 
     # --- projects --------------------------------------------------------
     def create_project(
@@ -560,211 +914,139 @@ class Store:
         project_id: str | None = None,
         is_example: bool = False,
     ) -> dict:
-        pid = project_id or f"proj_{uuid.uuid4().hex[:12]}"
-        now = _now_ms()
-        self._exec(
-            "INSERT OR REPLACE INTO projects(project_id,name,description,context,"
-            "is_example,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-            (pid, name, description, context, 1 if is_example else 0, now, now),
+        return self._frames.create_project(
+            name=name,
+            description=description,
+            context=context,
+            project_id=project_id,
+            is_example=is_example,
         )
-        return self.get_project(pid) or {}
 
     def get_project(self, project_id: str) -> dict | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM projects WHERE project_id=?", (project_id,)
-            ).fetchone()
-        return dict(row) if row else None
+        return self._frames.get_project(project_id)
 
     def update_project(self, project_id: str, **fields: Any) -> None:
-        if not fields:
-            return
-        fields["updated_at"] = _now_ms()
-        cols = ", ".join(f"{k}=?" for k in fields)
-        self._exec(
-            f"UPDATE projects SET {cols} WHERE project_id=?",
-            (*fields.values(), project_id),
-        )
+        self._frames.update_project(project_id, **fields)
 
     def delete_project(self, project_id: str) -> dict:
-        """Cascade-delete a project and everything it owns: frames, messages,
-        cells, artifacts + versions, lineage edges, folders, notes, memories,
-        compaction archives, host-call log rows and per-message feedback. Returns
-        {"stale_paths": [...], "frame_ids": [...]} so the caller can free the
-        artifact files AND the session workspace dirs from disk (M1)."""
-        with self._lock:
-            cur = self._conn
-            frame_ids = [
-                r["frame_id"]
-                for r in cur.execute(
-                    "SELECT frame_id FROM frames WHERE project_id=?", (project_id,)
-                ).fetchall()
-            ]
-            # every version path (live workspace files + immutable snapshots)
-            stale_paths = [
-                r["path"]
-                for r in cur.execute(
-                    "SELECT v.path FROM artifact_versions v JOIN artifacts a "
-                    "ON v.artifact_id=a.artifact_id WHERE a.project_id=? AND v.path IS NOT NULL",
-                    (project_id,),
-                ).fetchall()
-            ]
-            # lineage edges keyed by the project's version ids (frame_id is often
-            # NULL, so filtering by frame_id alone orphans rows) — delete by version
-            cur.execute(
-                "DELETE FROM lineage_edges WHERE input_version_id IN "
-                "(SELECT version_id FROM artifact_versions WHERE artifact_id IN "
-                "(SELECT artifact_id FROM artifacts WHERE project_id=?)) "
-                "OR output_version_id IN "
-                "(SELECT version_id FROM artifact_versions WHERE artifact_id IN "
-                "(SELECT artifact_id FROM artifacts WHERE project_id=?))",
-                (project_id, project_id),
-            )
-            cur.execute(
-                "DELETE FROM artifact_versions WHERE artifact_id IN "
-                "(SELECT artifact_id FROM artifacts WHERE project_id=?)",
-                (project_id,),
-            )
-            cur.execute("DELETE FROM artifacts WHERE project_id=?", (project_id,))
-            if frame_ids:
-                qmarks = ",".join("?" * len(frame_ids))
-                cur.execute(
-                    f"DELETE FROM messages WHERE root_frame_id IN ({qmarks})", frame_ids
-                )
-                cur.execute(
-                    f"DELETE FROM execution_log WHERE root_frame_id IN ({qmarks})"
-                    f" OR frame_id IN ({qmarks})",
-                    frame_ids + frame_ids,
-                )
-                cur.execute(
-                    f"DELETE FROM host_call_log WHERE frame_id IN ({qmarks})", frame_ids
-                )
-                cur.execute(
-                    f"DELETE FROM frame_steps WHERE frame_id IN ({qmarks})", frame_ids
-                )
-                cur.execute(
-                    f"DELETE FROM plans WHERE frame_id IN ({qmarks})", frame_ids
-                )
-                cur.execute(
-                    f"DELETE FROM annotations WHERE root_frame_id IN ({qmarks})",
-                    frame_ids,
-                )
-                # per-message feedback lives in settings as fb:<frame>:<key>
-                for fid in frame_ids:
-                    cur.execute(
-                        "DELETE FROM settings WHERE key LIKE ?", (f"fb:{fid}:%",)
-                    )
-                    cur.execute(
-                        "DELETE FROM permission_rules WHERE scope='conversation' "
-                        "AND scope_id=?",
-                        (fid,),
-                    )
-            cur.execute(
-                "DELETE FROM permission_rules WHERE scope='project' AND scope_id=?",
-                (project_id,),
-            )
-            cur.execute("DELETE FROM frames WHERE project_id=?", (project_id,))
-            cur.execute("DELETE FROM folders WHERE project_id=?", (project_id,))
-            cur.execute("DELETE FROM notes WHERE project_id=?", (project_id,))
-            cur.execute("DELETE FROM memories WHERE project_id=?", (project_id,))
-            cur.execute(
-                "DELETE FROM compaction_archives WHERE project_id=?", (project_id,)
-            )
-            cur.execute("DELETE FROM projects WHERE project_id=?", (project_id,))
-            self._conn.commit()
-        return {"stale_paths": stale_paths, "frame_ids": frame_ids}
+        return self._frames.delete_project(project_id)
+
+    def project_session_ids(self, project_id: str) -> list[str]:
+        return self._frames.project_session_ids(project_id)
 
     def list_projects(self) -> list[dict]:
-        """Projects with derived conversation_count + last_active_at."""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM projects ORDER BY updated_at DESC"
-            ).fetchall()
-            out = []
-            for r in rows:
-                d = dict(r)
-                agg = self._conn.execute(
-                    "SELECT COUNT(*) AS n, MAX(updated_at) AS last FROM frames "
-                    "WHERE project_id=? AND parent_id IS NULL",
-                    (d["project_id"],),
-                ).fetchone()
-                d["conversation_count"] = agg["n"] or 0
-                d["last_active_at"] = agg["last"] or d["updated_at"]
-                out.append(d)
-        return out
+        return self._frames.list_projects()
 
     # --- messages --------------------------------------------------------
     def add_message(
         self,
         *,
         root_frame_id: str,
+        branch_id: str | None = None,
         role: str,
         content: str,
         frame_id: str | None = None,
         metadata: dict | None = None,
         created_at: int | None = None,
     ) -> dict:
-        # `created_at` may be back-dated so a message stamps to the moment its
-        # content was produced (e.g. a mid-turn prose block persisted at turn
-        # end) — this keeps it correctly interleaved with the frame's steps,
-        # which the UI orders by timestamp. Defaults to now.
-        now = created_at if created_at is not None else _now_ms()
-        mid = f"m-{uuid.uuid4().hex[:12]}"
-        with self._lock:
-            seq = self._conn.execute(
-                "SELECT COALESCE(MAX(seq),-1)+1 AS s FROM messages WHERE root_frame_id=?",
-                (root_frame_id,),
-            ).fetchone()["s"]
-            self._conn.execute(
-                "INSERT INTO messages(message_id,root_frame_id,frame_id,seq,role,"
-                "content,metadata,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                (
-                    mid,
-                    root_frame_id,
-                    frame_id,
-                    seq,
-                    role,
-                    content,
-                    json.dumps(metadata, ensure_ascii=False) if metadata else None,
-                    now,
-                ),
-            )
-            self._conn.commit()
-        return {
-            "message_id": mid,
-            "root_frame_id": root_frame_id,
-            "seq": seq,
-            "role": role,
-            "content": content,
-            "created_at": now,
-        }
+        return self._frames.add_message(
+            root_frame_id=root_frame_id,
+            branch_id=branch_id,
+            role=role,
+            content=content,
+            frame_id=frame_id,
+            metadata=metadata,
+            created_at=created_at,
+        )
 
     def list_messages(
-        self, root_frame_id: str, *, start: int = 0, limit: int = 300
+        self,
+        root_frame_id: str,
+        *,
+        branch_id: str | None = None,
+        start: int = 0,
+        limit: int | None = 300,
     ) -> list[dict]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT role,content,metadata,created_at,seq FROM messages "
-                "WHERE root_frame_id=? ORDER BY seq ASC LIMIT ? OFFSET ?",
-                (root_frame_id, limit, start),
-            ).fetchall()
-        return [dict(r) for r in rows]
+        return self._frames.list_messages(
+            root_frame_id,
+            branch_id=branch_id,
+            start=start,
+            limit=limit,
+        )
+
+    def list_message_boundaries(
+        self,
+        root_frame_id: str,
+        *,
+        branch_id: str | None = None,
+        start: int = 0,
+        limit: int | None = 300,
+    ) -> list[dict]:
+        return self._frames.list_message_boundaries(
+            root_frame_id,
+            branch_id=branch_id,
+            start=start,
+            limit=limit,
+        )
+
+    def list_branch_messages(
+        self,
+        root_frame_id: str,
+        *,
+        branch_id: str | None = None,
+        start: int = 0,
+        limit: int | None = 300,
+        boundaries: bool = False,
+    ) -> list[dict]:
+        """Project one branch's visible conversation without deleting rows."""
+
+        reader = (
+            self._frames.list_message_boundaries
+            if boundaries
+            else self._frames.list_messages
+        )
+        projected = project_branch_records(
+            self,
+            root_frame_id,
+            branch_id or self.active_session_branch(root_frame_id),
+            list_local=lambda selected: reader(
+                root_frame_id,
+                branch_id=selected,
+                limit=None,
+            ),
+            record_position=lambda message: int(message.get("seq") or 0),
+            cursor_key="message_cursor",
+            normalize_cursor=count_cursor,
+        )
+        start = max(0, int(start))
+        if limit is None:
+            return projected[start:]
+        return projected[start : start + max(0, int(limit))]
+
+    def list_branch_message_boundaries(
+        self,
+        root_frame_id: str,
+        *,
+        branch_id: str | None = None,
+        start: int = 0,
+        limit: int | None = 300,
+    ) -> list[dict]:
+        return self.list_branch_messages(
+            root_frame_id,
+            branch_id=branch_id,
+            start=start,
+            limit=limit,
+            boundaries=True,
+        )
 
     def message_count(self, root_frame_id: str) -> int:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM messages WHERE root_frame_id=?",
-                (root_frame_id,),
-            ).fetchone()
-        return row["n"] or 0
+        return self._frames.message_count(root_frame_id)
 
     def cell_count(self, root_frame_id: str) -> int:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM execution_log WHERE root_frame_id=?",
-                (root_frame_id,),
-            ).fetchone()
-        return row["n"] or 0
+        return self._frames.cell_count(root_frame_id)
+
+    def latest_state_revision(self, root_frame_id: str) -> int:
+        return self._frames.latest_state_revision(root_frame_id)
 
     # --- semantic activity steps (plan / search / env / skill / edit / …) ----
     # Every visible host.* tool call becomes a persisted "step" so a reopened
@@ -779,32 +1061,14 @@ class Store:
         input: dict | None = None,
         status: str = "running",
     ) -> dict:
-        now = _now_ms()
-        with self._lock:
-            seq = self._conn.execute(
-                "SELECT COALESCE(MAX(seq),-1)+1 AS s FROM frame_steps WHERE frame_id=?",
-                (frame_id,),
-            ).fetchone()["s"]
-            self._conn.execute(
-                "INSERT INTO frame_steps(step_id,frame_id,seq,kind,title,input,"
-                "output,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (
-                    step_id,
-                    frame_id,
-                    seq,
-                    kind,
-                    title,
-                    json.dumps(input, ensure_ascii=False, default=str)
-                    if input is not None
-                    else None,
-                    None,
-                    status,
-                    now,
-                    now,
-                ),
-            )
-            self._conn.commit()
-        return {"step_id": step_id, "seq": seq, "created_at": now}
+        return self._frames.add_step(
+            step_id=step_id,
+            frame_id=frame_id,
+            kind=kind,
+            title=title,
+            input=input,
+            status=status,
+        )
 
     def update_step(
         self,
@@ -815,47 +1079,21 @@ class Store:
         title: str | None = None,
         summary: str | None = None,
     ) -> None:
-        now = _now_ms()
-        sets, params = [], []
-        if status is not None:
-            sets.append("status=?")
-            params.append(status)
-        if title is not None:
-            sets.append("title=?")
-            params.append(title)
-        if summary is not None:
-            sets.append("summary=?")
-            params.append(summary)
-        if output is not None:
-            sets.append("output=?")
-            params.append(json.dumps(output, ensure_ascii=False, default=str))
-        sets.append("updated_at=?")
-        params.append(now)
-        params.append(step_id)
-        with self._lock:
-            self._conn.execute(
-                f"UPDATE frame_steps SET {','.join(sets)} WHERE step_id=?", params
-            )
-            self._conn.commit()
+        self._frames.update_step(
+            step_id,
+            status=status,
+            output=output,
+            title=title,
+            summary=summary,
+        )
 
-    def list_steps(self, frame_id: str, *, limit: int = 800) -> list[dict]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT step_id,seq,kind,title,summary,input,output,status,created_at "
-                "FROM frame_steps WHERE frame_id=? ORDER BY seq ASC LIMIT ?",
-                (frame_id, limit),
-            ).fetchall()
-        out = []
-        for r in rows:
-            d = dict(r)
-            for k in ("input", "output"):
-                if d.get(k):
-                    try:
-                        d[k] = json.loads(d[k])
-                    except (ValueError, TypeError):
-                        pass
-            out.append(d)
-        return out
+    def list_steps(
+        self, frame_id: str, *, start: int = 0, limit: int = 800
+    ) -> list[dict]:
+        return self._frames.list_steps(frame_id, start=start, limit=limit)
+
+    def step_count(self, frame_id: str) -> int:
+        return self._frames.step_count(frame_id)
 
     # --- frame browse / detail / search --------------------------
     def browse_frames(
@@ -866,101 +1104,30 @@ class Store:
         roots_only: bool = True,
         limit: int = 50,
     ) -> list[dict]:
-        clauses, params = [], []
-        if project_id and project_id != "all":
-            clauses.append("project_id=?")
-            params.append(project_id)
-        if status:
-            clauses.append("status=?")
-            params.append(status)
-        if roots_only:
-            clauses.append("parent_id IS NULL")
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT frame_id,parent_id,root_frame_id,project_id,kind,name,"
-                "task_summary,model,status,depth,input_tokens,output_tokens,"
-                "cost_usd,created_at,updated_at FROM frames"
-                + where
-                + " ORDER BY created_at DESC LIMIT ?",
-                (*params, limit),
-            ).fetchall()
-        return [dict(r) for r in rows]
+        return self._frames.browse_frames(
+            project_id=project_id,
+            status=status,
+            roots_only=roots_only,
+            limit=limit,
+        )
 
     def frame_detail(
         self, frame_id: str, *, page: int = 0, page_size: int = 50
     ) -> dict | None:
-        """Detail view: frame meta + its cells oldest-first (latest = last page).
-
-        Newest activity is on the LAST page: to find the most
-        recent `[delegate]` dispatch line you must page to the end.
-        """
-        with self._lock:
-            frow = self._conn.execute(
-                "SELECT * FROM frames WHERE frame_id=?", (frame_id,)
-            ).fetchone()
-            if frow is None:
-                return None
-            total = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM execution_log WHERE frame_id=?", (frame_id,)
-            ).fetchone()["n"]
-            cells = self._conn.execute(
-                "SELECT producing_cell_id,cell_seq,origin,code,stdout,stderr,"
-                "error,interrupted,wall_s,cpu_s,created_at FROM execution_log "
-                "WHERE frame_id=? ORDER BY created_at ASC LIMIT ? OFFSET ?",
-                (frame_id, page_size, page * page_size),
-            ).fetchall()
-            children = self._conn.execute(
-                "SELECT frame_id,kind,name,status,depth FROM frames "
-                "WHERE parent_id=? ORDER BY created_at ASC",
-                (frame_id,),
-            ).fetchall()
-        n_pages = max(1, (total + page_size - 1) // page_size)
-        return {
-            "frame": dict(frow),
-            "cells": [dict(c) for c in cells],
-            "children": [dict(c) for c in children],
-            "page": page,
-            "page_size": page_size,
-            "n_pages": n_pages,
-            "total_cells": total,
-            "last_page": page >= n_pages - 1,
-        }
+        return self._frames.frame_detail(
+            frame_id,
+            page=page,
+            page_size=page_size,
+        )
 
     def search_frames(
         self, pattern: str, *, project_id: str | None = "default", limit: int = 50
     ) -> list[dict]:
-        """Regex search over frame name + its cells' code/stdout."""
-        rx = re.compile(pattern, re.IGNORECASE)
-        clauses, params = [], []
-        if project_id and project_id != "all":
-            clauses.append("f.project_id=?")
-            params.append(project_id)
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT DISTINCT f.frame_id,f.kind,f.name,f.status,f.depth,"
-                "f.project_id,f.created_at FROM frames f "
-                "LEFT JOIN execution_log e ON e.frame_id=f.frame_id"
-                + where
-                + " ORDER BY f.created_at DESC",
-                tuple(params),
-            ).fetchall()
-            out = []
-            for r in rows:
-                hay = [r["name"] or ""]
-                cells = self._conn.execute(
-                    "SELECT code,stdout FROM execution_log WHERE frame_id=?",
-                    (r["frame_id"],),
-                ).fetchall()
-                for c in cells:
-                    hay.append(c["code"] or "")
-                    hay.append(c["stdout"] or "")
-                if rx.search("\n".join(hay)):
-                    out.append(dict(r))
-                if len(out) >= limit:
-                    break
-        return out
+        return self._frames.search_frames(
+            pattern,
+            project_id=project_id,
+            limit=limit,
+        )
 
     # --- execution_log ---------------------------------------------------
     def log_cell(
@@ -974,204 +1141,587 @@ class Store:
         project_id: str = "default",
         root_frame_id: str | None = None,
         cell_index: int | None = None,
+        state_revision: int | None = None,
         kernel_id: str = "python",
         language: str = "python",
+        visibility: str | None = None,
+        pin: bool = False,
+        replay_policy: str | None = None,
         figures: list | None = None,
         files_read: list | None = None,
         files_written: list | None = None,
     ) -> str:
-        cell_id = result.get("id") or f"c-{uuid.uuid4().hex[:12]}"
-        usage = result.get("usage") or {}
-        status = (
-            "error"
-            if result.get("error")
-            else ("interrupted" if result.get("interrupted") else "ok")
+        return self._frames.log_cell(
+            frame_id=frame_id,
+            code=code,
+            result=result,
+            origin=origin,
+            cell_seq=cell_seq,
+            project_id=project_id,
+            root_frame_id=root_frame_id,
+            cell_index=cell_index,
+            state_revision=state_revision,
+            kernel_id=kernel_id,
+            language=language,
+            visibility=visibility,
+            pin=pin,
+            replay_policy=replay_policy,
+            figures=figures,
+            files_read=files_read,
+            files_written=files_written,
         )
-        self._exec(
-            "INSERT OR REPLACE INTO execution_log(producing_cell_id,frame_id,"
-            "root_frame_id,project_id,cell_seq,cell_index,kernel_id,language,"
-            "status,origin,code,stdout,stderr,error,figures,files_read,"
-            "files_written,interrupted,wall_s,cpu_s,peak_rss_kb,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                cell_id,
-                frame_id,
-                root_frame_id,
-                project_id,
-                cell_seq,
-                cell_index,
-                kernel_id,
-                language,
-                status,
-                origin,
-                code,
-                result.get("stdout"),
-                result.get("stderr"),
-                result.get("error"),
-                json.dumps(figures or [], ensure_ascii=False),
-                json.dumps(files_read or [], ensure_ascii=False),
-                json.dumps(files_written or [], ensure_ascii=False),
-                1 if result.get("interrupted") else 0,
-                usage.get("wall_s"),
-                usage.get("cpu_s"),
-                usage.get("peak_rss_kb"),
-                _now_ms(),
-            ),
-        )
-        return cell_id
 
-    def list_cells(self, root_frame_id: str) -> list[dict]:
-        """Notebook execution log for a session (oldest first)."""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT producing_cell_id,cell_index,kernel_id,language,status,"
-                "code,stdout,stderr,error,figures,files_read,files_written,"
-                "cpu_s,peak_rss_kb,created_at FROM execution_log "
-                "WHERE root_frame_id=? ORDER BY created_at ASC",
-                (root_frame_id,),
-            ).fetchall()
-        out = []
-        for r in rows:
-            d = dict(r)
-            for k in ("figures", "files_read", "files_written"):
-                try:
-                    d[k] = json.loads(d.get(k) or "[]")
-                except (TypeError, ValueError):
-                    d[k] = []
-            out.append(d)
-        return out
+    def list_cells(
+        self, root_frame_id: str, *, branch_id: str | None = None
+    ) -> list[dict]:
+        return self._frames.list_cells(root_frame_id, branch_id=branch_id)
 
     def cell_detail(self, producing_cell_id: str) -> dict | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM execution_log WHERE producing_cell_id=?",
-                (producing_cell_id,),
-            ).fetchone()
-        if not row:
-            return None
-        d = dict(row)
-        for k in ("figures", "files_read", "files_written"):
-            try:
-                d[k] = json.loads(d.get(k) or "[]")
-            except (TypeError, ValueError):
-                d[k] = []
-        return d
+        return self._frames.cell_detail(producing_cell_id)
 
-    def delete_frame(self, frame_id: str) -> None:
-        """Delete a session (root frame) and its descendants + messages/cells."""
-        with self._lock:
-            self._conn.execute(
-                "DELETE FROM messages WHERE root_frame_id=?", (frame_id,)
-            )
-            self._conn.execute(
-                "DELETE FROM execution_log WHERE root_frame_id=? OR frame_id=?",
-                (frame_id, frame_id),
-            )
-            self._conn.execute("DELETE FROM frame_steps WHERE frame_id=?", (frame_id,))
-            self._conn.execute("DELETE FROM plans WHERE frame_id=?", (frame_id,))
-            self._conn.execute(
-                "DELETE FROM annotations WHERE root_frame_id=?", (frame_id,)
-            )
-            self._conn.execute(
-                "DELETE FROM permission_rules WHERE scope='conversation' AND scope_id=?",
-                (frame_id,),
-            )
-            self._conn.execute(
-                "DELETE FROM frames WHERE frame_id=? OR root_frame_id=?",
-                (frame_id, frame_id),
-            )
-            self._conn.commit()
+    # --- canonical action ledger ---------------------------------------
+    def append_action_group(
+        self,
+        *,
+        root_frame_id: str,
+        turn_id: str,
+        kind: str,
+        branch_id: str | None = None,
+        ordinal: int | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        wire_state: Any = None,
+        assistant_content: str | None = None,
+        assistant_message: Any = None,
+        usage: dict[str, Any] | None = None,
+        cost_usd: float | None = None,
+        group_id: str | None = None,
+        created_at: int | None = None,
+    ) -> dict:
+        return self._actions.append_group(
+            root_frame_id=root_frame_id,
+            branch_id=branch_id,
+            turn_id=turn_id,
+            ordinal=ordinal,
+            kind=kind,
+            provider=provider,
+            model=model,
+            wire_state=wire_state,
+            assistant_content=assistant_content,
+            assistant_message=assistant_message,
+            usage=usage,
+            cost_usd=cost_usd,
+            group_id=group_id,
+            created_at=created_at,
+        )
+
+    def append_action_event(
+        self,
+        *,
+        group_id: str,
+        type: str,
+        sequence: int | None = None,
+        action_id: str | None = None,
+        tool_call_id: str | None = None,
+        wire_id: str | None = None,
+        canonical_arguments: Any = None,
+        raw_arguments: Any = None,
+        result: Any = None,
+        side_effect_class: str | None = None,
+        resource_keys: list[str] | tuple[str, ...] | None = None,
+        event_id: str | None = None,
+        created_at: int | None = None,
+    ) -> dict:
+        return self._actions.append_event(
+            group_id=group_id,
+            type=type,
+            sequence=sequence,
+            action_id=action_id,
+            tool_call_id=tool_call_id,
+            wire_id=wire_id,
+            canonical_arguments=canonical_arguments,
+            raw_arguments=raw_arguments,
+            result=result,
+            side_effect_class=side_effect_class,
+            resource_keys=resource_keys,
+            event_id=event_id,
+            created_at=created_at,
+        )
+
+    def append_tool_action_group(
+        self,
+        *,
+        root_frame_id: str,
+        turn_id: str,
+        events: list[dict[str, Any]],
+        branch_id: str | None = None,
+        ordinal: int | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        wire_state: Any = None,
+        assistant_content: str | None = None,
+        assistant_message: Any = None,
+        usage: dict[str, Any] | None = None,
+        cost_usd: float | None = None,
+        group_id: str | None = None,
+        created_at: int | None = None,
+    ) -> dict:
+        return self._actions.append_tool_group(
+            root_frame_id=root_frame_id,
+            branch_id=branch_id,
+            turn_id=turn_id,
+            events=events,
+            ordinal=ordinal,
+            provider=provider,
+            model=model,
+            wire_state=wire_state,
+            assistant_content=assistant_content,
+            assistant_message=assistant_message,
+            usage=usage,
+            cost_usd=cost_usd,
+            group_id=group_id,
+            created_at=created_at,
+        )
+
+    def get_action_group(
+        self, group_id: str, *, include_events: bool = True
+    ) -> dict | None:
+        return self._actions.get_group(group_id, include_events=include_events)
+
+    def list_action_groups(
+        self,
+        root_frame_id: str,
+        *,
+        branch_id: str | None = None,
+        turn_id: str | None = None,
+        after_ordinal: int | None = None,
+        limit: int | None = None,
+        include_events: bool = True,
+    ) -> list[dict]:
+        return self._actions.list_groups(
+            root_frame_id,
+            branch_id=branch_id,
+            turn_id=turn_id,
+            after_ordinal=after_ordinal,
+            limit=limit,
+            include_events=include_events,
+        )
+
+    def list_action_events(self, group_id: str) -> list[dict]:
+        return self._actions.list_events(group_id)
+
+    def allocate_execution_attempt(
+        self,
+        *,
+        group_id: str,
+        producing_cell_id: str,
+        state_revision: int | None = None,
+        generation_id: str | None = None,
+        owner_instance_id: str | None = None,
+        replayed_from_cell_id: str | None = None,
+        attempt_ordinal: int | None = None,
+        attempt_id: str | None = None,
+        allocated_at: int | None = None,
+    ) -> dict:
+        return self._actions.allocate_attempt(
+            group_id=group_id,
+            producing_cell_id=producing_cell_id,
+            state_revision=state_revision,
+            generation_id=generation_id,
+            owner_instance_id=owner_instance_id,
+            replayed_from_cell_id=replayed_from_cell_id,
+            attempt_ordinal=attempt_ordinal,
+            attempt_id=attempt_id,
+            allocated_at=allocated_at,
+        )
+
+    def mark_execution_attempt_started(
+        self, attempt_id: str, *, started_at: int | None = None
+    ) -> dict:
+        return self._actions.mark_attempt_started(attempt_id, started_at=started_at)
+
+    def bind_execution_attempt_generation(
+        self, attempt_id: str, generation_id: str
+    ) -> dict:
+        return self._actions.bind_attempt_generation(attempt_id, generation_id)
+
+    def abandon_incomplete_execution_attempts(
+        self,
+        *,
+        owner_instance_id: str,
+        finished_at: int | None = None,
+    ) -> int:
+        return self._actions.abandon_incomplete_attempts(
+            owner_instance_id=owner_instance_id,
+            finished_at=finished_at,
+        )
+
+    def mark_execution_attempt_response(
+        self, attempt_id: str, *, response_at: int | None = None
+    ) -> dict:
+        return self._actions.mark_attempt_response(attempt_id, response_at=response_at)
+
+    def mark_execution_attempt_capture(
+        self, attempt_id: str, *, capture_at: int | None = None
+    ) -> dict:
+        return self._actions.mark_attempt_capture(attempt_id, capture_at=capture_at)
+
+    def finish_execution_attempt(
+        self,
+        attempt_id: str,
+        *,
+        terminal_state: str,
+        error: Any = None,
+        finished_at: int | None = None,
+    ) -> dict:
+        return self._actions.finish_attempt(
+            attempt_id,
+            terminal_state=terminal_state,
+            error=error,
+            finished_at=finished_at,
+        )
+
+    def get_execution_attempt(self, attempt_id: str) -> dict | None:
+        return self._actions.get_attempt(attempt_id)
+
+    def list_execution_attempts(
+        self,
+        *,
+        group_id: str | None = None,
+        producing_cell_id: str | None = None,
+        root_frame_id: str | None = None,
+        branch_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> list[dict]:
+        return self._actions.list_attempts(
+            group_id=group_id,
+            producing_cell_id=producing_cell_id,
+            root_frame_id=root_frame_id,
+            branch_id=branch_id,
+            turn_id=turn_id,
+        )
+
+    # --- persistent kernel generations --------------------------------
+    def create_kernel_generation(self, **fields: Any) -> dict:
+        return self._kernel_generations.create(**fields)
+
+    def touch_kernel_generation(self, generation_id: str, **fields: Any) -> dict:
+        return self._kernel_generations.touch(generation_id, **fields)
+
+    def compare_and_swap_kernel_bootstrap(
+        self,
+        generation_id: str,
+        *,
+        expected_manifest_id: str | None,
+        bootstrap: Any,
+        at: int | None = None,
+    ) -> dict | None:
+        return self._kernel_generations.compare_and_swap_bootstrap(
+            generation_id,
+            expected_manifest_id=expected_manifest_id,
+            bootstrap=bootstrap,
+            at=at,
+        )
+
+    def finish_kernel_generation(
+        self,
+        generation_id: str,
+        *,
+        state: str,
+        reason: str,
+        ended_at: int | None = None,
+    ) -> dict:
+        return self._kernel_generations.finish(
+            generation_id,
+            state=state,
+            reason=reason,
+            ended_at=ended_at,
+        )
+
+    def abandon_live_kernel_generations(
+        self,
+        *,
+        owner_instance_id: str,
+        reason: str = "daemon_restart",
+        ended_at: int | None = None,
+    ) -> int:
+        return self._kernel_generations.abandon_live(
+            owner_instance_id=owner_instance_id,
+            reason=reason,
+            ended_at=ended_at,
+        )
+
+    def get_kernel_generation(self, generation_id: str) -> dict | None:
+        return self._kernel_generations.get(generation_id)
+
+    def latest_kernel_generation(
+        self,
+        root_frame_id: str,
+        language: str,
+        *,
+        branch_id: str | None = None,
+    ) -> dict | None:
+        return self._kernel_generations.latest(
+            root_frame_id,
+            language,
+            branch_id=branch_id,
+        )
+
+    def list_kernel_generations(
+        self,
+        root_frame_id: str,
+        *,
+        language: str | None = None,
+        branch_id: str | None = None,
+    ) -> list[dict]:
+        return self._kernel_generations.list(
+            root_frame_id,
+            language=language,
+            branch_id=branch_id,
+        )
+
+    # --- immutable session checkpoints / branches ----------------------
+    def ensure_session_branch(self, **fields: Any) -> dict:
+        return self._session_snapshots.ensure_branch(**fields)
+
+    def create_session_checkpoint(self, **fields: Any) -> dict:
+        return self._session_snapshots.create_checkpoint(**fields)
+
+    def get_checkpoint_state_snapshot(
+        self,
+        checkpoint_id: str,
+        *,
+        include_state: bool = False,
+    ) -> dict | None:
+        return self._checkpoint_states.get(
+            checkpoint_id,
+            include_state=include_state,
+        )
+
+    def list_checkpoint_state_snapshots(
+        self,
+        root_frame_id: str,
+        *,
+        branch_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        return self._checkpoint_states.list(
+            root_frame_id,
+            branch_id=branch_id,
+            limit=limit,
+        )
+
+    def import_quarantined_checkpoint_state(
+        self,
+        source: dict,
+        *,
+        checkpoint_id: str,
+        root_frame_id: str,
+        branch_id: str,
+        project_id: str,
+        artifact_id_map: dict[str, str] | None = None,
+        source_checkpoint_id: str | None = None,
+    ) -> dict:
+        return self._checkpoint_states.import_quarantined_snapshot(
+            source,
+            checkpoint_id=checkpoint_id,
+            root_frame_id=root_frame_id,
+            branch_id=branch_id,
+            project_id=project_id,
+            artifact_id_map=artifact_id_map,
+            source_checkpoint_id=source_checkpoint_id,
+        )
+
+    def validate_checkpoint_state_import(
+        self,
+        source: dict,
+        *,
+        include_state: bool = False,
+    ) -> dict:
+        return self._checkpoint_states.validate_checkpoint_state_import(
+            source,
+            include_state=include_state,
+        )
+
+    def restore_checkpoint_state_snapshot(
+        self,
+        *,
+        checkpoint_id: str,
+        root_frame_id: str,
+        project_id: str,
+    ) -> dict:
+        """Restore only the structured plan/review/memory projection.
+
+        Normal branch activation calls the same repository inside its broader
+        atomic publication transaction.  This narrow facade exists for repair
+        tooling and direct repository contract tests.
+        """
+
+        return self._checkpoint_states.restore_checkpoint(
+            checkpoint_id=checkpoint_id,
+            root_frame_id=root_frame_id,
+            project_id=project_id,
+        )
+
+    def fork_session_branch(self, **fields: Any) -> dict:
+        return self._session_snapshots.fork_branch(**fields)
+
+    def get_session_checkpoint(self, checkpoint_id: str) -> dict | None:
+        return self._session_snapshots.get_checkpoint(checkpoint_id)
+
+    def get_session_checkpoint_for_source(
+        self,
+        root_frame_id: str,
+        *,
+        source_kind: str,
+        source_id: str,
+    ) -> dict | None:
+        return self._session_snapshots.get_checkpoint_for_source(
+            root_frame_id,
+            source_kind=source_kind,
+            source_id=source_id,
+        )
+
+    def session_checkpoint_source_map(
+        self, root_frame_id: str, *, source_kind: str
+    ) -> dict[str, str]:
+        return self._session_snapshots.checkpoint_source_map(
+            root_frame_id,
+            source_kind=source_kind,
+        )
+
+    def list_session_checkpoints(
+        self,
+        root_frame_id: str,
+        *,
+        branch_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        return self._session_snapshots.list_checkpoints(
+            root_frame_id,
+            branch_id=branch_id,
+            limit=limit,
+        )
+
+    def retained_workspace_tree_ids(self) -> tuple[str, ...]:
+        return self._session_snapshots.retained_tree_ids()
+
+    def get_session_branch(self, branch_id: str) -> dict | None:
+        return self._session_snapshots.get_branch(branch_id)
+
+    def list_session_branches(self, root_frame_id: str) -> list[dict]:
+        return self._session_snapshots.list_branches(root_frame_id)
+
+    def ensure_active_session_branch(self, root_frame_id: str) -> str:
+        return self._session_activation.ensure(root_frame_id)
+
+    def active_session_branch(self, root_frame_id: str) -> str:
+        return self._session_activation.current(root_frame_id)
+
+    def activate_session_branch_checkpoint(self, **fields: Any) -> dict:
+        return self._session_activation.activate_checkpoint(**fields)
+
+    def record_snapshot_operation(self, **fields: Any) -> dict:
+        return self._session_snapshots.record_operation(**fields)
+
+    def get_snapshot_operation(self, operation_id: str) -> dict | None:
+        return self._session_snapshots.get_operation(operation_id)
+
+    def list_snapshot_operations(
+        self,
+        root_frame_id: str,
+        *,
+        branch_id: str | None = None,
+        kind: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        return self._session_snapshots.list_operations(
+            root_frame_id,
+            branch_id=branch_id,
+            kind=kind,
+            status=status,
+            limit=limit,
+        )
+
+    # --- append-only Kernel recovery journal ---------------------------
+    def append_recovery_event(self, **fields: Any) -> dict:
+        return self._recovery_journal.append(**fields)
+
+    def list_recovery_events(
+        self,
+        *,
+        recovery_id: str | None = None,
+        root_frame_id: str | None = None,
+        branch_id: str | None = None,
+        limit: int = 1000,
+        newest: bool = False,
+    ) -> list[dict]:
+        return self._recovery_journal.list(
+            recovery_id=recovery_id,
+            root_frame_id=root_frame_id,
+            branch_id=branch_id,
+            limit=limit,
+            newest=newest,
+        )
+
+    # --- durable sub-agent delegation projection ----------------------
+    def restore_delegation_tree(self, **fields: Any) -> dict:
+        return self._delegations.restore(**fields)
+
+    def reserve_delegation_children(self, **fields: Any) -> dict:
+        return self._delegations.reserve(**fields)
+
+    def release_delegation_budget(self, **fields: Any) -> dict:
+        return self._delegations.release(**fields)
+
+    def persist_delegation_child(self, **fields: Any) -> dict | None:
+        return self._delegations.persist_child(**fields)
+
+    def delegation_tree(self, root_frame_id: str) -> dict:
+        return self._delegations.project(root_frame_id)
+
+    def delegation_budget(self, root_frame_id: str) -> dict | None:
+        return self._delegations.budget(root_frame_id)
+
+    def delete_frame(self, frame_id: str) -> dict[str, Any]:
+        return self._frames.delete_frame(frame_id)
 
     def get_frame(self, frame_id: str) -> dict | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM frames WHERE frame_id=?", (frame_id,)
-            ).fetchone()
-        return dict(row) if row else None
+        return self._frames.get_frame(frame_id)
 
     def get_artifact(self, artifact_id: str) -> dict | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT a.*, v.size_bytes, v.checksum, v.path "
-                "FROM artifacts a LEFT JOIN artifact_versions v "
-                "ON a.latest_version_id=v.version_id WHERE a.artifact_id=?",
-                (artifact_id,),
-            ).fetchone()
-        return dict(row) if row else None
+        return self._artifacts.get_artifact(artifact_id)
 
     def delete_artifact(self, artifact_id: str) -> list[str]:
-        """Remove an artifact + its versions. Returns the on-disk paths that are
-        no longer referenced (caller may unlink them)."""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT path, snapshot_path FROM artifact_versions "
-                "WHERE artifact_id=?",
-                (artifact_id,),
-            ).fetchall()
-            # both the live path AND the immutable per-version snapshot are ours
-            # to reclaim once the artifact is gone
-            paths = {p for r in rows for p in (r["path"], r["snapshot_path"]) if p}
-            self._conn.execute(
-                "DELETE FROM artifact_versions WHERE artifact_id=?", (artifact_id,)
-            )
-            self._conn.execute(
-                "DELETE FROM artifacts WHERE artifact_id=?", (artifact_id,)
-            )
-            self._conn.execute(
-                "DELETE FROM annotations WHERE artifact_id=?", (artifact_id,)
-            )
-            self._conn.commit()
-            # keep any path a surviving version still references (as a live path or
-            # a snapshot) — checked AFTER deletion so only OTHER artifacts count
-            keep = set()
-            for p in paths:
-                if self._conn.execute(
-                    "SELECT 1 FROM artifact_versions "
-                    "WHERE path=? OR snapshot_path=? LIMIT 1",
-                    (p, p),
-                ).fetchone():
-                    keep.add(p)
-        return [p for p in paths if p not in keep]
+        return self._artifacts.delete_artifact(artifact_id)
 
     def rename_artifact(self, artifact_id: str, filename: str) -> None:
-        now = _now_ms()
-        with self._lock:
-            self._conn.execute(
-                "UPDATE artifacts SET filename=?, updated_at=? WHERE artifact_id=?",
-                (filename, now, artifact_id),
-            )
-            self._conn.execute(
-                "UPDATE artifact_versions SET filename=? WHERE artifact_id=?",
-                (filename, artifact_id),
-            )
-            self._conn.commit()
+        self._artifacts.rename_artifact(artifact_id, filename)
 
     def artifact_by_filename(
         self, filename: str, root_frame_id: str | None = None, *, strict: bool = False
     ) -> dict | None:
-        """Find an artifact by filename. With ``strict=True`` and a
-        ``root_frame_id``, ONLY match within that session (no cross-session
-        fallback) — used when versioning a re-written file so a common name like
-        ``figure_cell1_1.png`` isn't mistaken for another session's artifact."""
-        with self._lock:
-            if root_frame_id:
-                row = self._conn.execute(
-                    "SELECT artifact_id FROM artifacts WHERE filename=? AND "
-                    "root_frame_id=? ORDER BY created_at DESC LIMIT 1",
-                    (filename, root_frame_id),
-                ).fetchone()
-                if row:
-                    return self.get_artifact(row["artifact_id"])
-                if strict:
-                    return None
-            row = self._conn.execute(
-                "SELECT artifact_id FROM artifacts WHERE filename=? "
-                "ORDER BY created_at DESC LIMIT 1",
-                (filename,),
-            ).fetchone()
-        return self.get_artifact(row["artifact_id"]) if row else None
+        return self._artifacts.artifact_by_filename(
+            filename,
+            root_frame_id,
+            strict=strict,
+        )
 
     # --- artifacts -------------------------------------------------------
+    def _artifact_write_scope(
+        self,
+        *,
+        frame_id: str | None,
+        root_frame_id: str | None,
+        project_id: str | None,
+    ) -> tuple[bool, str | None, str]:
+        return self._artifacts.artifact_write_scope(
+            frame_id=frame_id,
+            root_frame_id=root_frame_id,
+            project_id=project_id,
+        )
+
     def save_artifact(
         self,
         *,
@@ -1182,256 +1732,128 @@ class Store:
         checksum: str | None,
         producing_cell_id: str | None = None,
         frame_id: str | None = None,
-        project_id: str = "default",
+        root_frame_id: str | None = None,
+        project_id: str | None = None,
         artifact_id: str | None = None,
         is_user_upload: bool = False,
         priority: int = 0,
         env_snapshot_id: str | None = None,
         snapshot_path: str | None = None,
     ) -> dict:
-        """Register a new artifact version. ``path`` is the (live, possibly
-        mutable) file; ``snapshot_path`` — when given — is an immutable per-version
-        copy of the bytes so version history survives later in-place overwrites of
-        ``path`` (see gateway._write_version_snapshot). The version row is written
-        before the artifact row is (re)pointed at it, both under one commit, so
-        ``latest_version_id`` never dangles."""
-        now = _now_ms()
-        version_id = f"v-{uuid.uuid4().hex[:12]}"
-        new_artifact = artifact_id is None
-        if new_artifact:
-            artifact_id = f"a-{uuid.uuid4().hex[:12]}"
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO artifact_versions(version_id,artifact_id,filename,"
-                "content_type,size_bytes,checksum,path,snapshot_path,"
-                "producing_cell_id,frame_id,created_at,env_snapshot_id) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    version_id,
-                    artifact_id,
-                    filename,
-                    content_type,
-                    size_bytes,
-                    checksum,
-                    path,
-                    snapshot_path,
-                    producing_cell_id,
-                    frame_id,
-                    now,
-                    env_snapshot_id,
-                ),
-            )
-            if new_artifact:
-                self._conn.execute(
-                    "INSERT INTO artifacts(artifact_id,project_id,root_frame_id,"
-                    "filename,content_type,is_user_upload,priority,"
-                    "latest_version_id,created_at,updated_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        artifact_id,
-                        project_id,
-                        frame_id,
-                        filename,
-                        content_type,
-                        1 if is_user_upload else 0,
-                        priority,
-                        version_id,
-                        now,
-                        now,
-                    ),
-                )
-            else:
-                self._conn.execute(
-                    "UPDATE artifacts SET latest_version_id=?,updated_at=? "
-                    "WHERE artifact_id=?",
-                    (version_id, now, artifact_id),
-                )
-            self._conn.commit()
-        return {
-            "artifact_id": artifact_id,
-            "version_id": version_id,
-            "filename": filename,
-            "path": path,
-            "content_type": content_type,
-            "size_bytes": size_bytes,
-            "checksum": checksum,
-            "created_at": now,
-        }
-
-    # --- environment snapshots -------------------------------------------
-    def upsert_env_snapshot(self, snapshot: dict) -> str:
-        """Store a de-duplicated environment snapshot; return its snapshot_id.
-
-        The id is a content hash of the interpreter identity + package manifest,
-        so identical envs collapse to a single row (many figures share it)."""
-        packages = snapshot.get("packages") or []
-        pj = json.dumps(packages, separators=(",", ":"))
-        remote = snapshot.get("remote") or []
-        rj = json.dumps(remote, separators=(",", ":"), sort_keys=True)
-        basis = "|".join(
-            [
-                snapshot.get("kind") or "",
-                snapshot.get("python_version") or "",
-                snapshot.get("implementation") or "",
-                snapshot.get("platform") or "",
-                pj,
-                rj,  # remote-GPU job provenance makes a remotely-computed run distinct
-            ]
+        return self._artifacts.save_artifact(
+            path=path,
+            filename=filename,
+            content_type=content_type,
+            size_bytes=size_bytes,
+            checksum=checksum,
+            producing_cell_id=producing_cell_id,
+            frame_id=frame_id,
+            root_frame_id=root_frame_id,
+            project_id=project_id,
+            artifact_id=artifact_id,
+            is_user_upload=is_user_upload,
+            priority=priority,
+            env_snapshot_id=env_snapshot_id,
+            snapshot_path=snapshot_path,
         )
-        sid = "env-" + hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
-        with self._lock:
-            exists = self._conn.execute(
-                "SELECT 1 FROM env_snapshots WHERE snapshot_id=?", (sid,)
-            ).fetchone()
-            if not exists:
-                self._conn.execute(
-                    "INSERT INTO env_snapshots(snapshot_id,created_at,kind,"
-                    "python_version,implementation,platform,package_count,"
-                    "packages_json,remote_json) VALUES(?,?,?,?,?,?,?,?,?)",
-                    (
-                        sid,
-                        _now_ms(),
-                        snapshot.get("kind"),
-                        snapshot.get("python_version"),
-                        snapshot.get("implementation"),
-                        snapshot.get("platform"),
-                        int(snapshot.get("package_count") or len(packages)),
-                        pj,
-                        rj if remote else None,
-                    ),
-                )
-                self._conn.commit()
-        return sid
+
+    def record_cell_artifact(
+        self,
+        *,
+        path: str,
+        filename: str,
+        content_type: str | None,
+        size_bytes: int,
+        checksum: str | None,
+        producing_cell_id: str | None,
+        frame_id: str | None,
+        root_frame_id: str | None = None,
+        project_id: str | None = None,
+        env_snapshot_id: str | None = None,
+        snapshot_path: str | None = None,
+        input_version_ids: list[str] | tuple[str, ...] | None = None,
+        preserve_filename: bool = False,
+        preserve_content_type: bool = False,
+        reuse_policy: str = "any",
+    ) -> dict:
+        return self._artifacts.record_cell_artifact(
+            path=path,
+            filename=filename,
+            content_type=content_type,
+            size_bytes=size_bytes,
+            checksum=checksum,
+            producing_cell_id=producing_cell_id,
+            frame_id=frame_id,
+            root_frame_id=root_frame_id,
+            project_id=project_id,
+            env_snapshot_id=env_snapshot_id,
+            snapshot_path=snapshot_path,
+            input_version_ids=input_version_ids,
+            preserve_filename=preserve_filename,
+            preserve_content_type=preserve_content_type,
+            reuse_policy=reuse_policy,
+        )
+
+    def record_artifact_restore(
+        self,
+        *,
+        artifact_id: str,
+        source_version_id: str,
+        expected_latest_version_id: str,
+        version_id: str,
+        path: str,
+        snapshot_path: str,
+        size_bytes: int,
+        checksum: str,
+        frame_id: str | None,
+        root_frame_id: str | None = None,
+        project_id: str | None = None,
+    ) -> dict:
+        return self._artifacts.record_artifact_restore(
+            artifact_id=artifact_id,
+            source_version_id=source_version_id,
+            expected_latest_version_id=expected_latest_version_id,
+            version_id=version_id,
+            path=path,
+            snapshot_path=snapshot_path,
+            size_bytes=size_bytes,
+            checksum=checksum,
+            frame_id=frame_id,
+            root_frame_id=root_frame_id,
+            project_id=project_id,
+        )
+
+    def upsert_env_snapshot(self, snapshot: dict) -> str:
+        return self._artifacts.upsert_env_snapshot(snapshot)
+
+    def delete_env_snapshots_if_unreferenced(self, snapshot_ids) -> int:
+        return self._artifacts.delete_env_snapshots_if_unreferenced(snapshot_ids)
 
     def get_env_snapshot(self, snapshot_id: str) -> dict | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM env_snapshots WHERE snapshot_id=?", (snapshot_id,)
-            ).fetchone()
-        if not row:
-            return None
-        d = dict(row)
-        try:
-            d["packages"] = json.loads(d.pop("packages_json") or "[]")
-        except (ValueError, TypeError):
-            d.pop("packages_json", None)
-            d["packages"] = []
-        try:
-            d["remote"] = json.loads(d.pop("remote_json") or "[]")
-        except (ValueError, TypeError):
-            d.pop("remote_json", None)
-            d["remote"] = []
-        return d
+        return self._artifacts.get_env_snapshot(snapshot_id)
 
     def env_snapshot_for_artifact(
         self, artifact_id: str, version_id: str | None = None
     ) -> dict | None:
-        """The env snapshot bound to a specific version, or the artifact's latest.
-
-        Returns None when nothing was recorded (e.g. a user upload, or an artifact
-        produced before this feature existed) — the caller falls back to live."""
-        with self._lock:
-            if version_id:
-                row = self._conn.execute(
-                    "SELECT env_snapshot_id FROM artifact_versions "
-                    "WHERE version_id=? AND artifact_id=?",
-                    (version_id, artifact_id),
-                ).fetchone()
-            else:
-                row = self._conn.execute(
-                    "SELECT v.env_snapshot_id FROM artifacts a "
-                    "JOIN artifact_versions v ON a.latest_version_id=v.version_id "
-                    "WHERE a.artifact_id=?",
-                    (artifact_id,),
-                ).fetchone()
-        sid = row["env_snapshot_id"] if row else None
-        return self.get_env_snapshot(sid) if sid else None
+        return self._artifacts.env_snapshot_for_artifact(
+            artifact_id,
+            version_id,
+        )
 
     def list_artifacts(self, filters: dict | None = None) -> list[dict]:
-        filters = filters or {}
-        sql = (
-            "SELECT a.artifact_id,a.filename,a.content_type,a.is_user_upload,"
-            "a.priority,a.latest_version_id,a.root_frame_id,a.project_id,"
-            "a.created_at,v.size_bytes,v.checksum "
-            "FROM artifacts a LEFT JOIN artifact_versions v "
-            "ON a.latest_version_id=v.version_id"
-        )
-        clauses, params = [], []
-        for k in (
-            "project_id",
-            "content_type",
-            "filename",
-            "artifact_id",
-            "root_frame_id",
-        ):
-            if k in filters:
-                clauses.append(f"a.{k}=?")
-                params.append(filters[k])
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY a.created_at DESC"
-        with self._lock:
-            rows = self._conn.execute(sql, tuple(params)).fetchall()
-        return [dict(r) for r in rows]
+        return self._artifacts.list_artifacts(filters)
 
     def resolve_artifact_path(self, ident: str) -> str | None:
-        """On-disk file to serve for a version_id or artifact_id. Prefers the
-        immutable per-version ``snapshot_path`` (so historical versions serve their
-        OWN bytes, not the current live-file content), falling back to ``path``."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT COALESCE(snapshot_path, path) AS p FROM artifact_versions "
-                "WHERE version_id=?",
-                (ident,),
-            ).fetchone()
-            if row:
-                return row["p"]
-            row = self._conn.execute(
-                "SELECT COALESCE(v.snapshot_path, v.path) AS p FROM artifacts a "
-                "JOIN artifact_versions v ON a.latest_version_id=v.version_id "
-                "WHERE a.artifact_id=?",
-                (ident,),
-            ).fetchone()
-        return row["p"] if row else None
+        return self._artifacts.resolve_artifact_path(ident)
 
     def version_for_path(self, path: str) -> str | None:
-        """Reverse lookup: newest version_id whose stored path matches."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT version_id FROM artifact_versions WHERE path=? "
-                "ORDER BY created_at DESC LIMIT 1",
-                (str(path),),
-            ).fetchone()
-        return row["version_id"] if row else None
+        return self._artifacts.version_for_path(path)
 
     def version_meta(self, version_id: str) -> dict | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM artifact_versions WHERE version_id=?", (version_id,)
-            ).fetchone()
-        return dict(row) if row else None
+        return self._artifacts.version_meta(version_id)
 
     def list_versions(self, artifact_id: str) -> list[dict]:
-        """All versions of an artifact, newest first, each flagged is_latest."""
-        with self._lock:
-            latest = self._conn.execute(
-                "SELECT latest_version_id FROM artifacts WHERE artifact_id=?",
-                (artifact_id,),
-            ).fetchone()
-            rows = self._conn.execute(
-                "SELECT version_id,filename,content_type,size_bytes,checksum,"
-                "producing_cell_id,frame_id,created_at FROM artifact_versions "
-                "WHERE artifact_id=? ORDER BY created_at DESC, rowid DESC",
-                (artifact_id,),
-            ).fetchall()
-        lv = latest["latest_version_id"] if latest else None
-        out = []
-        for i, r in enumerate(rows):
-            d = dict(r)
-            d["is_latest"] = r["version_id"] == lv
-            d["ordinal"] = len(rows) - i  # v1 = oldest
-            out.append(d)
-        return out
+        return self._artifacts.list_versions(artifact_id)
 
     def update_version_path(
         self,
@@ -1440,58 +1862,22 @@ class Store:
         size_bytes: int | None = None,
         checksum: str | None = None,
     ) -> None:
-        """Re-point a version at an (immutable) snapshot file so version history
-        survives later in-place edits of the live workspace file."""
-        sets = ["path=?"]
-        params: list = [path]
-        if size_bytes is not None:
-            sets.append("size_bytes=?")
-            params.append(size_bytes)
-        if checksum is not None:
-            sets.append("checksum=?")
-            params.append(checksum)
-        params.append(version_id)
-        self._exec(
-            f"UPDATE artifact_versions SET {','.join(sets)} " "WHERE version_id=?",
-            tuple(params),
+        self._artifacts.update_version_path(
+            version_id,
+            path,
+            size_bytes=size_bytes,
+            checksum=checksum,
         )
 
     def set_version_snapshot(self, version_id: str, snapshot_path: str) -> None:
-        """Bind a version to its immutable per-version byte snapshot, WITHOUT
-        touching ``path`` (which stays the live workspace file so the provenance
-        reverse-lookup ``version_for_path`` keeps resolving reads of that file)."""
-        self._exec(
-            "UPDATE artifact_versions SET snapshot_path=? " "WHERE version_id=?",
-            (snapshot_path, version_id),
-        )
+        self._artifacts.set_version_snapshot(version_id, snapshot_path)
 
     def set_priority(self, artifact_id: str, priority: int) -> dict | None:
-        """priority > 0 = starred/pinned, < 0 = hidden, 0 = normal."""
-        self._exec(
-            "UPDATE artifacts SET priority=?,updated_at=? WHERE artifact_id=?",
-            (int(priority), _now_ms(), artifact_id),
-        )
-        return self.get_artifact(artifact_id)
+        return self._artifacts.set_priority(artifact_id, priority)
 
     def set_latest_version(self, artifact_id: str, version_id: str) -> dict | None:
-        """Revert: make an existing version the current one. Validates the
-        version belongs to the artifact. History is preserved."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT version_id FROM artifact_versions WHERE version_id=? "
-                "AND artifact_id=?",
-                (version_id, artifact_id),
-            ).fetchone()
-        if not row:
-            return None
-        self._exec(
-            "UPDATE artifacts SET latest_version_id=?,updated_at=? "
-            "WHERE artifact_id=?",
-            (version_id, _now_ms(), artifact_id),
-        )
-        return self.get_artifact(artifact_id)
+        return self._artifacts.set_latest_version(artifact_id, version_id)
 
-    # --- lineage ---------------------------------------------------------
     def add_lineage_edge(
         self,
         *,
@@ -1500,150 +1886,60 @@ class Store:
         producing_cell_id: str | None = None,
         frame_id: str | None = None,
     ) -> None:
-        self._exec(
-            "INSERT INTO lineage_edges(edge_id,input_version_id,"
-            "output_version_id,producing_cell_id,frame_id,created_at) "
-            "VALUES(?,?,?,?,?,?)",
-            (
-                f"e-{uuid.uuid4().hex[:12]}",
-                input_version_id,
-                output_version_id,
-                producing_cell_id,
-                frame_id,
-                _now_ms(),
-            ),
+        self._artifacts.add_lineage_edge(
+            input_version_id=input_version_id,
+            output_version_id=output_version_id,
+            producing_cell_id=producing_cell_id,
+            frame_id=frame_id,
         )
 
     def lineage_inputs(self, version_id: str) -> list[dict]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT le.input_version_id, av.filename, av.path "
-                "FROM lineage_edges le LEFT JOIN artifact_versions av "
-                "ON le.input_version_id=av.version_id "
-                "WHERE le.output_version_id=?",
-                (version_id,),
-            ).fetchall()
-        return [
-            {
-                "version_id": r["input_version_id"],
-                "filename": r["filename"],
-                "path": r["path"],
-            }
-            for r in rows
-        ]
+        return self._artifacts.lineage_inputs(version_id)
 
     def lineage_edges_for(self, version_id: str, direction: str) -> list[dict]:
-        col_from = "output_version_id" if direction == "up" else "input_version_id"
-        col_to = "input_version_id" if direction == "up" else "output_version_id"
-        with self._lock:
-            rows = self._conn.execute(
-                f"SELECT {col_to} AS nxt FROM lineage_edges WHERE {col_from}=?",
-                (version_id,),
-            ).fetchall()
-        return [r["nxt"] for r in rows]
+        return self._artifacts.lineage_edges_for(version_id, direction)
 
     def producing_cell_for_version(self, version_id: str) -> dict | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT el.code, el.frame_id, el.producing_cell_id "
-                "FROM artifact_versions av "
-                "LEFT JOIN execution_log el "
-                "ON av.producing_cell_id=el.producing_cell_id "
-                "WHERE av.version_id=?",
-                (version_id,),
-            ).fetchone()
-        return dict(row) if row and row["code"] is not None else None
+        return self._artifacts.producing_cell_for_version(version_id)
 
     # --- notes -----------------------------------------------------------
     def add_note(
         self, *, project_id: str, content: str, title: str | None = None
     ) -> dict:
-        now = _now_ms()
-        nid = f"note_{uuid.uuid4().hex[:12]}"
-        self._exec(
-            "INSERT INTO notes(note_id,project_id,title,body,created_at) "
-            "VALUES(?,?,?,?,?)",
-            (nid, project_id, title, content, now),
+        return self._notes.add(
+            project_id=project_id,
+            content=content,
+            title=title,
         )
-        return {
-            "note_id": nid,
-            "project_id": project_id,
-            "content": content,
-            "created_at": now,
-            "updated_at": now,
-        }
 
     def list_notes(self, project_id: str) -> list[dict]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT note_id,project_id,title,body,created_at FROM notes "
-                "WHERE project_id=? ORDER BY created_at DESC",
-                (project_id,),
-            ).fetchall()
-        return [
-            {
-                "note_id": r["note_id"],
-                "project_id": r["project_id"],
-                "content": r["body"],
-                "title": r["title"],
-                "created_at": r["created_at"],
-                "updated_at": r["created_at"],
-            }
-            for r in rows
-        ]
+        return self._notes.list(project_id)
 
     def delete_note(self, note_id: str) -> None:
-        self._exec("DELETE FROM notes WHERE note_id=?", (note_id,))
+        self._notes.delete(note_id)
 
     # --- settings (KV) ---------------------------------------------------
     def get_setting(self, key: str, default: str | None = None) -> str | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT value FROM settings WHERE key=?", (key,)
-            ).fetchone()
-        return row["value"] if row else default
+        return self._settings.get(key, default)
 
     def set_setting(self, key: str, value: str) -> None:
-        self._exec(
-            "INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
-            "updated_at=excluded.updated_at",
-            (key, value, _now_ms()),
-        )
+        self._settings.set(key, value)
+
+    def delete_setting(self, key: str) -> None:
+        self._settings.delete(key)
 
     # --- model profiles (saved LLM/API configs) --------------------------
     # Stored as a JSON list under the `model_profiles` setting so users can keep
     # several full API configs (provider + base_url + model + key) side by side
     # and switch between them. Activating one writes the live `llm_*` settings.
     def list_model_profiles(self) -> list[dict]:
-        raw = self.get_setting("model_profiles")
-        if not raw:
-            return []
-        try:
-            v = json.loads(raw)
-        except (ValueError, TypeError):
-            return []
-        return v if isinstance(v, list) else []
+        return self._settings.list_model_profiles()
 
     def set_model_profiles(self, profiles: list[dict]) -> None:
-        self.set_setting("model_profiles", json.dumps(profiles))
+        self._settings.set_model_profiles(profiles)
 
     def mutate_model_profiles(self, fn):
-        """Atomically read-modify-write the profile list under the store lock.
-
-        `fn(profiles)` edits the list in place (append / mutate a dict / `ps[:] =
-        ...`) and may return a value, which is returned to the caller. Holding the
-        RLock across the read AND the write closes the lost-update window of the
-        plain list()+set() pattern: under the threaded daemon two concurrent
-        mutations would otherwise each read the same list and the second write
-        would clobber the first. Nested get_setting/set_setting reacquire the same
-        RLock harmlessly, so no other thread can interleave in between.
-        """
-        with self._lock:
-            profs = self.list_model_profiles()
-            result = fn(profs)
-            self.set_model_profiles(profs)
-            return result
+        return self._settings.mutate_model_profiles(fn)
 
     # --- permission rules (opencode-style tool-call gate) ----------------
     def set_permission_rule(
@@ -1655,63 +1951,30 @@ class Store:
         pattern: str = "*",
         decision: str,
     ) -> str:
-        """Upsert one rule keyed by (scope, scope_id, tool, pattern). Returns
-        the rule_id (existing or new)."""
-        scope_id = scope_id or ""
-        pattern = pattern or "*"
-        now = _now_ms()
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT rule_id FROM permission_rules WHERE scope=? AND "
-                "scope_id=? AND tool=? AND pattern=?",
-                (scope, scope_id, tool, pattern),
-            ).fetchone()
-            if row:
-                rid = row["rule_id"]
-                self._conn.execute(
-                    "UPDATE permission_rules SET decision=?, updated_at=? "
-                    "WHERE rule_id=?",
-                    (decision, now, rid),
-                )
-            else:
-                rid = f"perm_{uuid.uuid4().hex[:12]}"
-                self._conn.execute(
-                    "INSERT INTO permission_rules(rule_id,scope,scope_id,tool,"
-                    "pattern,decision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                    (rid, scope, scope_id, tool, pattern, decision, now, now),
-                )
-            self._conn.commit()
-        return rid
+        return self._permissions.set_rule(
+            scope=scope,
+            scope_id=scope_id,
+            tool=tool,
+            pattern=pattern,
+            decision=decision,
+        )
 
     def delete_permission_rule(self, rule_id: str) -> None:
-        self._exec("DELETE FROM permission_rules WHERE rule_id=?", (rule_id,))
+        self._permissions.delete_rule(rule_id)
+
+    def get_permission_rule(self, rule_id: str) -> dict | None:
+        return self._permissions.get_rule(rule_id)
 
     def get_permission_rules(self, *, scope: str, scope_id: str = "") -> list[dict]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM permission_rules WHERE scope=? AND scope_id=? "
-                "ORDER BY updated_at",
-                (scope, scope_id or ""),
-            ).fetchall()
-        return [dict(r) for r in rows]
+        return self._permissions.get_rules(scope=scope, scope_id=scope_id)
 
     def list_permission_rules_for_frame(
         self, *, root_frame_id: str | None = None, project_id: str | None = None
     ) -> dict:
-        """All rules relevant to a conversation, grouped by scope (for the UI)."""
-        return {
-            "global": self.get_permission_rules(scope="global", scope_id=""),
-            "project": (
-                self.get_permission_rules(scope="project", scope_id=project_id)
-                if project_id
-                else []
-            ),
-            "conversation": (
-                self.get_permission_rules(scope="conversation", scope_id=root_frame_id)
-                if root_frame_id
-                else []
-            ),
-        }
+        return self._permissions.list_for_frame(
+            root_frame_id=root_frame_id,
+            project_id=project_id,
+        )
 
     def resolve_permission(
         self,
@@ -1721,106 +1984,87 @@ class Store:
         tool: str,
         pattern_input: str = "",
     ) -> str:
-        """Resolve a tool call to allow|ask|deny across the three scopes.
-
-        DENY is an absolute veto: if ANY matching rule at ANY scope says 'deny',
-        the call is denied — a guardrail cannot be overridden by a broader
-        convenience 'allow' (this makes both the .env deny beat a conversation
-        read allow, AND a conversation 'deny bash *' beat a global 'allow git *',
-        which a pure specificity/scope ordering could not do together).
-        Otherwise, among matching allow/ask rules the WINNER is the most specific
-        (more specific tool, then pattern, then longer pattern), tie-broken by
-        narrower scope (conversation > project > global) then recency. When
-        nothing matches, the fallback is 'ask' (opencode's security-first
-        default)."""
-        cands: list[dict] = list(self.get_permission_rules(scope="global", scope_id=""))
-        if project_id:
-            cands += self.get_permission_rules(scope="project", scope_id=project_id)
-        if root_frame_id:
-            cands += self.get_permission_rules(
-                scope="conversation", scope_id=root_frame_id
-            )
-        scope_rank = {"global": 0, "project": 1, "conversation": 2}
-        best = None
-        best_key = None
-        for r in cands:
-            rtool = r["tool"] or "*"
-            rpat = r["pattern"] or "*"
-            if not _perm_match(tool, rtool):
-                continue
-            if not _perm_match(pattern_input or "", rpat):
-                continue
-            if r["decision"] == "deny":
-                return "deny"  # absolute veto — any matching deny wins outright
-            key = (
-                0 if rtool in ("*", "") else 1,
-                0 if rpat in ("*", "") else 1,
-                len(rpat),
-                scope_rank.get(r["scope"], 0),
-                r.get("updated_at") or 0,
-            )
-            if best_key is None or key > best_key:
-                best_key = key
-                best = r
-        return best["decision"] if best else "ask"
+        return self._permissions.resolve(
+            root_frame_id=root_frame_id,
+            project_id=project_id,
+            tool=tool,
+            pattern_input=pattern_input,
+        )
 
     def seed_default_permission_rules(self, *, force: bool = False) -> None:
-        """Insert the security-first global defaults once (idempotent). Normally
-        skips if already seeded so a user's later deletions/edits are not
-        reverted on restart. `force=True` (the 'reset to defaults' action)
-        re-inserts missing defaults AND restores the built-in decision of any
-        default rule the user modified (e.g. flips a changed 'bash * allow' back
-        to 'ask')."""
-        if not force and self.get_setting("perm_seeded"):
-            return
-        now = _now_ms()
-        with self._lock:
-            for tool, pattern, decision in _DEFAULT_PERMISSION_RULES:
-                row = self._conn.execute(
-                    "SELECT rule_id, decision FROM permission_rules WHERE scope='global' "
-                    "AND scope_id='' AND tool=? AND pattern=?",
-                    (tool, pattern),
-                ).fetchone()
-                if row is not None:
-                    # restore the built-in decision on reset if it was changed
-                    if force and row["decision"] != decision:
-                        self._conn.execute(
-                            "UPDATE permission_rules SET decision=?, updated_at=? "
-                            "WHERE rule_id=?",
-                            (decision, now, row["rule_id"]),
-                        )
-                    continue
-                self._conn.execute(
-                    "INSERT INTO permission_rules(rule_id,scope,scope_id,tool,"
-                    "pattern,decision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                    (
-                        f"perm_{uuid.uuid4().hex[:12]}",
-                        "global",
-                        "",
-                        tool,
-                        pattern,
-                        decision,
-                        now,
-                        now,
-                    ),
-                )
-            self._conn.commit()
-        self.set_setting("perm_seeded", "1")
+        self._permissions.seed_defaults(force=force)
+
+    def create_permission_request(self, **request: Any) -> dict:
+        return self._permissions.create_request(**request)
+
+    def resolve_permission_request(
+        self,
+        decision_id: str,
+        *,
+        state: str,
+        scope: str | None = None,
+        pattern: str | None = None,
+        message: str | None = None,
+        resolution_context: str | None = None,
+        continuation_required: bool = False,
+        resolved_at: int | None = None,
+    ) -> dict:
+        return self._permissions.resolve_request(
+            decision_id,
+            state=state,
+            scope=scope,
+            pattern=pattern,
+            message=message,
+            resolution_context=resolution_context,
+            continuation_required=continuation_required,
+            resolved_at=resolved_at,
+        )
+
+    def consume_restart_permission_grant(
+        self,
+        *,
+        root_frame_id: str,
+        tool: str,
+        target: str = "",
+        project_id: str | None = None,
+        consumed_at: int | None = None,
+    ) -> dict | None:
+        return self._permissions.consume_restart_once_grant(
+            root_frame_id=root_frame_id,
+            tool=tool,
+            target=target,
+            project_id=project_id,
+            consumed_at=consumed_at,
+        )
+
+    def activate_restart_permission_continuation(
+        self,
+        decision_id: str,
+        *,
+        expires_at: int | None = None,
+    ) -> dict:
+        return self._permissions.activate_restart_continuation(
+            decision_id,
+            expires_at=expires_at,
+        )
+
+    def get_permission_request(self, decision_id: str) -> dict | None:
+        return self._permissions.get_request(decision_id)
+
+    def list_permission_requests(
+        self,
+        *,
+        root_frame_id: str | None = None,
+        state: str | None = None,
+    ) -> list[dict]:
+        return self._permissions.list_requests(
+            root_frame_id=root_frame_id,
+            state=state,
+        )
 
     # --- plans (structured plan → approve → auto-execute) ----------------
     def _plan_row(self, row) -> dict:
-        d = dict(row)
-        for k in ("steps", "step_status"):
-            if d.get(k):
-                try:
-                    d[k] = json.loads(d[k])
-                except (ValueError, TypeError):
-                    pass
-        if not isinstance(d.get("steps"), list):
-            d["steps"] = []
-        if not isinstance(d.get("step_status"), dict):
-            d["step_status"] = {}
-        return d
+        return self._plans.normalize_row(row)
 
     def create_plan(
         self,
@@ -1834,60 +2078,26 @@ class Store:
         artifact_id: str | None = None,
         status: str = "draft",
     ) -> dict:
-        now = _now_ms()
-        plan_id = f"plan-{uuid.uuid4().hex[:12]}"
-        self._exec(
-            "INSERT INTO plans(plan_id,frame_id,project_id,title,rationale,"
-            "confidence,steps,status,step_status,artifact_id,created_at,updated_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                plan_id,
-                frame_id,
-                project_id,
-                title,
-                rationale,
-                confidence,
-                json.dumps(steps, ensure_ascii=False, default=str),
-                status,
-                json.dumps({}, ensure_ascii=False),
-                artifact_id,
-                now,
-                now,
-            ),
+        return self._plans.create(
+            frame_id=frame_id,
+            project_id=project_id,
+            title=title,
+            rationale=rationale,
+            confidence=confidence,
+            steps=steps,
+            artifact_id=artifact_id,
+            status=status,
         )
-        return self.get_plan(plan_id)
 
     def get_plan(self, plan_id: str) -> dict | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM plans WHERE plan_id=?", (plan_id,)
-            ).fetchone()
-        return self._plan_row(row) if row else None
+        return self._plans.get(plan_id)
 
     def get_plan_by_frame(self, frame_id: str) -> dict | None:
         """The most recent (non-discarded) plan for a frame, else the newest."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM plans WHERE frame_id=? AND status!='discarded' "
-                "ORDER BY created_at DESC LIMIT 1",
-                (frame_id,),
-            ).fetchone()
-            if row is None:
-                row = self._conn.execute(
-                    "SELECT * FROM plans WHERE frame_id=? "
-                    "ORDER BY created_at DESC LIMIT 1",
-                    (frame_id,),
-                ).fetchone()
-        return self._plan_row(row) if row else None
+        return self._plans.get_by_frame(frame_id)
 
     def list_plans(self, frame_id: str, *, limit: int = 50) -> list[dict]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM plans WHERE frame_id=? ORDER BY created_at DESC "
-                "LIMIT ?",
-                (frame_id, limit),
-            ).fetchall()
-        return [self._plan_row(r) for r in rows]
+        return self._plans.list_for_frame(frame_id, limit=limit)
 
     def update_plan(
         self,
@@ -1901,159 +2111,70 @@ class Store:
         step_status: dict | None = None,
         artifact_id: str | None = None,
     ) -> None:
-        sets, params = [], []
-
-        def add(col: str, val, js: bool = False) -> None:
-            sets.append(f"{col}=?")
-            params.append(
-                json.dumps(val, ensure_ascii=False, default=str) if js else val
-            )
-
-        if title is not None:
-            add("title", title)
-        if rationale is not None:
-            add("rationale", rationale)
-        if confidence is not None:
-            add("confidence", confidence)
-        if steps is not None:
-            add("steps", steps, True)
-        if status is not None:
-            add("status", status)
-        if step_status is not None:
-            add("step_status", step_status, True)
-        if artifact_id is not None:
-            add("artifact_id", artifact_id)
-        if not sets:
-            return
-        sets.append("updated_at=?")
-        params.append(_now_ms())
-        params.append(plan_id)
-        with self._lock:
-            self._conn.execute(
-                f"UPDATE plans SET {','.join(sets)} WHERE plan_id=?", params
-            )
-            self._conn.commit()
+        self._plans.update(
+            plan_id,
+            title=title,
+            rationale=rationale,
+            confidence=confidence,
+            steps=steps,
+            status=status,
+            step_status=step_status,
+            artifact_id=artifact_id,
+        )
 
     def set_plan_step_status(
         self, plan_id: str, step_id: str, status: str, note: str | None = None
     ) -> dict | None:
         """Merge one step's status into the plan's step_status JSON. Returns the
         updated plan (with steps[] status folded in)."""
-        p = self.get_plan(plan_id)
-        if not p:
-            return None
-        ss = dict(p.get("step_status") or {})
-        ss[step_id] = {"status": status, "note": note, "updated_at": _now_ms()}
-        self.update_plan(plan_id, step_status=ss)
-        return self.get_plan(plan_id)
+        return self._plans.set_step_status(plan_id, step_id, status, note)
 
     def delete_plans_for_frame(self, frame_id: str) -> None:
-        self._exec("DELETE FROM plans WHERE frame_id=?", (frame_id,))
+        self._plans.delete_for_frame(frame_id)
 
     # --- folders (session grouping within a project) --------------------
     def create_folder(self, *, project_id: str, name: str) -> dict:
-        now = _now_ms()
-        fid = f"fold_{uuid.uuid4().hex[:10]}"
-        self._exec(
-            "INSERT INTO folders(folder_id,project_id,name,created_at) "
-            "VALUES(?,?,?,?)",
-            (fid, project_id, name, now),
-        )
-        return {
-            "folder_id": fid,
-            "project_id": project_id,
-            "name": name,
-            "created_at": now,
-        }
+        return self._folders.create(project_id=project_id, name=name)
 
     def list_folders(self, project_id: str) -> list[dict]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT folder_id,project_id,name,created_at FROM folders "
-                "WHERE project_id=? ORDER BY name",
-                (project_id,),
-            ).fetchall()
-        return [dict(r) for r in rows]
+        return self._folders.list(project_id)
 
     def rename_folder(self, folder_id: str, name: str) -> None:
-        self._exec("UPDATE folders SET name=? WHERE folder_id=?", (name, folder_id))
+        self._folders.rename(folder_id, name)
 
     def delete_folder(self, folder_id: str) -> None:
-        # un-file any frames in the folder, then drop it
-        self._exec("UPDATE frames SET folder_id=NULL WHERE folder_id=?", (folder_id,))
-        self._exec("DELETE FROM folders WHERE folder_id=?", (folder_id,))
+        self._folders.delete(folder_id)
 
     def set_frame_folder(self, frame_id: str, folder_id: str | None) -> None:
-        self._exec(
-            "UPDATE frames SET folder_id=? WHERE frame_id=?", (folder_id, frame_id)
-        )
+        self._folders.set_frame_folder(frame_id, folder_id)
 
     # --- memories --------------------------------------------------------
     def add_memory(
         self, *, content: str, block: str = "general", project_id: str = "default"
     ) -> dict:
-        now = _now_ms()
-        mid = f"mem_{uuid.uuid4().hex[:12]}"
-        self._exec(
-            "INSERT INTO memories(memory_id,project_id,block,content,created_at) "
-            "VALUES(?,?,?,?,?)",
-            (mid, project_id, block, content, now),
+        return self._memories.add(
+            content=content,
+            block=block,
+            project_id=project_id,
         )
-        return {
-            "memory_id": mid,
-            "project_id": project_id,
-            "block": block,
-            "content": content,
-            "created_at": now,
-        }
 
     def list_memories(
         self, project_id: str | None = None, block: str | None = None
     ) -> list[dict]:
-        sql = (
-            "SELECT memory_id,project_id,block,content,created_at FROM memories "
-            "WHERE 1=1"
-        )
-        params: list = []
-        if project_id and project_id != "all":
-            sql += " AND project_id=?"
-            params.append(project_id)
-        if block:
-            sql += " AND block=?"
-            params.append(block)
-        sql += " ORDER BY created_at DESC"
-        with self._lock:
-            rows = self._conn.execute(sql, params).fetchall()
-        return [
-            {
-                "memory_id": r["memory_id"],
-                "project_id": r["project_id"],
-                "block": r["block"],
-                "content": r["content"],
-                "created_at": r["created_at"],
-            }
-            for r in rows
-        ]
+        return self._memories.list(project_id=project_id, block=block)
 
     def delete_memory(self, memory_id: str) -> None:
-        self._exec("DELETE FROM memories WHERE memory_id=?", (memory_id,))
+        self._memories.delete(memory_id)
+
+    def memory_blocks(self, project_id: str | None = None) -> list[dict]:
+        return self._memories.blocks(project_id)
 
     # --- feedback (per message) -----------------------------------------
     def set_feedback(self, frame_id: str, key: str, rating: str | None) -> None:
-        """Persist a thumbs up/down for an assistant message (key = message
-        index/hash). rating None clears it."""
-        if rating:
-            self.set_setting(f"fb:{frame_id}:{key}", rating)
-        else:
-            self._exec("DELETE FROM settings WHERE key=?", (f"fb:{frame_id}:{key}",))
+        self._settings.set_feedback(frame_id, key, rating)
 
     def list_feedback(self, frame_id: str) -> dict:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT key,value FROM settings WHERE key LIKE ?", (f"fb:{frame_id}:%",)
-            ).fetchall()
-        prefix = f"fb:{frame_id}:"
-        return {r["key"][len(prefix) :]: r["value"] for r in rows}
+        return self._settings.list_feedback(frame_id)
 
     # --- image annotations (figure review) ------------------------------
     def add_annotation(
@@ -2066,46 +2187,17 @@ class Store:
         rel_y: float,
         body: str,
     ) -> dict:
-        """Pin a comment to a point (rel_x, rel_y ∈ [0,1]) on an image artifact.
-        The pin `number` is the next ordinal within (frame, artifact)."""
-        aid = f"an-{uuid.uuid4().hex[:12]}"
-        now = _now_ms()
-        rel_x = max(0.0, min(1.0, float(rel_x)))
-        rel_y = max(0.0, min(1.0, float(rel_y)))
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT COALESCE(MAX(number),0) AS n FROM annotations "
-                "WHERE root_frame_id=? AND artifact_id=?",
-                (root_frame_id, artifact_id),
-            ).fetchone()
-            number = int(row["n"]) + 1
-            self._conn.execute(
-                "INSERT INTO annotations(annotation_id,root_frame_id,artifact_id,"
-                "artifact_name,rel_x,rel_y,number,body,status,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    aid,
-                    root_frame_id,
-                    artifact_id,
-                    artifact_name,
-                    rel_x,
-                    rel_y,
-                    number,
-                    body,
-                    "open",
-                    now,
-                    now,
-                ),
-            )
-            self._conn.commit()
-        return self.get_annotation(aid)
+        return self._annotations.add(
+            root_frame_id=root_frame_id,
+            artifact_id=artifact_id,
+            artifact_name=artifact_name,
+            rel_x=rel_x,
+            rel_y=rel_y,
+            body=body,
+        )
 
     def get_annotation(self, annotation_id: str) -> dict | None:
-        with self._lock:
-            r = self._conn.execute(
-                "SELECT * FROM annotations WHERE annotation_id=?", (annotation_id,)
-            ).fetchone()
-        return dict(r) if r else None
+        return self._annotations.get(annotation_id)
 
     def list_annotations(
         self,
@@ -2114,53 +2206,26 @@ class Store:
         artifact_id: str | None = None,
         status: str | None = None,
     ) -> list[dict]:
-        sql = "SELECT * FROM annotations WHERE root_frame_id=?"
-        params: list = [root_frame_id]
-        if artifact_id:
-            sql += " AND artifact_id=?"
-            params.append(artifact_id)
-        if status:
-            sql += " AND status=?"
-            params.append(status)
-        sql += " ORDER BY artifact_id, number"
-        with self._lock:
-            rows = self._conn.execute(sql, tuple(params)).fetchall()
-        return [dict(r) for r in rows]
+        return self._annotations.list_for_frame(
+            root_frame_id,
+            artifact_id=artifact_id,
+            status=status,
+        )
 
     def update_annotation(
         self, annotation_id: str, *, body: str | None = None, status: str | None = None
     ) -> dict | None:
-        sets, params = [], []
-        if body is not None:
-            sets.append("body=?")
-            params.append(body)
-        if status is not None:
-            sets.append("status=?")
-            params.append(status)
-        if not sets:
-            return self.get_annotation(annotation_id)
-        sets.append("updated_at=?")
-        params.append(_now_ms())
-        params.append(annotation_id)
-        self._exec(
-            f"UPDATE annotations SET {','.join(sets)} WHERE annotation_id=?",
-            tuple(params),
+        return self._annotations.update(
+            annotation_id,
+            body=body,
+            status=status,
         )
-        return self.get_annotation(annotation_id)
 
     def mark_annotations_sent(self, annotation_ids: list[str]) -> None:
-        ids = [a for a in (annotation_ids or []) if a]
-        if not ids:
-            return
-        qmarks = ",".join("?" * len(ids))
-        self._exec(
-            f"UPDATE annotations SET status='sent', updated_at={_now_ms()} "
-            f"WHERE annotation_id IN ({qmarks}) AND status='open'",
-            tuple(ids),
-        )
+        self._annotations.mark_sent(annotation_ids)
 
     def delete_annotation(self, annotation_id: str) -> None:
-        self._exec("DELETE FROM annotations WHERE annotation_id=?", (annotation_id,))
+        self._annotations.delete(annotation_id)
 
     # --- global search (command palette) --------------------------------
     def search(self, query: str, limit: int = 20) -> dict:
@@ -2203,29 +2268,104 @@ class Store:
         }
 
     # --- agents / specialists -------------------------------------------
-    def list_agents(self) -> list[dict]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT name,description,skill_names,connectors,unrestricted,"
-                "system_prompt,created_at,updated_at FROM agents ORDER BY name"
-            ).fetchall()
-        out = []
-        for r in rows:
-            d = dict(r)
-            for k in ("skill_names", "connectors"):
-                if d.get(k):
-                    try:
-                        d[k] = json.loads(d[k])
-                    except (ValueError, TypeError):
-                        d[k] = None
-            out.append(d)
-        return out
+    def capability_state(
+        self,
+        *,
+        project_id: str | None = None,
+        session_id: str | None = None,
+    ) -> CapabilityStateService:
+        return self._capabilities.scoped(
+            project_id=project_id,
+            session_id=session_id,
+        )
 
-    def get_agent(self, name: str) -> dict | None:
-        for a in self.list_agents():
-            if a["name"] == name:
-                return a
-        return None
+    def skill_versions(self) -> SkillVersionRepository:
+        """Return the Store-owned immutable Skill package repository."""
+
+        return self._skill_versions
+
+    def set_capability_enabled(
+        self,
+        kind: str,
+        name: str,
+        enabled: bool,
+        *,
+        scope: str = "global",
+        scope_id: str = "",
+        metadata: dict | None = None,
+    ) -> dict:
+        return self._capabilities.set_enabled(
+            kind,
+            name,
+            enabled,
+            scope=scope,
+            scope_id=scope_id,
+            metadata=metadata,
+        )
+
+    def capability_snapshot(
+        self,
+        kind: str,
+        names,
+        *,
+        project_id: str | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, dict]:
+        return self.capability_state(
+            project_id=project_id,
+            session_id=session_id,
+        ).snapshot(kind, names)
+
+    def list_explicit_capability_states(
+        self,
+        kind: str | None = None,
+        *,
+        scope: str | None = None,
+        scope_id: str | None = None,
+    ) -> list[dict]:
+        return self._capability_repository.explicit_states(
+            kind,
+            scope=scope,
+            scope_id=scope_id,
+        )
+
+    def list_agents(
+        self,
+        *,
+        project_id: str | None = None,
+        session_id: str | None = None,
+        include_disabled: bool = False,
+    ) -> list[dict]:
+        return self.specialist_profiles(
+            project_id=project_id,
+            session_id=session_id,
+        ).list(include_disabled=include_disabled)
+
+    def specialist_profiles(
+        self,
+        *,
+        project_id: str | None = None,
+        session_id: str | None = None,
+    ) -> SpecialistProfileService:
+        """Return the shared resolver/filter seam for custom and built-ins."""
+
+        return self._specialists.scoped(
+            project_id=project_id,
+            session_id=session_id,
+        )
+
+    def get_agent(
+        self,
+        name: str,
+        *,
+        project_id: str | None = None,
+        session_id: str | None = None,
+        include_disabled: bool = False,
+    ) -> dict | None:
+        return self.specialist_profiles(
+            project_id=project_id,
+            session_id=session_id,
+        ).resolve(name, include_disabled=include_disabled)
 
     def upsert_agent(
         self,
@@ -2237,70 +2377,24 @@ class Store:
         connectors: list | None = None,
         unrestricted: bool = True,
     ) -> dict:
-        now = _now_ms()
-        exists = self.get_agent(name) is not None
-        sk = json.dumps(skill_names) if skill_names is not None else None
-        cn = json.dumps(connectors) if connectors is not None else None
-        if exists:
-            self._exec(
-                "UPDATE agents SET description=?,skill_names=?,connectors=?,"
-                "unrestricted=?,system_prompt=?,updated_at=? WHERE name=?",
-                (
-                    description,
-                    sk,
-                    cn,
-                    1 if unrestricted else 0,
-                    system_prompt,
-                    now,
-                    name,
-                ),
-            )
-        else:
-            self._exec(
-                "INSERT INTO agents(name,description,skill_names,connectors,"
-                "unrestricted,system_prompt,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?)",
-                (
-                    name,
-                    description,
-                    sk,
-                    cn,
-                    1 if unrestricted else 0,
-                    system_prompt,
-                    now,
-                    now,
-                ),
-            )
-        return self.get_agent(name) or {"name": name}
+        return self._agents.upsert(
+            name=name,
+            description=description,
+            system_prompt=system_prompt,
+            skill_names=skill_names,
+            connectors=connectors,
+            unrestricted=unrestricted,
+        )
 
     def delete_agent(self, name: str) -> None:
-        self._exec("DELETE FROM agents WHERE name=?", (name,))
+        self._agents.delete(name)
 
     # --- connectors (MCP servers) ---------------------------------------
     def list_connectors(self) -> list[dict]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT connector_id,name,description,command,args,env,enabled,"
-                "created_at,updated_at FROM connectors ORDER BY name"
-            ).fetchall()
-        out = []
-        for r in rows:
-            d = dict(r)
-            d["enabled"] = bool(d["enabled"])
-            for k in ("command", "args", "env"):
-                if d.get(k):
-                    try:
-                        d[k] = json.loads(d[k])
-                    except (ValueError, TypeError):
-                        pass
-            out.append(d)
-        return out
+        return self._connectors.list()
 
     def get_connector(self, connector_id: str) -> dict | None:
-        for c in self.list_connectors():
-            if c["connector_id"] == connector_id:
-                return c
-        return None
+        return self._connectors.get(connector_id)
 
     def upsert_connector(
         self,
@@ -2313,55 +2407,21 @@ class Store:
         env=None,
         enabled: bool = True,
     ) -> dict:
-        now = _now_ms()
-        exists = self.get_connector(connector_id) is not None
-        cmd = json.dumps(command)
-        a = json.dumps(args or [])
-        e = json.dumps(env or {})
-        if exists:
-            self._exec(
-                "UPDATE connectors SET name=?,description=?,command=?,args=?,"
-                "env=?,enabled=?,updated_at=? WHERE connector_id=?",
-                (name, description, cmd, a, e, 1 if enabled else 0, now, connector_id),
-            )
-        else:
-            self._exec(
-                "INSERT INTO connectors(connector_id,name,description,command,"
-                "args,env,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                (
-                    connector_id,
-                    name,
-                    description,
-                    cmd,
-                    a,
-                    e,
-                    1 if enabled else 0,
-                    now,
-                    now,
-                ),
-            )
-        return self.get_connector(connector_id) or {"connector_id": connector_id}
-
-    def set_connector_enabled(self, connector_id: str, enabled: bool) -> None:
-        self._exec(
-            "UPDATE connectors SET enabled=?,updated_at=? " "WHERE connector_id=?",
-            (1 if enabled else 0, _now_ms(), connector_id),
+        return self._connectors.upsert(
+            connector_id=connector_id,
+            name=name,
+            command=command,
+            description=description,
+            args=args,
+            env=env,
+            enabled=enabled,
         )
 
-    def delete_connector(self, connector_id: str) -> None:
-        self._exec("DELETE FROM connectors WHERE connector_id=?", (connector_id,))
+    def set_connector_enabled(self, connector_id: str, enabled: bool) -> None:
+        self._connectors.set_enabled(connector_id, enabled)
 
-    def memory_blocks(self, project_id: str | None = None) -> list[dict]:
-        """Category counts for the Memory customize panel."""
-        sql = "SELECT block, COUNT(*) n FROM memories"
-        params: list = []
-        if project_id and project_id != "all":
-            sql += " WHERE project_id=?"
-            params.append(project_id)
-        sql += " GROUP BY block ORDER BY n DESC"
-        with self._lock:
-            rows = self._conn.execute(sql, params).fetchall()
-        return [{"block": r["block"] or "general", "count": r["n"]} for r in rows]
+    def delete_connector(self, connector_id: str) -> None:
+        self._connectors.delete(connector_id)
 
     # --- compaction ------------------------------------------------------
     def archive_compaction(
@@ -2371,81 +2431,52 @@ class Store:
         summary: str,
         compacted: list[dict],
         project_id: str = "default",
+        **metadata: Any,
     ) -> str:
-        archive_id = f"ca-{uuid.uuid4().hex[:12]}"
-        self._exec(
-            "INSERT INTO compaction_archives(archive_id,frame_id,project_id,"
-            "summary,compacted,n_messages,created_at) VALUES(?,?,?,?,?,?,?)",
-            (
-                archive_id,
-                frame_id,
-                project_id,
-                summary,
-                json.dumps(compacted, ensure_ascii=False),
-                len(compacted),
-                _now_ms(),
-            ),
+        return self._compactions.archive(
+            frame_id=frame_id,
+            summary=summary,
+            compacted=compacted,
+            project_id=project_id,
+            **metadata,
         )
-        return archive_id
+
+    def list_compaction_archives(self, frame_id: str, *, limit: int = 50) -> list[dict]:
+        return self._compactions.list(frame_id, limit=limit)
 
     # --- endpoints ----------------------------------------------
     def upsert_endpoint(self, name: str, **fields: Any) -> None:
-        now = _now_ms()
-        with self._lock:
-            exists = self._conn.execute(
-                "SELECT 1 FROM managed_endpoints WHERE name=?", (name,)
-            ).fetchone()
-            if exists:
-                fields["updated_at"] = now
-                cols = ", ".join(f"{k}=?" for k in fields)
-                self._conn.execute(
-                    f"UPDATE managed_endpoints SET {cols} WHERE name=?",
-                    (*fields.values(), name),
-                )
-            else:
-                fields.setdefault("created_at", now)
-                fields["updated_at"] = now
-                fields["name"] = name
-                cols = ", ".join(fields)
-                qs = ", ".join("?" for _ in fields)
-                self._conn.execute(
-                    f"INSERT INTO managed_endpoints({cols}) VALUES({qs})",
-                    tuple(fields.values()),
-                )
-            self._conn.commit()
+        self._endpoints.upsert(name, **fields)
 
     def list_endpoints(self) -> list[dict]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM managed_endpoints ORDER BY created_at"
-            ).fetchall()
-        return [dict(r) for r in rows]
+        return self._endpoints.list()
 
     # --- host_call audit ----------------------------------------
     def log_host_call(
-        self, *, method: str, args: list, ok: bool, frame_id: str | None = None
+        self,
+        *,
+        method: str,
+        args: list,
+        ok: bool,
+        frame_id: str | None = None,
+        result: Any = None,
+        action_group_id: str | None = None,
+        action_id: str | None = None,
+        permission_decision_id: str | None = None,
+        side_effect_class: str | None = None,
+        resource_keys: list[str] | tuple[str, ...] | None = None,
     ) -> None:
-        if method in DERIVABLE_HOST_CALLS:
-            return  # never persisted (credentials scrubber)
-        if method in SECRET_ARG_HOST_CALLS:
-            # audit that the call happened, but never the secret payload.
-            preview = "<redacted secret args>"
-        else:
-            try:
-                preview = json.dumps(args, ensure_ascii=False)[:500]
-            except (TypeError, ValueError):
-                preview = "<unserializable>"
-        self._exec(
-            "INSERT INTO host_call_log(call_id,frame_id,method,args_preview,ok,"
-            "created_at) VALUES(?,?,?,?,?,?)",
-            (
-                f"hc-{uuid.uuid4().hex[:12]}",
-                frame_id,
-                method,
-                preview,
-                1 if ok else 0,
-                _now_ms(),
-            ),
+        self._host_calls.log(
+            method=method,
+            args=args,
+            ok=ok,
+            frame_id=frame_id,
+            result=result,
+            action_group_id=action_group_id,
+            action_id=action_id,
+            permission_decision_id=permission_decision_id,
+            side_effect_class=side_effect_class,
+            resource_keys=resource_keys,
         )
 
     # --- generic read-only query (host.query backing) -------------------
@@ -2519,12 +2550,21 @@ _STORES: dict[str, Store] = {}
 _STORES_LOCK = threading.Lock()
 
 
+def _discard_store(store: Store) -> None:
+    """Remove a closed singleton without evicting a newer replacement."""
+
+    key = str(store.db_path.resolve())
+    with _STORES_LOCK:
+        if _STORES.get(key) is store:
+            _STORES.pop(key, None)
+
+
 def get_store(db_path: Path) -> Store:
     """Process-wide singleton Store per db path."""
     key = str(Path(db_path).resolve())
     with _STORES_LOCK:
         st = _STORES.get(key)
-        if st is None:
+        if st is None or st._closed:
             st = Store(Path(db_path))
             _STORES[key] = st
     return st

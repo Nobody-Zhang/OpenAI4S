@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import io
 import json
 import re
@@ -7,6 +8,8 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from openai4s.config import Config, LLMConfig
 from openai4s.server import gateway as gateway_mod
@@ -29,6 +32,405 @@ class _Hub:
         self.events.append(event)
 
 
+def test_demo_seed_can_be_disabled_for_ci_and_air_gapped_startup(monkeypatch):
+    monkeypatch.delenv("OPENAI4S_SEED_DEMO", raising=False)
+    assert gateway_mod._demo_seed_enabled() is True
+    for value in ("0", "false", "NO", "off"):
+        monkeypatch.setenv("OPENAI4S_SEED_DEMO", value)
+        assert gateway_mod._demo_seed_enabled() is False
+    monkeypatch.setenv("OPENAI4S_SEED_DEMO", "1")
+    assert gateway_mod._demo_seed_enabled() is True
+
+
+def test_ws_resume_buffer_replaces_notebook_drafts_and_keeps_live_cell_events():
+    hub = gateway_mod.WSHub()
+    root = "root-draft-replay"
+    hub.broadcast(root, {"type": "text_reset", "frame_id": root})
+    hub.broadcast(
+        root,
+        {
+            "type": "notebook_cell_draft",
+            "frame_id": root,
+            "draft_id": "draft-1",
+            "revision": 1,
+            "source": "x =",
+        },
+    )
+    hub.broadcast(
+        root,
+        {
+            "type": "notebook_cell_draft",
+            "frame_id": root,
+            "draft_id": "draft-1",
+            "revision": 2,
+            "source": "x = 1",
+        },
+    )
+    hub.broadcast(
+        root,
+        {"type": "notebook_cell_start", "frame_id": root, "cell_id": "cell-1"},
+    )
+    hub.broadcast(
+        root,
+        {
+            "type": "notebook_cell_chunk",
+            "frame_id": root,
+            "cell_id": "cell-1",
+            "chunk": "1\n",
+        },
+    )
+
+    events = hub._live[root]["events"]
+    drafts = [event for event in events if event["type"] == "notebook_cell_draft"]
+    assert len(drafts) == 1
+    assert drafts[0]["revision"] == 2
+    assert drafts[0]["source"] == "x = 1"
+    assert {event["type"] for event in events} >= {
+        "notebook_cell_start",
+        "notebook_cell_chunk",
+    }
+
+
+def test_ws_resume_coalesces_notebook_and_activity_stdout_independently():
+    hub = gateway_mod.WSHub()
+    root = "root-chunk-coalesce"
+    hub.broadcast(root, {"type": "text_reset", "frame_id": root})
+    hub.broadcast(
+        root,
+        {
+            "type": "notebook_cell_start",
+            "frame_id": root,
+            "producing_cell_id": "cell-1",
+        },
+    )
+    # The activity header is not a stdout echo and must remain replayable.
+    hub.broadcast(
+        root,
+        {
+            "type": "text_chunk",
+            "frame_id": root,
+            "block_type": "tool",
+            "producing_cell_id": "cell-1",
+            "cell_index": 1,
+            "chunk": "cell header\n",
+        },
+    )
+    for chunk in ("alpha", " beta"):
+        hub.broadcast(
+            root,
+            {
+                "type": "notebook_cell_chunk",
+                "frame_id": root,
+                "producing_cell_id": "cell-1",
+                "stream": "stdout",
+                "chunk": chunk,
+            },
+        )
+        hub.broadcast(
+            root,
+            {
+                "type": "text_chunk",
+                "frame_id": root,
+                "block_type": "tool",
+                "producing_cell_id": "cell-1",
+                "chunk": chunk,
+            },
+        )
+
+    # A semantic event boundary starts a fresh pair; stdout is never moved
+    # across a step merely to improve compression.
+    hub.broadcast(root, {"type": "step", "frame_id": root, "ordinal": 1})
+    for event_type in ("notebook_cell_chunk", "text_chunk"):
+        event = {
+            "type": event_type,
+            "frame_id": root,
+            "producing_cell_id": "cell-1",
+            "chunk": " gamma",
+        }
+        if event_type == "notebook_cell_chunk":
+            event["stream"] = "stdout"
+        else:
+            event["block_type"] = "tool"
+        hub.broadcast(root, event)
+
+    events = hub._live[root]["events"]
+    chunks = [event for event in events if event["type"] == "notebook_cell_chunk"]
+    assert [event["chunk"] for event in chunks] == ["alpha beta", " gamma"]
+    tool_text = [
+        event
+        for event in events
+        if event["type"] == "text_chunk" and event.get("block_type") == "tool"
+    ]
+    assert [event["chunk"] for event in tool_text] == [
+        "cell header\n",
+        "alpha beta",
+        " gamma",
+    ]
+
+
+def test_ws_stray_state_does_not_create_phantom_live_buffer_and_repl_is_bounded():
+    hub = gateway_mod.WSHub()
+    root = "root-stray-state"
+
+    for event in (
+        {"type": "kernel_status", "frame_id": root, "status": "started"},
+        {"type": "frame_update", "frame_id": root, "status": "updated"},
+        {"type": "frame_update", "frame_id": root, "status": "ready"},
+    ):
+        hub.broadcast(root, event)
+    assert root not in hub._live
+    assert hub.is_running(root) is False
+
+    hub.broadcast(
+        root,
+        {
+            "type": "notebook_cell_start",
+            "frame_id": root,
+            "producing_cell_id": "repl-cell",
+            "origin": "user",
+        },
+    )
+    assert hub.is_running(root) is True
+    hub.broadcast(
+        root,
+        {
+            "type": "notebook_cell_finished",
+            "frame_id": root,
+            "producing_cell_id": "repl-cell",
+            "origin": "user",
+            "status": "ok",
+        },
+    )
+    assert hub.is_running(root) is False
+
+    # If preparation fails after start but before a Cell finish projection, the
+    # execution coordinator's terminal state still closes the REPL window.
+    hub.broadcast(
+        root,
+        {
+            "type": "notebook_cell_start",
+            "frame_id": root,
+            "producing_cell_id": "repl-failed",
+            "origin": "user",
+        },
+    )
+    assert hub.is_running(root) is True
+    hub.broadcast(
+        root,
+        {
+            "type": "execution_state",
+            "frame_id": root,
+            "execution_id": "repl-failed",
+            "status": "failed",
+        },
+    )
+    assert hub.is_running(root) is False
+
+
+def test_ws_resume_trim_preserves_active_cell_start_before_tail_chunks():
+    hub = gateway_mod.WSHub()
+    hub._BUFFER_CAP = 6
+    root = "root-trim-active-cell"
+    hub.broadcast(root, {"type": "text_reset", "frame_id": root})
+    hub.broadcast(
+        root,
+        {
+            "type": "notebook_cell_start",
+            "frame_id": root,
+            "producing_cell_id": "cell-live",
+        },
+    )
+    for ordinal in range(12):
+        hub.broadcast(
+            root,
+            {"type": "step", "frame_id": root, "ordinal": ordinal},
+        )
+    hub.broadcast(
+        root,
+        {
+            "type": "notebook_cell_chunk",
+            "frame_id": root,
+            "producing_cell_id": "cell-live",
+            "chunk": "still running",
+        },
+    )
+
+    events = hub._live[root]["events"]
+    assert len(events) <= hub._BUFFER_CAP
+    types = [event["type"] for event in events]
+    assert types[0] == "text_reset"
+    assert "notebook_cell_start" in types
+    assert "notebook_cell_chunk" in types
+    assert types.index("notebook_cell_start") < types.index("notebook_cell_chunk")
+
+
+def test_ws_subscribe_replay_enqueue_is_atomic_with_live_broadcast():
+    hub = gateway_mod.WSHub()
+    root = "root-atomic-replay"
+    hub.broadcast(root, {"type": "text_reset", "frame_id": root})
+    hub.broadcast(root, {"type": "text_chunk", "frame_id": root, "chunk": "old"})
+
+    class BlockingConnection:
+        def __init__(self):
+            self.alive = True
+            self.subs = set()
+            self.events = []
+            self.replay_started = threading.Event()
+            self.release_replay = threading.Event()
+
+        def send_json(self, event):
+            self.events.append(dict(event))
+            if event.get("type") == "replay_begin":
+                self.replay_started.set()
+                assert self.release_replay.wait(2)
+
+    conn = BlockingConnection()
+    hub.add(conn)
+    subscribe = threading.Thread(target=hub.subscribe, args=(root, conn))
+    subscribe.start()
+    assert conn.replay_started.wait(2)
+
+    live = threading.Thread(
+        target=hub.broadcast,
+        args=(root, {"type": "text_chunk", "frame_id": root, "chunk": "new"}),
+    )
+    live.start()
+    # The live producer is waiting on the replay's enqueue transaction.
+    live.join(0.05)
+    assert live.is_alive()
+    conn.release_replay.set()
+    subscribe.join(2)
+    live.join(2)
+    assert not subscribe.is_alive()
+    assert not live.is_alive()
+
+    assert [event.get("type") for event in conn.events] == [
+        "replay_begin",
+        "text_reset",
+        "text_chunk",
+        "replay_end",
+        "text_chunk",
+    ]
+    assert [
+        event.get("chunk") for event in conn.events if event.get("type") == "text_chunk"
+    ] == ["old", "new"]
+
+
+def test_ws_outbound_queue_covers_a_complete_resume_envelope():
+    assert gateway_mod.WSConnection._QUEUE_CAP >= (
+        gateway_mod.WSHub._BUFFER_CAP + gateway_mod._WS_REPLAY_ENVELOPE_EVENTS
+    )
+    assert gateway_mod.WSConnection._QUEUE_BYTE_CAP >= (
+        gateway_mod.WSHub._BUFFER_BYTE_CAP + gateway_mod._WS_REPLAY_QUEUE_BYTE_HEADROOM
+    )
+
+
+def test_ws_connection_byte_budget_drops_and_clears_queued_accounting():
+    class PausedConnection(gateway_mod.WSConnection):
+        def __init__(self):
+            self.release_writer = threading.Event()
+            super().__init__(io.BytesIO())
+
+        def _drain(self):
+            assert self.release_writer.wait(2)
+            super()._drain()
+
+    conn = PausedConnection()
+    conn._QUEUE_BYTE_CAP = 10
+    conn._enqueue(b"123456")
+    conn._enqueue(b"7890")
+    assert conn.alive is True
+    assert conn._queued_bytes == 10
+
+    conn._enqueue(b"!")
+    assert conn.alive is False
+    assert conn._queued_bytes == 0
+    conn.release_writer.set()
+    conn._writer.join(2)
+    assert not conn._writer.is_alive()
+
+
+def test_ws_connection_counts_a_socket_blocked_frame_against_byte_budget():
+    class BlockingWriter:
+        def __init__(self):
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def write(self, frame):
+            self.started.set()
+            assert self.release.wait(2)
+            return len(frame)
+
+        def flush(self):
+            return None
+
+    writer = BlockingWriter()
+    conn = gateway_mod.WSConnection(writer)
+    conn._QUEUE_BYTE_CAP = 10
+    conn._enqueue(b"123456")
+    assert writer.started.wait(2)
+    assert conn._queued_bytes == 6
+
+    # The six bytes currently blocked in write() still consume the budget.
+    conn._enqueue(b"78901")
+    assert conn.alive is False
+    assert conn._queued_bytes == 0
+    writer.release.set()
+    conn._writer.join(2)
+    assert not conn._writer.is_alive()
+
+
+def test_ws_resume_byte_budget_keeps_reset_active_start_and_latest_tail():
+    hub = gateway_mod.WSHub()
+    hub._BUFFER_CAP = 100
+    hub._BUFFER_BYTE_CAP = 900
+    root = "root-byte-trim"
+    hub.broadcast(root, {"type": "text_reset", "frame_id": root})
+    hub.broadcast(
+        root,
+        {
+            "type": "notebook_cell_start",
+            "frame_id": root,
+            "producing_cell_id": "cell-byte",
+        },
+    )
+    for sequence in range(6):
+        hub.broadcast(
+            root,
+            {
+                "type": "text_chunk",
+                "frame_id": root,
+                "block_type": "text",
+                "sequence": sequence,
+                "chunk": str(sequence) + ("x" * 300),
+            },
+        )
+
+    buf = hub._live[root]
+    assert buf["event_bytes"] == sum(
+        hub._event_wire_size(event) for event in buf["events"]
+    )
+    assert buf["event_bytes"] <= hub._BUFFER_BYTE_CAP
+    assert len(buf["event_sizes"]) == len(buf["events"])
+    assert len(buf["events"]) < 8  # count cap=100; only byte pressure trimmed it
+    types = [event["type"] for event in buf["events"]]
+    assert types[0] == "text_reset"
+    assert "notebook_cell_start" in types
+    assert types.index("notebook_cell_start") < len(types) - 1
+    assert buf["events"][-1]["sequence"] == 5
+
+
+def test_ws_live_frame_limit_is_hard_even_when_every_buffer_is_running():
+    hub = gateway_mod.WSHub()
+    hub._MAX_LIVE_FRAMES = 2
+    for root in ("root-live-1", "root-live-2", "root-live-3"):
+        hub.broadcast(root, {"type": "text_reset", "frame_id": root})
+
+    assert list(hub._live) == ["root-live-2", "root-live-3"]
+    assert all(buf["running"] for buf in hub._live.values())
+    assert hub.is_running("root-live-1") is False
+
+
 def _cfg(tmp_path):
     return Config(
         data_dir=tmp_path,
@@ -37,7 +439,44 @@ def _cfg(tmp_path):
     )
 
 
-def test_gateway_plain_answer_is_nudged_until_structured_submit(monkeypatch, tmp_path):
+def test_permission_resolution_does_not_create_live_turn_buffer():
+    hub = gateway_mod.WSHub()
+    hub.broadcast(
+        "root-restart",
+        {
+            "type": "permission_resolved",
+            "frame_id": "root-restart",
+            "decision_id": "perm-restart",
+            "resolution_context": "after_restart",
+            "requires_continue": True,
+        },
+    )
+    assert hub.is_running("root-restart") is False
+
+
+def test_completion_nudge_falls_back_to_code_for_no_tool_endpoint(monkeypatch):
+    monkeypatch.setattr(
+        gateway_mod,
+        "get_model_capabilities",
+        lambda *args, **kwargs: SimpleNamespace(tool_calling=False),
+    )
+
+    nudge = gateway_mod._submit_nudge_for(
+        SimpleNamespace(
+            provider="local-openai",
+            model="local-model",
+            base_url="http://127.0.0.1:11434/v1",
+        )
+    )
+
+    assert "without native tool calling" in nudge
+    assert "host.submit_output" in nudge
+    assert "finalize_response" not in nudge
+
+
+def test_gateway_plain_answer_is_nudged_to_structured_finalize_without_kernel(
+    monkeypatch, tmp_path
+):
     cfg = _cfg(tmp_path)
     hub = _Hub()
     runner = gateway_mod.SessionRunner(cfg, hub)
@@ -45,31 +484,53 @@ def test_gateway_plain_answer_is_nudged_until_structured_submit(monkeypatch, tmp
     fid = store.new_frame(kind="turn", project_id="default", status="ready")
     calls = []
 
+    finalize_arguments = {
+        "summary": "Short answer.",
+        "completion_bullets": ["Answered the question"],
+    }
+    finalize_call = {
+        "id": "final-plain-answer",
+        "wire_id": "final-plain-answer",
+        "name": "finalize_response",
+        "ordinal": 0,
+        "raw_arguments": json.dumps(finalize_arguments),
+        "arguments": finalize_arguments,
+        "parse_error": None,
+        "provider_meta": {},
+    }
     replies = iter(
         [
-            "Short answer.",
-            "```python\nhost.submit_output({'answer': 'Short answer.'}, ['done'])\n```",
+            {"content": "Short answer.", "usage": {}},
+            {
+                "content": "",
+                "tool_calls": [finalize_call],
+                "assistant_message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [finalize_call],
+                },
+                "usage": {},
+            },
         ]
     )
 
     def fake_chat(messages, cfg, on_delta=None, **kwargs):
         calls.append(messages)
-        content = next(replies)
-        if on_delta:
-            on_delta(content)
-        return {"content": content, "usage": {}}
+        reply = next(replies)
+        if on_delta and reply.get("content"):
+            on_delta(reply["content"])
+        return reply
 
     def fake_ensure(st):
         st.dispatcher = SimpleNamespace(last_output=None)
         st.messages = [{"role": "system", "content": "sys"}]
         st.booted = True
 
-    def fake_exec(st, code, origin, emit, stream=True):
-        st.dispatcher.last_output = {"output": {"answer": "Short answer."}}
-        return {"result": {"stdout": "", "stderr": "", "error": None}}
+    def fake_exec(*args, **kwargs):
+        raise AssertionError(f"conversational finalization started a Cell: {args!r}")
 
     monkeypatch.setattr(gateway_mod, "chat", fake_chat)
-    monkeypatch.setattr(runner, "_ensure_kernel", fake_ensure)
+    monkeypatch.setattr(runner, "_ensure_runtime", fake_ensure)
     monkeypatch.setattr(runner, "_execute_and_log", fake_exec)
     # the background title-summary chat would also land in `calls` and race the
     # count; it is orthogonal to the plain-answer path under test
@@ -84,11 +545,68 @@ def test_gateway_plain_answer_is_nudged_until_structured_submit(monkeypatch, tmp
         for m in calls[1]
         if m["role"] == "user"
     )
+    nudge = next(
+        m["content"]
+        for m in calls[1]
+        if m["role"] == "user" and "Prose is not a completion signal" in m["content"]
+    )
+    assert "finalize_response" in nudge
+    assert "do NOT start a Python/R kernel merely to finish" in nudge
+    assert runner._state(fid, "default").kernel is None
     messages = store.list_messages(fid)
-    assert [m["role"] for m in messages] == ["user", "assistant"]
-    assert messages[-1]["content"] == "Short answer."
+    assert [m["role"] for m in messages] == ["user", "assistant", "assistant"]
+    assert messages[-2]["content"] == "Short answer."
+    assert "Answered the question" in messages[-1]["content"]
     assert hub.events[-1]["type"] == "frame_update"
     assert hub.events[-1]["status"] == "completed"
+
+
+def test_gateway_projects_submit_only_result_as_live_and_persisted_final_message(
+    monkeypatch, tmp_path
+):
+    cfg = _cfg(tmp_path)
+    hub = _Hub()
+    runner = gateway_mod.SessionRunner(cfg, hub)
+    store = get_store(cfg.db_path)
+    fid = store.new_frame(kind="turn", project_id="default", status="ready")
+
+    def fake_ensure(st):
+        st.dispatcher = SimpleNamespace(last_output=None)
+        st.messages = [{"role": "system", "content": "sys"}]
+        st.booted = True
+
+    def finish_without_model_prose(st, emit, visible):
+        del emit, visible
+        st.dispatcher.last_output = {
+            "output": {"summary": "已完成真实数据分析。"},
+            "completion_bullets": ["生成了结果表", "总结了关键发现"],
+        }
+        st.last_model_prose = ""
+        return "submitted"
+
+    monkeypatch.setattr(runner, "_ensure_runtime", fake_ensure)
+    monkeypatch.setattr(runner, "_loop", finish_without_model_prose)
+    monkeypatch.setattr(runner, "_spawn_title_summary", lambda *a, **k: None)
+
+    result = runner.run_message(fid, "default", "分析这些真实数据")
+
+    assert result["status"] == "completed"
+    messages = store.list_messages(fid)
+    assert [message["role"] for message in messages] == ["user", "assistant"]
+    assert "已完成真实数据分析" in messages[-1]["content"]
+    assert "生成了结果表" in messages[-1]["content"]
+    assert "no textual response" not in messages[-1]["content"]
+    final_text_index = max(
+        index
+        for index, event in enumerate(hub.events)
+        if event.get("type") == "text_chunk" and "已完成真实数据分析" in event.get("chunk", "")
+    )
+    terminal_index = max(
+        index
+        for index, event in enumerate(hub.events)
+        if event.get("type") == "frame_update" and event.get("status") == "completed"
+    )
+    assert final_text_index < terminal_index
 
 
 def test_submit_message_runs_turn_in_background(tmp_path):
@@ -232,7 +750,7 @@ def test_auto_capture_preserves_version_bytes(tmp_path):
     )
 
 
-def test_restore_version_reverts_live_and_latest(tmp_path):
+def test_restore_version_appends_fresh_current_version(tmp_path):
     cfg, runner, store, fid, st = _runner_frame(tmp_path)
     f = st.workspace / "fig.txt"
     f.write_text("ALPHA")
@@ -240,15 +758,24 @@ def test_restore_version_reverts_live_and_latest(tmp_path):
     f.write_text("BETA")
     rec2 = runner._register_file(st, f, "c2", lambda e: None)
 
+    source_before = store.version_meta(rec1["version_id"])
     res = runner.restore_version(rec1["artifact_id"], rec1["version_id"])
     assert res.get("ok")
+    restored_version_id = res["version_id"]
+    assert restored_version_id not in {rec1["version_id"], rec2["version_id"]}
+    assert res["restored_from_version_id"] == rec1["version_id"]
+    assert res["artifact"]["version_id"] == restored_version_id
     # the live workspace file is reverted so the agent sees the old content
     assert f.read_text() == "ALPHA"
-    # the latest pointer moved back to the restored version
+    # Restore is append-only: a fresh version becomes current, never the old row.
     a = store.get_artifact(rec1["artifact_id"])
-    assert a["latest_version_id"] == rec1["version_id"]
+    assert a["latest_version_id"] == restored_version_id
     assert Path(store.resolve_artifact_path(rec1["artifact_id"])).read_text() == "ALPHA"
-    # history is preserved — the superseded version still serves its own bytes
+    assert store.version_meta(rec1["version_id"]) == source_before
+    assert store.lineage_edges_for(restored_version_id, "up") == [rec1["version_id"]]
+    assert len(store.list_versions(rec1["artifact_id"])) == 3
+    # Both historical versions still serve their own immutable bytes.
+    assert Path(store.resolve_artifact_path(rec1["version_id"])).read_text() == "ALPHA"
     assert Path(store.resolve_artifact_path(rec2["version_id"])).read_text() == "BETA"
 
     # a nonexistent / foreign version_id is rejected, not silently applied
@@ -257,6 +784,46 @@ def test_restore_version_reverts_live_and_latest(tmp_path):
     g.write_text("G")
     other = runner._register_file(st, g, "c3", lambda e: None)
     assert runner.restore_version(rec1["artifact_id"], other["version_id"]).get("error")
+
+
+def test_restore_route_returns_fresh_identity_and_surfaces_verification_error(
+    tmp_path,
+):
+    cfg, runner, store, fid, st = _runner_frame(tmp_path)
+    hub = _Hub()
+    handler_cls = gateway_mod.make_handler(cfg, hub, runner)
+    handler = object.__new__(handler_cls)
+    replies = []
+    handler._query = lambda: {}
+    handler._body = lambda: {}
+    handler._json = lambda obj, code=200: replies.append((code, obj))
+
+    path = st.workspace / "route.txt"
+    path.write_bytes(b"ALPHA")
+    first = runner._register_file(st, path, "c1", lambda event: None)
+    path.write_bytes(b"BETA")
+    second = runner._register_file(st, path, "c2", lambda event: None)
+
+    route = (
+        f"/artifacts/{first['artifact_id']}/versions/" f"{first['version_id']}/restore"
+    )
+    handler._api("POST", route)
+
+    code, response = replies[-1]
+    assert code == 200
+    assert response["version_id"] not in {
+        first["version_id"],
+        second["version_id"],
+    }
+    assert response["restored_from_version_id"] == first["version_id"]
+    assert response["artifact"]["version_id"] == response["version_id"]
+    assert path.read_bytes() == b"ALPHA"
+
+    source = store.version_meta(first["version_id"])
+    Path(source["snapshot_path"]).write_bytes(b"tampered")
+    handler._api("POST", route)
+    assert replies[-1][0] == 404
+    assert "checksum verification failed" in replies[-1][1]["error"]
 
 
 def test_save_artifact_atomic_and_delete_cleans_snapshots(tmp_path):
@@ -303,7 +870,7 @@ def test_explore_mode_injects_protocol_and_nudges_prose_stalls(monkeypatch, tmp_
         st.booted = True
 
     monkeypatch.setattr(gateway_mod, "chat", fake_chat)
-    monkeypatch.setattr(runner, "_ensure_kernel", fake_ensure)
+    monkeypatch.setattr(runner, "_ensure_runtime", fake_ensure)
     # silence the background title-summary chat (it would race `calls`)
     monkeypatch.setattr(runner, "_spawn_title_summary", lambda *a, **k: None)
 
@@ -373,13 +940,13 @@ def test_midtask_prose_conclusion_still_requires_structured_submit(
         st.messages = [{"role": "system", "content": "sys"}]
         st.booted = True
 
-    def fake_exec(st, code, origin, emit, stream=True):
+    def fake_exec(st, code, origin, emit, stream=True, language="python"):
         if "host.submit_output" in code:
             st.dispatcher.last_output = {"output": {"answer": 42}}
         return {"result": {"stdout": "x\n", "stderr": "", "error": None}}
 
     monkeypatch.setattr(gateway_mod, "chat", fake_chat)
-    monkeypatch.setattr(runner, "_ensure_kernel", fake_ensure)
+    monkeypatch.setattr(runner, "_ensure_runtime", fake_ensure)
     monkeypatch.setattr(runner, "_execute_and_log", fake_exec)
     monkeypatch.setattr(runner, "_spawn_title_summary", lambda *a, **k: None)
 
@@ -431,13 +998,13 @@ def test_batched_code_blocks_warn_only_first_ran(monkeypatch, tmp_path):
         st.messages = [{"role": "system", "content": "sys"}]
         st.booted = True
 
-    def fake_exec(st, code, origin, emit, stream=True):
+    def fake_exec(st, code, origin, emit, stream=True, language="python"):
         if "host.submit_output" in code:
             st.dispatcher.last_output = {"output": {"ok": True}}
         return {"result": {"stdout": "a\n", "stderr": "", "error": None}}
 
     monkeypatch.setattr(gateway_mod, "chat", fake_chat)
-    monkeypatch.setattr(runner, "_ensure_kernel", fake_ensure)
+    monkeypatch.setattr(runner, "_ensure_runtime", fake_ensure)
     monkeypatch.setattr(runner, "_execute_and_log", fake_exec)
     monkeypatch.setattr(runner, "_spawn_title_summary", lambda *a, **k: None)
 
@@ -535,6 +1102,42 @@ def test_model_profile_activate_moves_to_front_and_sanitizes_key(tmp_path):
     assert [p["id"] for p in store.list_model_profiles()] == ["mp-b", "mp-a"]
     assert store.get_setting("active_model_profile") == "mp-b"
     assert store.get_setting("llm_api_key") == ""
+
+
+def test_local_model_discovery_route_is_explicit_and_non_mutating(
+    monkeypatch, tmp_path
+):
+    class Discovery:
+        def discover(self, *, force=False):
+            return {
+                "endpoints": [{"kind": "ollama", "models": ["qwen3:8b"]}],
+                "probed": 4,
+                "cached": not force,
+                "mutated_settings": False,
+            }
+
+    monkeypatch.setattr(gateway_mod, "LocalModelDiscoveryService", Discovery)
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    handler = object.__new__(handler_cls)
+    replies = []
+    handler._query = lambda: {"force": ["true"]}
+    handler._json = lambda obj, code=200: replies.append((code, obj))
+
+    handler._api("GET", "/model-endpoints/discover")
+
+    assert replies == [
+        (
+            200,
+            {
+                "endpoints": [{"kind": "ollama", "models": ["qwen3:8b"]}],
+                "probed": 4,
+                "cached": False,
+                "mutated_settings": False,
+            },
+        )
+    ]
 
 
 # --- API contract assertions (documented in docs/webapp-api.md) ------------
@@ -674,10 +1277,8 @@ def test_edit_rename_upload_artifact_created_shapes(tmp_path):
     assert art["root_frame_id"] == fid
 
 
-def test_plan_flat_and_bare_artifact_created_shapes(tmp_path):
-    """Shapes 3 and 4 of artifact_created (docs/webapp-api.md §3): the plan
-    artifact emits a FLAT event (no nested `artifact` key), and delete /
-    version-restore emit a BARE {"type","root_frame_id"} refresh signal."""
+def test_plan_restore_and_delete_artifact_created_shapes(tmp_path):
+    """Plan stays flat, restore carries its fresh cache identity, delete bare."""
     cfg = _cfg(tmp_path)
     hub = _Hub()
     runner = gateway_mod.SessionRunner(cfg, hub)
@@ -695,19 +1296,23 @@ def test_plan_flat_and_bare_artifact_created_shapes(tmp_path):
     assert ev["artifact_id"] == rec["artifact_id"]
     assert ev["filename"].startswith("plan_") and ev["filename"].endswith(".json")
 
-    # shape 4a: version restore — bare refresh signal via runner.hub
+    # Version restore carries the fresh append-only identity for cache busting.
     f = st.workspace / "fig.txt"
     f.write_text("ALPHA")
     r1 = runner._register_file(st, f, "c1", lambda e: None)
     f.write_text("BETA")
     runner._register_file(st, f, "c2", lambda e: None)
     hub.events.clear()
-    assert runner.restore_version(r1["artifact_id"], r1["version_id"]).get("ok")
+    restored = runner.restore_version(r1["artifact_id"], r1["version_id"])
+    assert restored.get("ok")
     ev = [e for e in hub.events if e.get("type") == "artifact_created"][-1]
-    assert set(ev) == {"type", "root_frame_id"}
+    assert set(ev) == {"type", "root_frame_id", "artifact"}
     assert ev["root_frame_id"] == fid
+    assert ev["artifact"]["id"] == ev["artifact"]["artifact_id"] == r1["artifact_id"]
+    assert ev["artifact"]["version_id"] == restored["version_id"]
+    assert ev["artifact"]["restored_from_version_id"] == r1["version_id"]
 
-    # shape 4b: DELETE /api/artifacts/{aid} — same bare form + {"ok": true}
+    # DELETE /api/artifacts/{aid} retains the bare refresh form + {"ok": true}.
     handler_cls = gateway_mod.make_handler(cfg, hub, runner)
     handler = object.__new__(handler_cls)
     replies = []
@@ -729,7 +1334,10 @@ def test_frame_update_status_literal_vocabulary(tmp_path):
     terminal site emits a VARIABLE status ∈ {completed, failed, cancelled}
     (asserted behaviorally by the structured-submit and max-turn tests above).
     If this fails, a status was added/removed — update docs/webapp-api.md."""
+    from openai4s.server import titles as titles_mod
+
     src = Path(gateway_mod.__file__).read_text(encoding="utf-8")
+    src += Path(titles_mod.__file__).read_text(encoding="utf-8")
     sites = list(re.finditer(r'"type": "frame_update"', src))
     assert len(sites) >= 7  # the emit sites documented today
     literals = set()
@@ -814,6 +1422,7 @@ def test_token_gate_401_and_cookie_redirect(monkeypatch, tmp_path, capsys):
     handler._route("GET")
     code, body = replies[-1]
     assert code == 200 and body["status"] == "ok"
+    assert "data_dir" not in body
 
     # valid ?token= on a GET → 303 to / with the os_token cookie set
     resp = {"code": None, "headers": {}}
@@ -893,12 +1502,51 @@ def test_cross_origin_api_write_is_refused(tmp_path):
     assert replies == [(403, {"error": "cross-origin request refused"})]
 
 
+def test_cross_origin_ws_upgrade_is_refused(tmp_path):
+    """The /api/ws upgrade (a GET) gets the same Origin==Host CSRF check as
+    mutating verbs, since WebSocket handshakes bypass CORS and the socket
+    accepts state-changing commands + streams session output."""
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    handler = object.__new__(handler_cls)
+    handler.headers = {"Origin": "http://evil.example", "Host": "127.0.0.1:8760"}
+    replies = []
+    upgraded = []
+    handler._json = lambda obj, code=200: replies.append((code, obj))
+    handler._handle_ws = lambda: upgraded.append(True)
+    handler.path = "/api/ws"
+    handler._route("GET")
+
+    assert upgraded == []
+    assert replies == [(403, {"error": "cross-origin request refused"})]
+
+
+def test_ws_upgrade_allows_absent_and_same_origin(tmp_path):
+    """A same-origin browser upgrade (Origin == Host) and an Origin-less client
+    (CLI/tests) both pass the WS CSRF gate."""
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    for headers in (
+        {"Host": "127.0.0.1:8760"},
+        {"Origin": "http://127.0.0.1:8760", "Host": "127.0.0.1:8760"},
+    ):
+        handler = object.__new__(handler_cls)
+        handler.headers = headers
+        upgraded = []
+        handler._json = lambda obj, code=200: None
+        handler._handle_ws = lambda: upgraded.append(True)
+        handler.path = "/api/ws"
+        handler._route("GET")
+        assert upgraded == [True]
+
+
 def test_execution_log_route_serializer_contract(tmp_path):
     """GET /api/frames/{fid}/execution-log — the Notebook data contract: each
-    entry carries exactly source/stdout/stderr/error/status/figures/
-    files_written/files_read/cpu_seconds/peak_rss_kb (+ cell_index/kernel_id/
-    language), with code→source and cpu_s→cpu_seconds renames and ""/[] (never
-    null) defaults."""
+    entry carries immutable identity plus source/stdout/stderr/error/status,
+    artifacts/resources and retry-projection metadata, with code→source and
+    cpu_s→cpu_seconds renames and ""/[] (never null) defaults."""
     cfg = _cfg(tmp_path)
     runner = gateway_mod.SessionRunner(cfg, _Hub())
     handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
@@ -950,10 +1598,25 @@ def test_execution_log_route_serializer_contract(tmp_path):
     assert len(body["entries"]) == 2
     e1, e2 = body["entries"]
     assert set(e1) == {
+        "producing_cell_id",
+        "fork_checkpoint_id",
         "cell_index",
+        "state_revision",
+        "generation_id",
         "kernel_id",
         "language",
+        "origin",
         "source",
+        "code_hash",
+        "visibility",
+        "pin",
+        "replay_policy",
+        "variable_reads",
+        "variable_writes",
+        "variable_deletes",
+        "mutation_uncertain",
+        "stale",
+        "stale_reasons",
         "stdout",
         "stderr",
         "error",
@@ -963,8 +1626,27 @@ def test_execution_log_route_serializer_contract(tmp_path):
         "files_read",
         "cpu_seconds",
         "peak_rss_kb",
+        "attempt_group_id",
+        "attempt",
+        "revision_of",
+        "is_latest_attempt",
+        "attempt_count",
     }
+    assert e1["producing_cell_id"] == "cell-1"
+    assert e1["fork_checkpoint_id"] is None
+    assert e1["state_revision"] == 1
+    assert e1["generation_id"] is None
+    assert e1["attempt_group_id"] == "cell-1"
     assert e1["source"] == "print('hi')"  # code -> source rename
+    assert e1["code_hash"] == hashlib.sha256(b"print('hi')").hexdigest()
+    assert e1["visibility"] == "scientific"
+    assert e1["pin"] is False
+    assert e1["replay_policy"] == "conditional"
+    assert e1["variable_reads"] == ["print"]
+    assert e1["variable_writes"] == []
+    assert e1["variable_deletes"] == []
+    assert e1["mutation_uncertain"] is False
+    assert e1["stale"] is False and e1["stale_reasons"] == []
     assert e1["status"] == "ok"
     assert e1["cpu_seconds"] == 0.25  # cpu_s -> cpu_seconds rename
     assert e1["peak_rss_kb"] == 2048
@@ -979,8 +1661,8 @@ def test_execution_log_route_serializer_contract(tmp_path):
 
 def test_lineage_serializer_producing_cell_and_inputs(tmp_path):
     """The artifact lineage payload (UI provenance view): a produced artifact
-    reports its producing cell interaction + save event, and
-    dependency_mappings.inputs = files_read minus files_written minus itself.
+    reports its producing cell interaction + save event, and merges legacy
+    execution-log reads with real version lineage before filtering outputs.
     An unknown artifact returns the same shape, empty."""
     cfg, runner, store, fid, st = _runner_frame(tmp_path)
     handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
@@ -992,12 +1674,40 @@ def test_lineage_serializer_producing_cell_and_inputs(tmp_path):
         code="plot(df)",
         result={"id": "cell-7", "stdout": "", "stderr": "", "error": None},
         cell_index=3,
-        files_read=["raw.csv", "fig.txt"],
+        files_read=["legacy.csv", "fig.txt", "raw.csv"],
         files_written=["fig.txt"],
+    )
+    raw = store.save_artifact(
+        path=str(st.workspace / "raw.csv"),
+        filename="raw.csv",
+        content_type="text/csv",
+        size_bytes=3,
+        checksum="raw",
+        frame_id=fid,
+    )
+    edge_only = store.save_artifact(
+        path=str(st.workspace / "edge.csv"),
+        filename="edge.csv",
+        content_type="text/csv",
+        size_bytes=4,
+        checksum="edge",
+        frame_id=fid,
     )
     f = st.workspace / "fig.txt"
     f.write_text("bytes")
     rec = runner._register_file(st, f, "cell-7", lambda e: None)
+    store.add_lineage_edge(
+        input_version_id=raw["version_id"],
+        output_version_id=rec["version_id"],
+        producing_cell_id="cell-7",
+        frame_id=fid,
+    )
+    store.add_lineage_edge(
+        input_version_id=edge_only["version_id"],
+        output_version_id=rec["version_id"],
+        producing_cell_id="cell-7",
+        frame_id=fid,
+    )
 
     lin = handler._lineage(rec["artifact_id"])
     assert lin["artifact_id"] == rec["artifact_id"]
@@ -1009,8 +1719,12 @@ def test_lineage_serializer_producing_cell_and_inputs(tmp_path):
     assert cell["source"] == "plot(df)"
     assert cell["exit_status"] == "ok"
     assert cell["files_written"] == ["fig.txt"]
-    # inputs exclude what the cell itself wrote and the artifact's own filename
-    assert lin["dependency_mappings"] == {"inputs": ["raw.csv"]}
+    assert cell["files_read"] == ["legacy.csv", "fig.txt", "raw.csv", "edge.csv"]
+    # inputs exclude what the cell itself wrote and the artifact's own filename,
+    # while retaining both legacy telemetry and Store-backed lineage edges.
+    assert lin["dependency_mappings"] == {
+        "inputs": ["legacy.csv", "raw.csv", "edge.csv"]
+    }
 
     empty = handler._lineage("a-does-not-exist")
     assert empty == {
@@ -1019,6 +1733,63 @@ def test_lineage_serializer_producing_cell_and_inputs(tmp_path):
         "interactions": [],
         "dependency_mappings": {"inputs": []},
     }
+    replies = []
+    handler._query = lambda: {}
+    handler._json = lambda obj, code=200: replies.append((code, obj))
+    handler._api("GET", "/artifacts/a-does-not-exist/lineage")
+    assert replies[-1] == (200, empty)
+
+
+def test_lineage_serializer_follows_latest_and_restored_version_edges(tmp_path):
+    cfg, runner, store, fid, st = _runner_frame(tmp_path)
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    handler = object.__new__(handler_cls)
+    sources = []
+    for name in ("input-a.txt", "input-b.txt"):
+        path = st.workspace / name
+        path.write_text(name)
+        sources.append(
+            store.save_artifact(
+                path=str(path),
+                filename=name,
+                content_type="text/plain",
+                size_bytes=len(name),
+                checksum=name,
+                frame_id=fid,
+            )
+        )
+
+    output = st.workspace / "result.txt"
+    versions = []
+    for index, source in enumerate(sources, start=1):
+        cell_id = f"cell-{index}"
+        store.log_cell(
+            frame_id=fid,
+            root_frame_id=fid,
+            code=f"write version {index}",
+            result={"id": cell_id, "stdout": "", "stderr": "", "error": None},
+            cell_index=index,
+            files_read=[],
+            files_written=["result.txt"],
+        )
+        output.write_text(f"version {index}")
+        record = runner._register_file(st, output, cell_id, lambda event: None)
+        versions.append(record)
+        store.add_lineage_edge(
+            input_version_id=source["version_id"],
+            output_version_id=record["version_id"],
+            producing_cell_id=cell_id,
+            frame_id=fid,
+        )
+
+    latest = handler._lineage(versions[0]["artifact_id"])
+    assert latest["dependency_mappings"] == {"inputs": ["input-b.txt"]}
+    assert latest["interactions"][0]["files_read"] == ["input-b.txt"]
+
+    store.set_latest_version(versions[0]["artifact_id"], versions[0]["version_id"])
+    restored = handler._lineage(versions[0]["artifact_id"])
+    assert restored["dependency_mappings"] == {"inputs": ["input-a.txt"]}
+    assert restored["interactions"][0]["files_read"] == ["input-a.txt"]
 
 
 def test_upload_base64_decode_and_raw_fallback(tmp_path):
@@ -1239,6 +2010,96 @@ def test_body_malformed_json_treated_as_empty_dict(tmp_path):
     assert handler._body() == {}
 
 
+def test_ignored_json_body_is_buffered_before_next_keepalive_request(tmp_path):
+    """A no-argument POST may still carry ``{}``; its bytes must not prefix
+    the next HTTP/1.1 request line on the persistent connection."""
+
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    handler = object.__new__(handler_cls)
+    handler.headers = {"Content-Length": "2"}
+    handler.rfile = io.BytesIO(b"{}GET /health HTTP/1.1\r\n")
+    handler.close_connection = False
+    handler._request_body_tracking_active = True
+    handler._request_body_ready = False
+    handler._request_body_payload = b""
+
+    handler._prepare_request_body("/api/artifacts/a-1/versions/v-1/restore", "POST")
+
+    assert handler._body() == {}
+    assert handler.rfile.read() == b"GET /health HTTP/1.1\r\n"
+    assert handler.close_connection is False
+
+
+def test_request_body_rejects_ambiguous_or_unsupported_framing(tmp_path):
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    handler = object.__new__(handler_cls)
+    handler.rfile = io.BytesIO(b"")
+    handler.close_connection = False
+
+    handler.headers = {"Content-Length": "-1"}
+    with pytest.raises(gateway_mod.GatewayError, match="invalid Content-Length"):
+        handler._body()
+    assert handler.close_connection is True
+
+    handler.close_connection = False
+    handler.headers = {"Transfer-Encoding": "chunked"}
+    with pytest.raises(gateway_mod.GatewayError, match="Transfer-Encoding"):
+        handler._body()
+    assert handler.close_connection is True
+
+    class DuplicateLengthHeaders(dict):
+        def get_all(self, name):
+            return ["2", "2"] if name == "Content-Length" else None
+
+    handler.close_connection = False
+    handler.headers = DuplicateLengthHeaders({"Content-Length": "2"})
+    with pytest.raises(gateway_mod.GatewayError, match="ambiguous Content-Length"):
+        handler._body()
+    assert handler.close_connection is True
+
+
+def test_request_body_cache_is_released_after_keepalive_dispatch(tmp_path):
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    handler = object.__new__(handler_cls)
+    handler.path = "/ignored"
+    handler.headers = {"Content-Length": "2"}
+    handler.rfile = io.BytesIO(b"{}")
+    handler.close_connection = False
+    replies = []
+    handler._json = lambda obj, code=200: replies.append((code, obj))
+
+    handler._route("POST")
+
+    assert replies == [(404, {"error": "not found"})]
+    assert handler._request_body_payload == b""
+    assert handler._request_body_ready is False
+    assert handler._request_body_tracking_active is False
+    assert handler.close_connection is False
+
+
+def test_websocket_upgrade_is_never_reused_as_http_keepalive(tmp_path):
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    handler = object.__new__(handler_cls)
+    handler.path = "/api/ws"
+    handler.headers = {}
+    handler.close_connection = False
+    upgraded = []
+    handler._handle_ws = lambda: upgraded.append(True)
+
+    handler._route("GET")
+
+    assert upgraded == [True]
+    assert handler.close_connection is True
+
+
 # --- runtime-env labelling + resume (frames.runtime_env) ---------------------
 def test_kernel_id_labels_default_env_as_python_and_names_switches(tmp_path):
     """Phase 1: _kernel_id groups Notebook cells under a runtime segment —
@@ -1294,15 +2155,15 @@ def test_persisted_env_roundtrip_and_resume_seeds_new_session(monkeypatch, tmp_p
 def test_notebook_repl_execute_route_gated_by_flag(monkeypatch, tmp_path):
     """Phase 3: POST /frames/{fid}/kernel/execute is refused 403 when
     cfg.notebook_repl is False (the default read-only Notebook) and never
-    reaches runner.run_repl; with the flag on it proceeds to run_repl."""
-    # disabled by default → 403 error envelope, run_repl short-circuited
+    reaches runner.submit_repl; with the flag on it returns an async ticket."""
+    # disabled by default → 403 error envelope, submit_repl short-circuited
     cfg = _cfg(tmp_path)
     assert cfg.notebook_repl is False
     runner = gateway_mod.SessionRunner(cfg, _Hub())
     store = get_store(cfg.db_path)
     fid = store.new_frame(kind="turn", project_id="default", status="ready")
     called = []
-    runner.run_repl = lambda *a, **k: called.append((a, k)) or {"ok": True}
+    runner.submit_repl = lambda *a, **k: called.append((a, k)) or None
 
     handler = object.__new__(gateway_mod.make_handler(cfg, _Hub(), runner))
     replies = []
@@ -1316,26 +2177,71 @@ def test_notebook_repl_execute_route_gated_by_flag(monkeypatch, tmp_path):
         assert "disabled" in replies[-1][1]["error"]
     assert called == []  # the gate fired before the kernel path
 
-    # enabled (OPENAI4S_NOTEBOOK_REPL=1) → proceeds to runner.run_repl
+    # enabled (OPENAI4S_NOTEBOOK_REPL=1) → queues and returns immediately
     monkeypatch.setenv("OPENAI4S_NOTEBOOK_REPL", "1")
     cfg2 = _cfg(tmp_path)
     assert cfg2.notebook_repl is True
     runner2 = gateway_mod.SessionRunner(cfg2, _Hub())
-    sentinel = {"cell": {"cell_index": 1}}
     hits = []
-    runner2.run_repl = (
-        lambda rfid, pid, code: hits.append((rfid, pid, code)) or sentinel
+    ticket = SimpleNamespace(
+        job_id="job-repl",
+        execution_id="repl-client-exact",
+        execution_owner={"kind": "user_repl", "id": "repl-client-exact"},
+        wait_result=lambda: {"cell": {"cell_index": 1}},
+    )
+    runner2.submit_repl = lambda rfid, pid, code, **kwargs: (
+        hits.append((rfid, pid, code, kwargs)) or ticket
     )
 
     handler2 = object.__new__(gateway_mod.make_handler(cfg2, _Hub(), runner2))
     replies2 = []
     handler2._query = lambda: {}
-    handler2._body = lambda: {"code": "print(2)"}
+    handler2._body = lambda: {
+        "code": "print(2)",
+        "language": "python",
+        "execution_id": "repl-client-exact",
+    }
     handler2._json = lambda obj, code=200: replies2.append((code, obj))
 
     handler2._api("POST", f"/frames/{fid}/kernel/execute")
-    assert hits == [(fid, "default", "print(2)")]
-    assert replies2[-1] == (200, sentinel)
+    assert hits == [
+        (
+            fid,
+            "default",
+            "print(2)",
+            {"language": "python", "execution_id": "repl-client-exact"},
+        )
+    ]
+    assert replies2[-1][0] == 202
+    assert replies2[-1][1] == {
+        "status": "accepted",
+        "frame_id": fid,
+        "job_id": "job-repl",
+        "execution_id": "repl-client-exact",
+        "owner": {"kind": "user_repl", "id": "repl-client-exact"},
+        "queue_position": None,
+    }
+
+    interrupts = []
+    runner2.interrupt_kernel = lambda rfid, **kwargs: (
+        interrupts.append((rfid, kwargs)) or {"ok": True}
+    )
+    handler2._body = lambda: {
+        "execution_id": "repl-client-exact",
+        "owner": {"kind": "user_repl", "id": "repl-client-exact"},
+    }
+    handler2._api("POST", f"/frames/{fid}/kernel/interrupt")
+    assert interrupts == [
+        (
+            fid,
+            {
+                "execution_id": "repl-client-exact",
+                "owner": {"kind": "user_repl", "id": "repl-client-exact"},
+                "owner_id": "repl-client-exact",
+            },
+        )
+    ]
+    assert replies2[-1] == (200, {"ok": True})
 
 
 def test_resolve_env_does_not_clobber_pin_when_env_unresolvable(monkeypatch, tmp_path):
@@ -1387,33 +2293,76 @@ def test_restart_respawns_when_active_env_is_only_a_pin_fallback(monkeypatch, tm
     calls = []
 
     class FallbackKernel:
-        generation = 1
-
         def shutdown(self):
             calls.append("shutdown")
 
         def restart(self):
             calls.append("restart")
 
-    st.kernel = FallbackKernel()
+    st.kernels.ensure("python", "base", FallbackKernel)
     st.env_name = "base"
     st.desired_env = "struct"
 
     def spawn(state):
         calls.append("spawn")
         state.env_name = state.desired_env
-        state.kernel = SimpleNamespace(generation=2)
+        return state.kernels.ensure(
+            "python",
+            "struct",
+            lambda: SimpleNamespace(shutdown=lambda: None),
+        )
 
     monkeypatch.setattr(runner, "_spawn_kernel", spawn)
     result = runner.restart_kernel(st.root_frame_id, st.project_id)
 
-    assert calls == ["shutdown", "spawn"]
+    # Replacement is build-first: the old base worker is shut down only after
+    # the recovered target worker exists.
+    assert calls == ["spawn", "shutdown"]
     assert st.env_name == "struct"
-    assert result["generation"] == 2
+    assert result["generation"] == 1
 
 
-def test_tool_batch_applies_env_switch_before_following_bash(monkeypatch, tmp_path):
-    """env_use then bash in one reply must use the rebuilt dispatcher."""
+def test_restart_still_clears_namespace_when_pin_remains_unavailable(
+    monkeypatch, tmp_path
+):
+    """A fallback resolving to the same base key must not turn Restart into reuse."""
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    st = runner._state("f-restart-still-fallback", "default")
+    calls = []
+
+    class FallbackKernel:
+        def restart(self):
+            calls.append("restart")
+
+        def shutdown(self):
+            calls.append("shutdown")
+
+    kernel = FallbackKernel()
+    st.kernels.ensure("python", "base", lambda: kernel)
+    st.env_name = "base"
+    st.desired_env = "struct"
+
+    def unresolved(state):
+        calls.append("resolve-base")
+        return state.kernels.ensure("python", "base", lambda: FallbackKernel())
+
+    monkeypatch.setattr(runner, "_spawn_kernel", unresolved)
+    monkeypatch.setattr(
+        runner,
+        "_run_bootstrap",
+        lambda state, target=None: calls.append("bootstrap"),
+    )
+
+    result = runner.restart_kernel(st.root_frame_id, st.project_id)
+
+    assert st.kernel is kernel
+    assert calls == ["resolve-base", "restart", "bootstrap"]
+    assert result["generation"] == 1
+
+
+def test_tool_batch_applies_env_switch_before_following_call(monkeypatch, tmp_path):
+    """env_use then another tool in one reply must use the rebuilt dispatcher."""
     cfg = _cfg(tmp_path)
     runner = gateway_mod.SessionRunner(cfg, _Hub())
     st = runner._state("f-env-batch", "default")
@@ -1436,7 +2385,7 @@ def test_tool_batch_applies_env_switch_before_following_bash(monkeypatch, tmp_pa
     replies = iter(
         [
             '```tool\n{"name":"env_use","arguments":{"name":"struct"}}\n```\n'
-            '```tool\n{"name":"bash","arguments":{"command":"python -V"}}\n```',
+            '```tool\n{"name":"list_dir","arguments":{"path":"."}}\n```',
             "```python\nhost.submit_output({'ok': True}, ['done'])\n```",
         ]
     )
@@ -1453,7 +2402,7 @@ def test_tool_batch_applies_env_switch_before_following_bash(monkeypatch, tmp_pa
     monkeypatch.setattr(gateway_mod, "chat", fake_chat)
     monkeypatch.setattr(runner, "_apply_pending_env", apply_pending)
 
-    def fake_exec(state, code, origin, emit, stream=True):
+    def fake_exec(state, code, origin, emit, stream=True, language="python"):
         state.dispatcher.last_output = {"output": {"ok": True}}
         return {"result": {"stdout": "", "stderr": "", "error": None}}
 
@@ -1461,7 +2410,7 @@ def test_tool_batch_applies_env_switch_before_following_bash(monkeypatch, tmp_pa
 
     runner._loop(st, lambda event: None, [])
 
-    assert calls == [("old", "env_use"), ("apply", "struct"), ("new", "bash")]
+    assert calls == [("old", "env_use"), ("apply", "struct"), ("new", "list_dir")]
 
 
 def test_env_summary_exposes_canonical_kernel_id(tmp_path):
@@ -1488,6 +2437,11 @@ def test_live_cell_start_event_carries_canonical_kernel_id(monkeypatch, tmp_path
     fid = runner.store.new_frame(kind="turn", project_id="default", status="ready")
     st = runner._state(fid, "default")
     st.env_name = "struct"
+    st.kernels.ensure(
+        "python",
+        "struct",
+        lambda: SimpleNamespace(is_alive=lambda: True, shutdown=lambda: None),
+    )
     events = []
     monkeypatch.setattr(runner, "_safety_refusal", lambda *a, **k: "blocked")
 

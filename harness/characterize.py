@@ -420,6 +420,7 @@ def _disabled_mcp_tools_connects(data_dir: Path) -> Mapping[str, Any]:
     config = importlib.import_module("openai4s.config")
     host_dispatch = importlib.import_module("openai4s.host_dispatch")
     mcp_client = importlib.import_module("openai4s.mcp_client")
+    tool_registry = importlib.import_module("openai4s.tools.registry")
     cfg = config.Config(
         data_dir=data_dir,
         llm=config.LLMConfig(
@@ -440,8 +441,18 @@ def _disabled_mcp_tools_connects(data_dir: Path) -> Mapping[str, Any]:
         enabled=False,
     )
     fake_manager = _FakeMCPManager()
+    tool = tool_registry.get_tool("list_mcp_tools")
+    if tool is None:  # pragma: no cover - a missing built-in must stay visible
+        raise AssertionError("list_mcp_tools is missing from the production registry")
     with mock.patch.object(mcp_client, "manager", return_value=fake_manager):
-        result = dispatcher("mcp_tools", ["disabled-characterization"])
+        # Exercise the production control-tool boundary.  Built-in Tool classes
+        # own their object-shaped schema and translate it to the Host method's
+        # positional behavior; passing the pre-migration scalar wire shape here
+        # would characterize a probe bug rather than current production.
+        result = tool.invoke(
+            dispatcher,
+            {"server": "disabled-characterization"},
+        )
     return {
         "connector_enabled": False,
         "manager_list_tools_calls": len(fake_manager.calls),
@@ -492,10 +503,10 @@ def collect_prechange_characterization(data_dir: str | Path) -> dict[str, Any]:
             "probe": _oversized_observation,
         },
         {
-            "case_id": "headless_ask_allows_deny_absolute",
-            "current_behavior": "A headless effective ask is allowed, while a matching standing deny remains an absolute rejection.",
-            "desired_contract": "rules_only denies unresolved ask in headless mode while preserving standing deny as absolute.",
-            "known_bug": True,
+            "case_id": "headless_ask_fails_closed_deny_absolute",
+            "current_behavior": "A headless effective ask is denied unless an operator explicitly enables unattended approval; a matching standing deny remains absolute.",
+            "desired_contract": "Deny unresolved ask in headless mode while preserving an explicit operator override and standing deny as absolute.",
+            "known_bug": False,
             "probe": lambda: _headless_permission(root / "permissions"),
         },
         {

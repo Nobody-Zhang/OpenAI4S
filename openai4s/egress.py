@@ -1,13 +1,12 @@
-"""Outbound domain allowlist — the host-stamped network egress fence (report §5.1).
+"""Outbound domain allowlist — the host-stamped network egress fence.
 
-The Claude Science reverse-engineering report describes an OS-level sandbox whose
-network layer is an **outbound domain allowlist**: science APIs (NCBI, UniProt,
+The policy is an **outbound domain allowlist**: science APIs (NCBI, UniProt,
 RCSB, EBI, OpenAlex, CrossRef, arXiv), package indexes (PyPI, conda, CRAN,
 Bioconductor, npm) and data repositories (GEO, SRA, ENA, CELLxGENE) are reachable;
 everything else returns a proxy 403 and the agent must call
 ``request_network_access(domain=...)`` to widen the fence.
 
-openai4s does not ship the OS sandbox (Seatbelt/bubblewrap) — that is a
+openai4s does not ship an OS-level sandbox (Seatbelt/bubblewrap) — that is a
 separate, infra-heavy subsystem — so this module is a **best-effort, code-as-action
 fence** enforced at the host-tool boundary (``host.web_fetch`` / ``host.web_search``
 and, statically, ``host.bash``). It is:
@@ -238,6 +237,21 @@ def check_url(url: str) -> None:
 _URL_RE = re.compile(r"https?://[^\s'\"|;>)`]+", re.I)
 
 
+def command_domains(command: str) -> list[str]:
+    """The unique http(s) URL-domains named in a shell command, policy-free.
+
+    Pure extraction (no mode/allowlist consultation) so the kernel-local
+    `host.bash` can collect the domains in the worker and ask the HOST for the
+    verdict — the runtime grants (`request_network_access`) and the live
+    `OPENAI4S_EGRESS` toggle exist only in the host process."""
+    out: list[str] = []
+    for m in _URL_RE.finditer(command or ""):
+        host = domain_of(m.group(0))
+        if host and host not in out:
+            out.append(host)
+    return out
+
+
 def scan_command(command: str) -> str | None:
     """Best-effort static egress check for host.bash: return the first http(s)
     URL-domain in `command` that the allowlist would block, else None.
@@ -248,8 +262,7 @@ def scan_command(command: str) -> str | None:
     `curl`/`wget`/`pip install <url>`/`git clone https://…` shapes."""
     if egress_mode() != "allowlist":
         return None
-    for m in _URL_RE.finditer(command or ""):
-        host = domain_of(m.group(0))
-        if host and not domain_allowed(host):
+    for host in command_domains(command):
+        if not domain_allowed(host):
             return host
     return None

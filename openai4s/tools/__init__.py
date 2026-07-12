@@ -1,19 +1,87 @@
-"""ReAct tool surface for openai4s.
+"""Class-based control-tool surface for openai4s.
 
-A thin, declarative layer on top of the Code-as-Action model: each `Tool` is
-metadata that names a small deterministic operation (list/read/write/glob/grep/
-edit/bash/env/web) and the host method it routes to. Tools do NOT re-implement
-any fs/shell/web logic — `execute_tool_call` dispatches them through the
-existing `HostDispatcher` (passed in by the caller), so every call inherits the
-permission gate, egress fence, injection screening, UI activity steps, and call
-logging. Analysis, plotting, modeling and multi-step computation stay in
-```python cells with persistent kernel state.
+Every built-in is a named ``Tool`` subclass whose module contains both schema
+and domain behaviour. Model calls still enter through ``HostDispatcher`` before
+that behaviour runs, preserving permissions, human approval, egress controls,
+injection screening, UI activity events, audit logs, and replay. There is no
+shell or completion tool: shell/scientific work remains Code-as-Action and only
+``host.submit_output`` completes a task.
 
 This package is pure stdlib and imports nothing from the engine (no
 host_dispatch / loop / gateway) at module load, so it stays importable with
 zero side effects. Wiring into the agent loops happens elsewhere.
 """
+from openai4s.tools.artifacts import (
+    GetArtifactMetadataTool,
+    ListArtifactsTool,
+    ListArtifactVersionsTool,
+    RestoreArtifactVersionTool,
+    SaveArtifactTool,
+)
+from openai4s.tools.background import (
+    InterruptBackgroundExecTool,
+    ListBackgroundExecsTool,
+    PeekBackgroundExecTool,
+    SubmitBackgroundExecTool,
+)
 from openai4s.tools.base import Tool
+from openai4s.tools.capabilities import SearchCapabilitiesTool
+from openai4s.tools.catalog import SessionToolCatalog
+from openai4s.tools.content_search import ContentSearchTool
+from openai4s.tools.contexts import (
+    ControlToolContext,
+    EnvironmentToolContext,
+    WorkspaceToolContext,
+)
+from openai4s.tools.data import (
+    FramesTool,
+    LineageGetTool,
+    LineageGraphTool,
+    QuerySchemaTool,
+    ReadOnlyQueryTool,
+)
+from openai4s.tools.delegation import (
+    CollectChildrenTool,
+    DelegateTaskTool,
+    ListChildrenTool,
+    SendChildMessageTool,
+    StopChildTool,
+)
+from openai4s.tools.dynamic import (
+    DynamicToolManifest,
+    DynamicToolRegistry,
+    ProxyDynamicTool,
+)
+from openai4s.tools.dynamic_control import (
+    DefineDynamicTool,
+    ListDynamicTools,
+    PromoteDynamicTool,
+)
+from openai4s.tools.edit import EditFileTool
+from openai4s.tools.env_create import EnvCreateTool
+from openai4s.tools.env_list import EnvListTool
+from openai4s.tools.env_use import EnvUseTool
+from openai4s.tools.glob_files import GlobFilesTool
+from openai4s.tools.list_directory import ListDirectoryTool
+from openai4s.tools.mcp import (
+    CallMCPTool,
+    GetMCPPromptTool,
+    ListMCPPromptsTool,
+    ListMCPResourcesTool,
+    ListMCPServersTool,
+    ListMCPToolsTool,
+    ReadMCPResourceTool,
+)
+from openai4s.tools.native import ToolSpec, control_tool_specs
+from openai4s.tools.network_access import RequestNetworkAccessTool
+from openai4s.tools.progress import (
+    ReadPlanTool,
+    ReadTodosTool,
+    ReviewStatusTool,
+    UpdatePlanStepTool,
+    WriteTodosTool,
+)
+from openai4s.tools.read_text_file import ReadTextFileTool
 from openai4s.tools.registry import (
     MAX_TOOL_CALLS_PER_TURN,
     MAX_TOOL_OBS_CHARS,
@@ -24,19 +92,133 @@ from openai4s.tools.registry import (
     finalize_tool_batch,
     format_tool_result,
     get_tool,
+    get_tool_by_host_method,
     parse_fence_delimiter,
     parse_tool_calls,
+    register_tool,
     render_tools_prompt,
     run_tool_calls,
     scan_fenced_blocks,
     strip_fenced_blocks,
+    tool_validation_error,
 )
+from openai4s.tools.remote_capabilities import (
+    RegisterRemoteCapabilityTool,
+    RemoteGPUStatusTool,
+)
+from openai4s.tools.remote_compute import (
+    CancelRemoteComputeJobTool,
+    CloseRemoteComputeTool,
+    GetRemoteComputeJobResultTool,
+    RemoteComputeStatusTool,
+    SubmitRemoteComputeJobTool,
+)
+from openai4s.tools.schema import (
+    SchemaDefinitionError,
+    ValidationIssue,
+    normalize_object_schema,
+    provider_strict_compatible,
+    validate_json_schema,
+    validate_schema_definition,
+)
+from openai4s.tools.session import (
+    CreateCheckpointTool,
+    ForkSessionTool,
+    PendingPermissionsTool,
+    RevertPreviewTool,
+    SessionStatusTool,
+)
+from openai4s.tools.skills import (
+    LoadSkillTool,
+    RollbackSkillVersionTool,
+    SearchSkillsTool,
+    SkillHistoryTool,
+    SkillStatusTool,
+)
+from openai4s.tools.taxonomy import SIDE_EFFECT_CLASSES
+from openai4s.tools.web_fetch import WebFetchTool
+from openai4s.tools.web_search import WebSearchTool
+from openai4s.tools.write_file import WriteFileTool
 
 __all__ = [
     "Tool",
+    "ToolSpec",
+    "SessionToolCatalog",
+    "WorkspaceToolContext",
+    "EnvironmentToolContext",
+    "ControlToolContext",
+    "QuerySchemaTool",
+    "ReadOnlyQueryTool",
+    "FramesTool",
+    "LineageGetTool",
+    "LineageGraphTool",
+    "SubmitBackgroundExecTool",
+    "ListBackgroundExecsTool",
+    "PeekBackgroundExecTool",
+    "InterruptBackgroundExecTool",
+    "ListDirectoryTool",
+    "ReadTextFileTool",
+    "WriteFileTool",
+    "GlobFilesTool",
+    "ContentSearchTool",
+    "EditFileTool",
+    "EnvListTool",
+    "EnvUseTool",
+    "EnvCreateTool",
+    "WebSearchTool",
+    "WebFetchTool",
+    "SearchCapabilitiesTool",
+    "SearchSkillsTool",
+    "LoadSkillTool",
+    "SkillStatusTool",
+    "SkillHistoryTool",
+    "RollbackSkillVersionTool",
+    "ListArtifactsTool",
+    "GetArtifactMetadataTool",
+    "ListArtifactVersionsTool",
+    "SaveArtifactTool",
+    "RestoreArtifactVersionTool",
+    "ReadTodosTool",
+    "WriteTodosTool",
+    "ReadPlanTool",
+    "ReviewStatusTool",
+    "UpdatePlanStepTool",
+    "SessionStatusTool",
+    "CreateCheckpointTool",
+    "ForkSessionTool",
+    "RevertPreviewTool",
+    "PendingPermissionsTool",
+    "DelegateTaskTool",
+    "ListChildrenTool",
+    "CollectChildrenTool",
+    "StopChildTool",
+    "SendChildMessageTool",
+    "ListMCPServersTool",
+    "ListMCPToolsTool",
+    "ListMCPResourcesTool",
+    "ReadMCPResourceTool",
+    "ListMCPPromptsTool",
+    "GetMCPPromptTool",
+    "CallMCPTool",
+    "RequestNetworkAccessTool",
+    "RemoteGPUStatusTool",
+    "RegisterRemoteCapabilityTool",
+    "SubmitRemoteComputeJobTool",
+    "RemoteComputeStatusTool",
+    "GetRemoteComputeJobResultTool",
+    "CancelRemoteComputeJobTool",
+    "CloseRemoteComputeTool",
+    "DefineDynamicTool",
+    "ListDynamicTools",
+    "PromoteDynamicTool",
+    "DynamicToolManifest",
+    "DynamicToolRegistry",
+    "ProxyDynamicTool",
     "FencedBlock",
     "REGISTRY",
     "get_tool",
+    "get_tool_by_host_method",
+    "register_tool",
     "all_tools",
     "parse_fence_delimiter",
     "parse_tool_calls",
@@ -49,4 +231,13 @@ __all__ = [
     "finalize_tool_batch",
     "MAX_TOOL_CALLS_PER_TURN",
     "MAX_TOOL_OBS_CHARS",
+    "control_tool_specs",
+    "tool_validation_error",
+    "SchemaDefinitionError",
+    "ValidationIssue",
+    "normalize_object_schema",
+    "provider_strict_compatible",
+    "validate_json_schema",
+    "validate_schema_definition",
+    "SIDE_EFFECT_CLASSES",
 ]

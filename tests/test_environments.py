@@ -1,7 +1,7 @@
 """Prebuilt-environment registry + kernel env selection.
 
 Uses fake conda-env directories under a temp OPENAI4S_ENV_ROOTS so the tests
-are deterministic and do not depend on the developer's ~/.claude-science envs.
+are deterministic and do not depend on the developer's installed conda envs.
 """
 import os
 import sys
@@ -93,13 +93,13 @@ def test_r_only_env_not_runnable(tmp_path, monkeypatch):
 
 def test_hidden_envs_are_dropped(tmp_path, monkeypatch):
     roots = tmp_path / "envs"
-    _make_py_env(roots, "operon-mcp")  # always-hidden
+    _make_py_env(roots, "internal")
     _make_py_env(roots, "secret")
     _make_py_env(roots, "keep")
     monkeypatch.setenv("OPENAI4S_ENV_ROOTS", str(roots))
-    monkeypatch.setenv("OPENAI4S_ENV_HIDE", "secret")
+    monkeypatch.setenv("OPENAI4S_ENV_HIDE", "secret,internal")
     names = {e.name for e in E.discover_environments(force=True)}
-    assert "operon-mcp" not in names
+    assert "internal" not in names
     assert "secret" not in names
     assert "keep" in names
 
@@ -145,7 +145,13 @@ def test_dispatcher_env_list_and_use(tmp_path, monkeypatch):
     assert u["ok"] is True and switched["name"] == "python"
 
     assert "error" in disp._m_env_use({"name": "nope"})
-    assert "error" in disp._m_env_use({"name": "r"})  # R has no Python kernel
+    # an R-only env is no longer refused: it retargets the ```r channel (the
+    # persistent R kernel) and leaves the python kernel untouched
+    u_r = disp._m_env_use({"name": "r"})
+    assert u_r["ok"] is True
+    assert disp.active_r_env == "r"
+    assert switched["name"] == "r"  # gateway applies via the pending-env path
+    assert "```r" in u_r["note"]
 
 
 # --- gateway wiring -------------------------------------------------------

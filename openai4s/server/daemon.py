@@ -93,7 +93,6 @@ def _make_handler(cfg: Config):
                     {
                         "status": "ok",
                         "model": cfg.llm.model,
-                        "data_dir": str(cfg.data_dir),
                     },
                 )
             else:

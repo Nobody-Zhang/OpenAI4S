@@ -6,9 +6,12 @@ import time
 
 import pytest
 
+from openai4s.agent.ledger import restore_action_history
 from openai4s.config import Config, LLMConfig
 from openai4s.permissions import PermissionBroker, broker, suggest_patterns
+from openai4s.server.action_timeline import ActionTimelineService
 from openai4s.store import get_store
+from openai4s.tools.taxonomy import SIDE_EFFECT_CLASSES
 
 
 def _store(tmp_path):
@@ -143,11 +146,20 @@ def test_upsert_and_delete_rule(tmp_path):
 
 
 # --- broker round-trip ----------------------------------------------------
-def test_broker_headless_allows_ask_but_enforces_deny(tmp_path):
+def test_broker_headless_fails_closed_unless_operator_explicitly_allows(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OPENAI4S_UNATTENDED_APPROVAL", raising=False)
     st = _store(tmp_path)
     b = PermissionBroker()
-    # no UI channel registered -> ask degrades to allow (non-interactive runs)
-    assert b.gate(store=st, frame_id=None, method="bash", target="ls")["allow"] is True
+    # No UI channel registered: an ask action is auditable and denied by
+    # default instead of silently escalating to allow.
+    denied = b.gate(store=st, frame_id=None, method="bash", target="ls")
+    assert denied["allow"] is False
+    assert st.list_permission_requests(state="denied")[-1]["tool"] == "bash"
+    monkeypatch.setenv("OPENAI4S_UNATTENDED_APPROVAL", "allow")
+    assert b.gate(store=st, frame_id=None, method="bash", target="pwd")["allow"] is True
+    assert st.list_permission_requests(state="allowed")[-1]["target"] == "pwd"
     # deny rules still bite even without a channel
     res = b.gate(store=st, frame_id=None, method="read_file", target="a/.env")
     assert res["allow"] is False
@@ -174,11 +186,22 @@ def test_broker_blocks_until_allowed_and_persists(tmp_path):
         time.sleep(0.01)
     ask = next(e for e in events if e.get("type") == "await_permission")
     assert ask["tool"] == "bash" and ask["scopes"][0] == "once"
-    assert b.resolve(
-        ask["decision_id"], allow=True, scope="conversation", pattern="pytest *"
+    decision = b.resolve_result(
+        ask["decision_id"],
+        allow=True,
+        scope="conversation",
+        pattern="pytest *",
+        store=st,
+        root_frame_id="root1",
     )
+    assert decision["ok"] is True
+    assert decision["resolution_context"] == "live_thread"
+    assert decision["requires_continue"] is False
     t.join(timeout=5)
     assert out["res"]["allow"] is True
+    durable = st.get_permission_request(ask["decision_id"])
+    assert durable["state"] == "allowed"
+    assert durable["scope"] == "conversation"
     # a resolved event was emitted to clear the card
     assert any(e.get("type") == "permission_resolved" for e in events)
     # the conversation rule was persisted, so a matching call no longer asks
@@ -237,6 +260,344 @@ def test_broker_cancel_denies_pending(tmp_path):
     b.cancel_root("root3")
     t.join(timeout=5)
     assert out["res"]["allow"] is False
+    decision_id = next(
+        event["decision_id"]
+        for event in events
+        if event.get("type") == "await_permission"
+    )
+    assert st.get_permission_request(decision_id)["state"] == "cancelled"
+
+
+def test_durable_pending_request_survives_broker_restart_and_can_be_resolved(tmp_path):
+    st = _store(tmp_path)
+    payload = {
+        "type": "await_permission",
+        "frame_id": "root-durable",
+        "decision_id": "perm-durable",
+        "tool": "mcp_call",
+        "target": "server/send",
+    }
+    st.create_permission_request(
+        decision_id="perm-durable",
+        root_frame_id="root-durable",
+        frame_id="root-durable",
+        project_id="default",
+        tool="mcp_call",
+        target="server/send",
+        payload=payload,
+    )
+
+    st.close()
+    st = _store(tmp_path)
+    restarted = PermissionBroker()
+    restarted.register_channel("root-durable", lambda event: None, store=st)
+    assert restarted.pending_events("root-durable") == [payload]
+    resolution = restarted.resolve_result(
+        "perm-durable",
+        allow=False,
+        message="reviewed",
+        store=st,
+        root_frame_id="root-durable",
+    )
+    assert resolution["ok"] is True
+    assert resolution["requires_continue"] is False
+    assert resolution["original_action_executed"] is False
+    row = st.get_permission_request("perm-durable")
+    assert row["state"] == "denied"
+    assert row["message"] == "reviewed"
+    assert row["continuation_required"] == 0
+    assert restarted.pending_events("root-durable") == []
+    history = restore_action_history(st, "root-durable")
+    assert history[-1]["role"] == "system"
+    assert "denied" in history[-1]["content"]
+    assert "did not execute" in history[-1]["content"]
+
+
+def test_restart_approval_requires_fresh_turn_and_never_replays_arguments(tmp_path):
+    st = _store(tmp_path)
+    st.append_tool_action_group(
+        root_frame_id="root-restart",
+        turn_id="turn-before-crash",
+        assistant_message={
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-before-crash",
+                    "name": "mcp_call",
+                    "arguments": {"server": "lab", "tool": "send"},
+                }
+            ],
+        },
+        events=[
+            {
+                "type": "proposed",
+                "tool_call_id": "call-before-crash",
+                "canonical_arguments": {
+                    "name": "mcp_call",
+                    "arguments": {"server": "lab", "tool": "send"},
+                },
+            }
+        ],
+    )
+    payload = {
+        "type": "await_permission",
+        "frame_id": "root-restart",
+        "decision_id": "perm-restart",
+        "tool": "mcp_call",
+        "target": "lab/send",
+    }
+    st.create_permission_request(
+        decision_id="perm-restart",
+        root_frame_id="root-restart",
+        frame_id="root-restart",
+        project_id="default",
+        tool="mcp_call",
+        target="lab/send",
+        payload=payload,
+    )
+
+    st.close()
+    st = _store(tmp_path)
+    restarted = PermissionBroker()
+    # No runtime/channel needs to be reconstructed merely to resurface the card.
+    assert restarted.pending_events("root-restart", store=st) == [payload]
+    result = restarted.resolve_result(
+        "perm-restart",
+        allow=True,
+        scope="once",
+        store=st,
+        root_frame_id="root-restart",
+    )
+    assert result["ok"] is True
+    assert result["allow"] is True
+    assert result["scope"] == "once"
+    assert result["resolution_context"] == "after_restart"
+    assert result["requires_continue"] is True
+    assert result["original_action_executed"] is False
+    assert result["continuation_authorization"] == "once"
+    assert result["continuation_expires_at"] > int(time.time() * 1000)
+    row = st.get_permission_request("perm-restart")
+    assert row["state"] == "allowed"
+    assert row["continuation_required"] == 1
+    assert row["continuation_expires_at"] == result["continuation_expires_at"]
+    assert row["continuation_consumed_at"] is None
+    retry = restarted.resolve_result(
+        "perm-restart",
+        allow=True,
+        scope="once",
+        store=st,
+        root_frame_id="root-restart",
+    )
+    assert retry["ok"] is True
+    assert retry["continuation_expires_at"] == result["continuation_expires_at"]
+    escalation = restarted.resolve_result(
+        "perm-restart",
+        allow=True,
+        scope="global",
+        pattern="*",
+        store=st,
+        root_frame_id="root-restart",
+    )
+    assert escalation["ok"] is False
+    assert "cannot be changed" in escalation["error"]
+
+    history = restore_action_history(st, "root-restart")
+    assert [message["role"] for message in history] == [
+        "assistant",
+        "tool",
+        "system",
+    ]
+    assert "interrupted" in history[1]["content"]
+    assert "original operation did not execute" in history[2]["content"]
+    marker = st.list_action_groups("root-restart")[-1]
+    assert marker["kind"] == "permission_resolution"
+    assert "arguments" not in repr(marker["events"][0]["result"])
+    assert marker["events"][0]["side_effect_class"] == "runtime_mutation"
+    assert marker["events"][0]["side_effect_class"] in SIDE_EFFECT_CLASSES
+    assert len(marker["events"]) == 1
+    timeline_group = ActionTimelineService(st).get("root-restart")["groups"][-1]
+    assert timeline_group["status"] == "completed"
+    assert "Approval recorded after restart" in timeline_group["title"]
+
+    standing = st.set_permission_rule(
+        scope="conversation",
+        scope_id="root-restart",
+        tool="mcp_call",
+        pattern="lab/send",
+        decision="deny",
+    )
+    assert (
+        restarted.gate(
+            store=st,
+            frame_id="root-restart",
+            method="mcp_call",
+            target="lab/send",
+        )["allow"]
+        is False
+    )
+    assert st.get_permission_request("perm-restart")["continuation_consumed_at"] is None
+    st.set_permission_rule(
+        scope="conversation",
+        scope_id="root-restart",
+        tool="mcp_call",
+        pattern="lab/send",
+        decision="allow",
+    )
+    assert (
+        restarted.gate(
+            store=st,
+            frame_id="root-restart",
+            method="mcp_call",
+            target="lab/send",
+        )["allow"]
+        is True
+    )
+    assert st.get_permission_request("perm-restart")["continuation_consumed_at"] is None
+    st.delete_permission_rule(standing)
+
+    # A fresh, exact action consumes the durable once grant. No handler args
+    # from the interrupted action are replayed by approval resolution itself.
+    assert (
+        restarted.gate(
+            store=st,
+            frame_id="root-restart",
+            method="mcp_call",
+            target="lab/send",
+        )["allow"]
+        is True
+    )
+    assert st.get_permission_request("perm-restart")["continuation_consumed_at"]
+    consumed_retry = restarted.resolve_result(
+        "perm-restart",
+        allow=True,
+        scope="once",
+        store=st,
+        root_frame_id="root-restart",
+    )
+    assert consumed_retry["requires_continue"] is False
+    assert consumed_retry["continuation_authorization"] == "consumed"
+
+
+def test_restart_resolution_scopes_rule_and_rejects_cross_frame_decision(tmp_path):
+    st = _store(tmp_path)
+    st.create_permission_request(
+        decision_id="perm-conversation",
+        root_frame_id="root-a",
+        frame_id="root-a",
+        project_id="science",
+        tool="mcp_call",
+        target="lab/send",
+        payload={"type": "await_permission", "frame_id": "root-a"},
+    )
+    restarted = PermissionBroker()
+    mismatch = restarted.resolve_result(
+        "perm-conversation",
+        allow=True,
+        scope="conversation",
+        pattern="lab/*",
+        store=st,
+        root_frame_id="root-b",
+    )
+    assert mismatch["ok"] is False
+    assert st.get_permission_request("perm-conversation")["state"] == "pending"
+
+    result = restarted.resolve_result(
+        "perm-conversation",
+        allow=True,
+        scope="conversation",
+        pattern="lab/*",
+        store=st,
+        root_frame_id="root-a",
+    )
+    assert result["requires_continue"] is True
+    assert (
+        st.resolve_permission(
+            root_frame_id="root-a",
+            project_id="science",
+            tool="mcp_call",
+            pattern_input="lab/other",
+        )
+        == "allow"
+    )
+    assert (
+        st.resolve_permission(
+            root_frame_id="root-b",
+            project_id="science",
+            tool="mcp_call",
+            pattern_input="lab/other",
+        )
+        == "ask"
+    )
+
+
+def test_racing_restart_retry_cannot_escalate_once_to_global(tmp_path):
+    st = _store(tmp_path)
+    st.create_permission_request(
+        decision_id="perm-race",
+        root_frame_id="root-race",
+        frame_id="root-race",
+        project_id="science",
+        tool="mcp_call",
+        target="lab/send",
+        payload={"type": "await_permission", "frame_id": "root-race"},
+    )
+    global_read = threading.Event()
+    once_resolved = threading.Event()
+
+    class StaleGlobalView:
+        def __getattr__(self, name):
+            return getattr(st, name)
+
+        def get_permission_request(self, decision_id):
+            request = st.get_permission_request(decision_id)
+            global_read.set()
+            return request
+
+        def resolve_permission_request(self, *args, **kwargs):
+            assert once_resolved.wait(2)
+            return st.resolve_permission_request(*args, **kwargs)
+
+    restarted = PermissionBroker()
+    raced: dict = {}
+
+    def global_retry():
+        raced.update(
+            restarted.resolve_result(
+                "perm-race",
+                allow=True,
+                scope="global",
+                pattern="*",
+                store=StaleGlobalView(),
+                root_frame_id="root-race",
+            )
+        )
+
+    thread = threading.Thread(target=global_retry)
+    thread.start()
+    assert global_read.wait(1)
+    once = restarted.resolve_result(
+        "perm-race",
+        allow=True,
+        scope="once",
+        store=st,
+        root_frame_id="root-race",
+    )
+    assert once["ok"] is True
+    once_resolved.set()
+    thread.join(2)
+    assert not thread.is_alive()
+    assert raced["ok"] is False
+    assert "cannot be changed" in raced["error"]
+    assert (
+        st.resolve_permission(
+            root_frame_id="another-root",
+            project_id="science",
+            tool="mcp_call",
+            pattern_input="anything",
+        )
+        == "ask"
+    )
 
 
 def test_suggest_patterns_generalizes():
@@ -268,15 +629,25 @@ def _wait_ask(events):
     raise AssertionError("no await_permission emitted")
 
 
-def test_dispatcher_gate_denies_bash_soft_fail(tmp_path):
-    disp, frame, _ = _dispatcher(tmp_path)
+def test_dispatcher_gate_denies_write_file_soft_fail(tmp_path):
+    # bash is no longer a host method (shell runs kernel-local); write_file —
+    # pinned to 'ask' for this conversation — exercises the same deny path.
+    disp, frame, st = _dispatcher(tmp_path)
+    st.set_permission_rule(
+        scope="conversation",
+        scope_id=frame,
+        tool="write_file",
+        pattern="*",
+        decision="ask",
+    )
     events = []
     broker().register_channel(frame, lambda ev: events.append(ev))
     try:
         out = {}
         t = threading.Thread(
             target=lambda: out.__setitem__(
-                "r", disp("bash", [{"command": "echo should-not-run"}])
+                "r",
+                disp("write_file", [{"path": "gate.txt", "content": "nope"}]),
             )
         )
         t.start()
@@ -286,29 +657,227 @@ def test_dispatcher_gate_denies_bash_soft_fail(tmp_path):
         # denied call returns the single-key soft-fail dict the worker raises
         assert set(out["r"].keys()) == {"error"}
         assert "Permission denied" in out["r"]["error"]
+        assert not (disp._workspace() / "gate.txt").exists()
     finally:
         broker().unregister_channel(frame)
 
 
-def test_dispatcher_gate_allows_and_runs_bash(tmp_path):
-    disp, frame, _ = _dispatcher(tmp_path)
+def test_dispatcher_gate_allows_and_runs_write_file(tmp_path):
+    disp, frame, st = _dispatcher(tmp_path)
+    st.set_permission_rule(
+        scope="conversation",
+        scope_id=frame,
+        tool="write_file",
+        pattern="*",
+        decision="ask",
+    )
     events = []
     broker().register_channel(frame, lambda ev: events.append(ev))
     try:
         out = {}
         t = threading.Thread(
             target=lambda: out.__setitem__(
-                "r", disp("bash", [{"command": "echo gate-ok"}])
+                "r",
+                disp("write_file", [{"path": "gate.txt", "content": "gate-ok"}]),
             )
         )
         t.start()
         ask = _wait_ask(events)
         broker().resolve(ask["decision_id"], allow=True, scope="once")
         t.join(timeout=8)
-        # allow → the real _m_bash ran and captured stdout
-        assert "gate-ok" in (out["r"].get("stdout") or "")
+        # allow → the real _m_write_file ran and the file exists
+        assert out["r"].get("path")
+        assert (disp._workspace() / "gate.txt").read_text() == "gate-ok"
     finally:
         broker().unregister_channel(frame)
+
+
+def test_dispatcher_permission_carries_exact_action_attribution(tmp_path):
+    disp, frame, st = _dispatcher(tmp_path)
+    st.set_permission_rule(
+        scope="conversation",
+        scope_id=frame,
+        tool="write_file",
+        pattern="*",
+        decision="ask",
+    )
+    group = st.append_action_group(
+        root_frame_id=frame,
+        turn_id="turn-attributed",
+        kind="native_tools",
+    )
+    st.append_action_event(
+        group_id=group["group_id"],
+        type="proposed",
+        action_id="call-write",
+        tool_call_id="call-write",
+        side_effect_class="workspace_write",
+        resource_keys=["workspace:attributed.txt"],
+    )
+    events = []
+    broker().register_channel(frame, lambda event: events.append(event))
+    try:
+        out = {}
+
+        def run():
+            with disp.bind_action_context(
+                {
+                    "action_group_id": group["group_id"],
+                    "action_id": "call-write",
+                    "tool_call_id": "call-write",
+                }
+            ):
+                out["result"] = disp(
+                    "write_file",
+                    [{"path": "attributed.txt", "content": "ok"}],
+                )
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        ask = _wait_ask(events)
+        assert ask["action_group_id"] == group["group_id"]
+        assert ask["action_id"] == "call-write"
+        assert ask["resource_keys"] == ["workspace:attributed.txt"]
+        broker().resolve(ask["decision_id"], allow=True, scope="once")
+        thread.join(timeout=8)
+        assert out["result"].get("path")
+
+        request = st.get_permission_request(ask["decision_id"])
+        assert request["action_group_id"] == group["group_id"]
+        assert request["tool_call_id"] == "call-write"
+        assert request["side_effect_class"] == "workspace_write"
+        assert request["resource_keys"] == ["workspace:attributed.txt"]
+        assert [
+            event["type"] for event in st.get_action_group(group["group_id"])["events"]
+        ] == ["proposed", "permission_pending", "permission_resolved"]
+        audit = st._conn.execute(
+            "SELECT action_group_id,action_id,permission_decision_id,"
+            "side_effect_class,resource_keys,result_preview,result_digest "
+            "FROM host_call_log WHERE method='write_file' "
+            "ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        assert audit["action_group_id"] == group["group_id"]
+        assert audit["action_id"] == "call-write"
+        assert audit["permission_decision_id"] == ask["decision_id"]
+        assert audit["side_effect_class"] == "workspace_write"
+        assert json.loads(audit["resource_keys"]) == ["workspace:attributed.txt"]
+        assert json.loads(audit["result_preview"])["type"] == "object"
+        assert len(audit["result_digest"]) == 64
+    finally:
+        broker().unregister_channel(frame)
+
+
+def test_new_control_tool_class_auto_routes_and_defaults_to_approval(tmp_path):
+    from openai4s.tools import registry as registry_mod
+    from openai4s.tools.base import Tool
+
+    calls = []
+
+    class ExtensionProbeTool(Tool):
+        name = "extension_probe"
+        host_method = "extension_probe"
+        description = "Test the class-based extension path."
+        parameters = {
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+        }
+
+        def execute(self, context, arguments):
+            calls.append((context, arguments))
+            return {"value": arguments.get("value")}
+
+    tool = ExtensionProbeTool()
+    registry_mod.register_tool(tool)
+    try:
+        disp, frame, store = _dispatcher(tmp_path)
+        store.set_permission_rule(
+            scope="conversation",
+            scope_id=frame,
+            tool=tool.host_method,
+            pattern="*",
+            decision="deny",
+        )
+
+        denied = disp(tool.host_method, [{"value": "blocked"}])
+
+        assert set(denied) == {"error"}
+        assert calls == []
+
+        store.set_permission_rule(
+            scope="conversation",
+            scope_id=frame,
+            tool=tool.host_method,
+            pattern="*",
+            decision="allow",
+        )
+        allowed = disp(tool.host_method, [{"value": "ran"}])
+
+        assert allowed == {"value": "ran"}
+        assert calls == [(disp._tool_context, {"value": "ran"})]
+        logged = store._conn.execute(
+            "SELECT ok FROM host_call_log WHERE method=? ORDER BY rowid",
+            (tool.host_method,),
+        ).fetchall()
+        assert [row["ok"] for row in logged] == [0, 1]
+    finally:
+        registry_mod._unregister_tool(tool.name)
+
+
+def test_control_tool_secret_guard_is_independent_of_approval(tmp_path):
+    from openai4s.tools import registry as registry_mod
+    from openai4s.tools.base import Tool
+
+    calls = []
+
+    class UngatedSecretProbeTool(Tool):
+        name = "ungated_secret_probe"
+        host_method = "ungated_secret_probe"
+        description = "Exercise the absolute secret-path veto."
+        parameters = {
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        requires_approval = False
+        secret_path_key = "path"
+
+        def execute(self, context, arguments):
+            calls.append(arguments)
+            return {"ok": True}
+
+    tool = registry_mod.register_tool(UngatedSecretProbeTool())
+    try:
+        disp, _frame, _store = _dispatcher(tmp_path)
+
+        result = disp(tool.host_method, [{"path": "config/.env"}])
+
+        assert set(result) == {"error"}
+        assert "secret" in result["error"].lower()
+        assert calls == []
+    finally:
+        registry_mod._unregister_tool(tool.name)
+
+
+def test_plugin_tool_cannot_shadow_existing_non_control_host_method(tmp_path):
+    from openai4s.tools import registry as registry_mod
+    from openai4s.tools.base import Tool
+
+    class CredentialShadowTool(Tool):
+        name = "credential_shadow"
+        host_method = "credentials_set"
+        description = "Must not replace a built-in host capability."
+        parameters = {"properties": {}, "required": []}
+
+        def execute(self, context, arguments):
+            return {"ok": True}
+
+    tool = registry_mod.register_tool(CredentialShadowTool())
+    try:
+        disp, _frame, _store = _dispatcher(tmp_path)
+
+        with pytest.raises(ValueError, match="conflicts with existing host method"):
+            disp(tool.host_method, [{}])
+    finally:
+        registry_mod._unregister_tool(tool.name)
 
 
 def test_dispatcher_readonly_tool_not_gated_by_default(tmp_path):
@@ -370,17 +939,27 @@ def test_exact_literal_pattern_with_metachars_matches_itself(tmp_path):
 def test_reset_restores_modified_default_decision(tmp_path):
     st = _store(tmp_path)
     st.set_permission_rule(
-        scope="global", scope_id="", tool="bash", pattern="*", decision="allow"
+        scope="global", scope_id="", tool="mcp_call", pattern="*", decision="allow"
     )  # user loosens the default
-    assert st.resolve_permission(tool="bash", pattern_input="rm x") == "allow"
+    assert st.resolve_permission(tool="mcp_call", pattern_input="srv/tool") == "allow"
     st.seed_default_permission_rules(force=True)  # reset
-    assert st.resolve_permission(tool="bash", pattern_input="rm x") == "ask"
+    assert st.resolve_permission(tool="mcp_call", pattern_input="srv/tool") == "ask"
 
 
 def test_exec_background_gate_target_is_the_code():
     from openai4s.host_dispatch import _gate_target
 
     assert _gate_target("exec_background", [{"code": "print(1)"}]) == "print(1)"
+
+
+def test_control_tool_gate_targets_preserve_missing_argument_defaults():
+    from openai4s.host_dispatch import _gate_target
+
+    assert _gate_target("read_file", [{}]) == ""
+    assert _gate_target("glob", [{}]) == ""
+    assert _gate_target("web_search", [{}]) == ""
+    assert _gate_target("list_dir", [{}]) == "."
+    assert _gate_target("env_setup", [{"packages": []}]) == ""
 
 
 def test_is_secret_path_case_insensitive():
@@ -435,10 +1014,16 @@ def test_agent_query_cannot_read_settings_secret(tmp_path):
 
 
 def test_credentials_set_secret_never_in_host_call_log(tmp_path):
-    # credentials_set runs (headless dispatcher passes the gate) and stores the
-    # value in the in-memory vault, but its plaintext must never reach the
-    # host_call_log preview.
+    # Explicitly authorize this synthetic credential write; headless `ask`
+    # now fails closed. Its plaintext must never reach the host_call_log.
     disp, _frame, st = _dispatcher(tmp_path)
+    st.set_permission_rule(
+        scope="global",
+        scope_id="",
+        tool="credentials_set",
+        pattern="*",
+        decision="allow",
+    )
     out = disp("credentials_set", [{"name": "HF_TOKEN", "value": _SYNTH_SECRET}])
     assert out.get("ok") is True
     # the value round-trips in-process…
@@ -458,6 +1043,13 @@ def test_recorder_never_tapes_credentials_set(tmp_path):
     from openai4s.replay import TapeRecorder
 
     disp, _frame, _st = _dispatcher(tmp_path)
+    _st.set_permission_rule(
+        scope="global",
+        scope_id="",
+        tool="credentials_set",
+        pattern="*",
+        decision="allow",
+    )
     rec = TapeRecorder(tmp_path / "openai4s_tape.json")
     disp.recorder = rec
 

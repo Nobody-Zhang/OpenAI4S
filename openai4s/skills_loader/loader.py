@@ -15,21 +15,85 @@ SKILL.md may start with a YAML-ish frontmatter block:
     origin: personal
     ---
 
-`description` becomes the one-line summary shown in the prompt. `origin` is one
-of openai4s|organization|personal|draft|unknown and drives the permission gate.
+`description` becomes the one-line summary shown in the prompt. `origin` is
+lifecycle/display metadata; the configured discovery root, not frontmatter,
+determines whether a skill is writable.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from openai4s.capabilities import CapabilityStateService
 from openai4s.config import Config, get_config
+from openai4s.skills_loader.versions import project_skills_root
 
 _VALID_ORIGINS = ("openai4s", "organization", "personal", "draft", "unknown")
-# origins whose sidecar/doc is read-only (cannot be edited/deleted via CRUD)
-_READONLY_ORIGINS = ("openai4s",)
 _WORD = re.compile(r"[a-z0-9]+")
+
+
+def _canonical_skill_name(value: str) -> str:
+    """Return the collision identity for a declared skill name.
+
+    Directory names are an implementation detail: capability state and agent
+    retrieval use the frontmatter ``name``.  Normalize that public identity so
+    a user directory cannot shadow a bundled skill through casing, compatible
+    Unicode, or whitespace differences.
+    """
+
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    return " ".join(normalized.split()).casefold()
+
+
+class _StoreCapabilityRepository:
+    """Resolve the current Store-owned repository for every operation.
+
+    A ``SkillLoader`` can legitimately outlive a server/test Store generation
+    (configuration reloads and daemon restarts both replace the SQLite owner).
+    Holding the concrete repository would leave the loader pointing at a
+    closed connection.  This tiny adapter preserves the Store as the sole
+    connection owner while making the default loader safe across that
+    lifecycle boundary.  Explicitly injected capability services retain their
+    caller-owned lifetime semantics.
+    """
+
+    def __init__(self, db_path: Path) -> None:
+        self._db_path = Path(db_path)
+
+    def _call(self, method: str, *args, **kwargs):
+        # Lazy import avoids a Store -> skills -> Store initialization cycle.
+        from openai4s.store import get_store
+
+        repository = get_store(self._db_path).capability_state().repository
+        return getattr(repository, method)(*args, **kwargs)
+
+    def set_enabled(self, *args, **kwargs):
+        return self._call("set_enabled", *args, **kwargs)
+
+    def resolve(self, *args, **kwargs):
+        return self._call("resolve", *args, **kwargs)
+
+    def snapshot(self, *args, **kwargs):
+        return self._call("snapshot", *args, **kwargs)
+
+    def explicit_states(self, *args, **kwargs):
+        return self._call("explicit_states", *args, **kwargs)
+
+    def append_event(self, *args, **kwargs):
+        return self._call("append_event", *args, **kwargs)
+
+    def list_events(self, *args, **kwargs):
+        return self._call("list_events", *args, **kwargs)
+
+    def record_manifest(self, *args, **kwargs):
+        return self._call("record_manifest", *args, **kwargs)
+
+    def latest_manifest(self, *args, **kwargs):
+        return self._call("latest_manifest", *args, **kwargs)
 
 
 def _strip_scalar(v: str) -> str:
@@ -135,11 +199,18 @@ class Skill:
     has_kernel: bool  # kernel.py sidecar present?
     description: str = ""  # one-line summary for progressive disclosure
     origin: str = "unknown"
+    # Filesystem discovery source is authoritative for ownership. Frontmatter
+    # origin remains lifecycle/display metadata and is intentionally unable to
+    # make a bundled directory writable.
+    source: str = "bundled"
     keywords: set[str] = field(default_factory=set)
+    version: str = ""
+    document_sha256: str = ""
+    sidecar_sha256: str | None = None
 
     @property
     def read_only(self) -> bool:
-        return self.origin in _READONLY_ORIGINS
+        return self.source == "bundled"
 
     @property
     def import_hint(self) -> str | None:
@@ -185,40 +256,258 @@ class Skill:
         except OSError as e:
             return {"ok": False, "error": f"cannot read sidecar: {e}"}
 
+    def manifest_entry(self, state: dict) -> dict:
+        """Describe discovery/bootstrap state without claiming an import.
+
+        ``loaded`` starts false.  The generated kernel import hook changes it
+        only after the sidecar loader's ``exec_module`` succeeds.
+        """
+
+        gate = self.sidecar_gate()
+        return {
+            "name": self.name,
+            "directory": self.root.name,
+            "origin": self.origin,
+            "distribution_scope": self.source,
+            "enabled": bool(state.get("enabled", True)),
+            "state_scope": state.get("scope", "default"),
+            "state_scope_id": state.get("scope_id", ""),
+            "version": self.version,
+            "document_sha256": self.document_sha256,
+            "sidecar": {
+                "present": self.has_kernel,
+                "sha256": self.sidecar_sha256,
+                "gate": gate,
+                "loaded": False,
+            },
+        }
+
+
+def _bootstrap_runtime_code(manifest: dict, roots: list[str]) -> str:
+    """Generate the in-kernel import gate/tracker for one manifest snapshot."""
+
+    entries = manifest.get("entries") or []
+    known = {
+        str(entry.get("directory")): entry
+        for entry in entries
+        if entry.get("directory")
+    }
+    disabled = {
+        directory
+        for directory, entry in known.items()
+        if not entry.get("enabled", True)
+    }
+    # Keep this generated snippet self-contained: a scientific kernel may not
+    # import openai4s internals from its selected environment.
+    return (
+        "import base64 as _o4s_base64\n"
+        "import hashlib as _o4s_hashlib\n"
+        "import importlib.abc as _o4s_abc\n"
+        "import importlib.machinery as _o4s_machinery\n"
+        "import sys as _o4s_sys\n"
+        "import time as _o4s_time\n"
+        f"__openai4s_skill_bootstrap_manifest__ = {manifest!r}\n"
+        "__openai4s_skill_load_events__ = "
+        "__openai4s_skill_bootstrap_manifest__['load_events']\n"
+        f"_o4s_skill_roots = {roots!r}\n"
+        "_o4s_skill_entries = {\n"
+        "    _o4s_entry['directory']: _o4s_entry\n"
+        "    for _o4s_entry in "
+        "__openai4s_skill_bootstrap_manifest__['entries']\n"
+        "}\n"
+        f"_o4s_disabled_skills = {disabled!r}\n"
+        "for _o4s_root in reversed(_o4s_skill_roots):\n"
+        "    if _o4s_root not in _o4s_sys.path:\n"
+        "        _o4s_sys.path.insert(0, _o4s_root)\n"
+        "for _o4s_module in list(_o4s_sys.modules):\n"
+        "    if _o4s_module.partition('.')[0] in _o4s_skill_entries:\n"
+        "        _o4s_sys.modules.pop(_o4s_module, None)\n"
+        "_o4s_sys.meta_path[:] = [\n"
+        "    _o4s_finder for _o4s_finder in _o4s_sys.meta_path\n"
+        "    if not getattr(_o4s_finder, '_openai4s_skill_gate', False)\n"
+        "]\n"
+        "class _OpenAI4STrackedSkillLoader:\n"
+        "    def __init__(self, delegate, skill_name, entry):\n"
+        "        self._delegate = delegate\n"
+        "        self._skill_name = skill_name\n"
+        "        self._entry = entry\n"
+        "    def create_module(self, spec):\n"
+        "        create = getattr(self._delegate, 'create_module', None)\n"
+        "        return create(spec) if create else None\n"
+        "    def exec_module(self, module):\n"
+        "        spec = getattr(module, '__spec__', None)\n"
+        "        source_path = getattr(spec, 'origin', None)\n"
+        "        get_data = getattr(self._delegate, 'get_data', None)\n"
+        "        if not source_path or not callable(get_data):\n"
+        "            raise ImportError('Skill sidecar source cannot be frozen')\n"
+        "        source = get_data(source_path)\n"
+        "        if not isinstance(source, bytes):\n"
+        "            raise ImportError('Skill sidecar loader returned non-bytes')\n"
+        "        if len(source) > 2_000_000:\n"
+        "            raise ImportError('Skill sidecar exceeds 2MB capture limit')\n"
+        "        captured = sum(\n"
+        "            len(item.get('source_b64'))\n"
+        "            for item in __openai4s_skill_load_events__\n"
+        "            if isinstance(item, dict)\n"
+        "            and isinstance(item.get('source_b64'), str)\n"
+        "        )\n"
+        "        if captured + ((len(source) + 2) // 3 * 4) > 10_000_000:\n"
+        "            raise ImportError('Skill sidecar capture budget exceeded')\n"
+        "        sidecar = self._entry.get('sidecar') or {}\n"
+        "        expected_sha256 = sidecar.get('sha256')\n"
+        "        actual_sha256 = _o4s_hashlib.sha256(source).hexdigest()\n"
+        "        if not expected_sha256 or actual_sha256 != expected_sha256:\n"
+        "            raise ImportError(\n"
+        "                'Skill sidecar changed after bootstrap; restart the '\n"
+        "                'kernel to accept a new capability manifest'\n"
+        "            )\n"
+        "        code = compile(source, source_path, 'exec')\n"
+        "        exec(code, module.__dict__)\n"
+        "        sidecar['loaded'] = True\n"
+        "        sidecar['loaded_sha256'] = actual_sha256\n"
+        "        event = {\n"
+        "            'event': 'sidecar_loaded',\n"
+        "            'skill_name': self._entry.get('name') or self._skill_name,\n"
+        "            'module': module.__name__,\n"
+        "            'version': self._entry.get('version'),\n"
+        "            'expected_sha256': sidecar.get('sha256'),\n"
+        "            'sha256': actual_sha256,\n"
+        "            'source_b64': _o4s_base64.b64encode(source).decode('ascii'),\n"
+        "            'source_path': source_path,\n"
+        "            'order': len(__openai4s_skill_load_events__),\n"
+        "            'exports': [],\n"
+        "            'import_mode': 'module',\n"
+        "            'loaded_at_ns': _o4s_time.time_ns(),\n"
+        "        }\n"
+        "        __openai4s_skill_load_events__.append(event)\n"
+        "    def __getattr__(self, name):\n"
+        "        return getattr(self._delegate, name)\n"
+        "class _OpenAI4SSkillGate(_o4s_abc.MetaPathFinder):\n"
+        "    _openai4s_skill_gate = True\n"
+        "    def find_spec(self, fullname, path=None, target=None):\n"
+        "        top = fullname.partition('.')[0]\n"
+        "        entry = _o4s_skill_entries.get(top)\n"
+        "        if entry is None:\n"
+        "            return None\n"
+        "        if top in _o4s_disabled_skills:\n"
+        "            raise ModuleNotFoundError(\n"
+        '                f"skill sidecar {top!r} is disabled by capability policy"\n'
+        "            )\n"
+        "        spec = _o4s_machinery.PathFinder.find_spec(fullname, path)\n"
+        "        if (\n"
+        "            spec is not None and fullname == top + '.kernel'\n"
+        "            and spec.loader is not None\n"
+        "        ):\n"
+        "            spec.loader = _OpenAI4STrackedSkillLoader(\n"
+        "                spec.loader, top, entry\n"
+        "            )\n"
+        "        return spec\n"
+        "_o4s_sys.meta_path.insert(0, _OpenAI4SSkillGate())\n"
+    )
+
 
 class SkillLoader:
-    def __init__(self, skills_dir: Path | None = None, cfg: Config | None = None):
+    def __init__(
+        self,
+        skills_dir: Path | None = None,
+        cfg: Config | None = None,
+        *,
+        capabilities: CapabilityStateService | None = None,
+        project_id: str | None = None,
+        session_id: str | None = None,
+    ):
         self.cfg = cfg or get_config()
         self.skills_dir = Path(skills_dir) if skills_dir else self.cfg.skills_dir
+        if capabilities is None:
+            capabilities = CapabilityStateService(
+                _StoreCapabilityRepository(self.cfg.db_path),
+                project_id=project_id,
+                session_id=session_id,
+            )
+        elif project_id is not None or session_id is not None:
+            capabilities = capabilities.scoped(
+                project_id=project_id,
+                session_id=session_id,
+            )
+        self.capabilities = capabilities
+        self.project_id = project_id or getattr(capabilities, "project_id", None)
+        self.session_id = session_id or getattr(capabilities, "session_id", None)
         self._skills: dict[str, Skill] = {}
+        self._last_manifest: dict | None = None
+
+    def scoped(
+        self,
+        *,
+        project_id: str | None = None,
+        session_id: str | None = None,
+    ) -> "SkillLoader":
+        return SkillLoader(
+            self.skills_dir,
+            self.cfg,
+            capabilities=self.capabilities.scoped(
+                project_id=project_id,
+                session_id=session_id,
+            ),
+            project_id=(self.project_id if project_id is None else project_id),
+            session_id=(self.session_id if session_id is None else session_id),
+        )
 
     def user_skills_dir(self) -> Path:
         """Writable dir for user-authored skills (kept separate from the bundled
         read-only skills). Discovered alongside the bundled ones."""
         return self.cfg.data_dir / "user-skills"
 
+    def project_skills_dir(self) -> Path | None:
+        """Writable project overlay, isolated by a hashed project identity."""
+
+        if not self.project_id:
+            return None
+        return project_skills_root(self.cfg, self.project_id)
+
+    @staticmethod
+    def parse_document(content: str) -> tuple[dict, str]:
+        """Parse one SKILL.md document with the loader's frontmatter rules."""
+
+        return _parse_frontmatter(content)
+
     def discover(self) -> dict[str, Skill]:
-        self._skills = {}
+        # Build into a fresh local map and publish it with a single atomic
+        # reference swap at the end.  A concurrent reader (search()/get()/
+        # catalog(), or another discover() from a parallel skill-read tool)
+        # then observes either the complete old map or the complete new one —
+        # never a dict being cleared and repopulated in place, which raised
+        # "dictionary changed size during iteration".
+        discovered: dict[str, Skill] = {}
         # bundled skills first, then user-authored ones. A user skill must NOT
-        # silently shadow a trusted BUNDLED skill of the same dir-name — bundled
-        # wins on collision (else agent loads untrusted content under a trusted name).
-        for base in (self.skills_dir, self.user_skills_dir()):
+        # silently shadow a trusted BUNDLED skill by directory or declared
+        # canonical name. Bundled wins on collision, otherwise the agent could
+        # load untrusted content under a trusted capability identity.
+        claimed_names: set[str] = set()
+        roots = [("bundled", self.skills_dir)]
+        project_root = self.project_skills_dir()
+        if project_root is not None:
+            roots.append(("project", project_root))
+        roots.append(("user", self.user_skills_dir()))
+        for source, base in roots:
             if not base or not base.exists():
                 continue
-            is_user = base.resolve() == self.user_skills_dir().resolve()
+            is_writable = source in {"user", "project"}
             for child in sorted(base.iterdir()):
                 if not child.is_dir():
                     continue
                 md = child / "SKILL.md"
                 if not md.exists():
                     continue
-                if is_user and child.name in self._skills:
+                if is_writable and child.name in discovered:
                     continue  # bundled skill already claimed this name — keep it
                 raw = md.read_text("utf-8")
                 meta, body = _parse_frontmatter(raw)
                 origin = (meta.get("origin") or "unknown").lower()
-                if is_user:
-                    origin = "user"
+                if is_writable:
+                    # User-space files cannot claim a trusted bundled origin.
+                    # Preserve the host lifecycle's draft -> personal states;
+                    # Web-authored documents use the separate ``user`` state.
+                    origin = origin if origin in {"draft", "personal"} else "user"
                 elif origin not in _VALID_ORIGINS:
                     origin = "unknown"
                 description = meta.get("description") or _first_paragraph(body)
@@ -226,24 +515,90 @@ class SkillLoader:
                 if len(description) > 200:
                     description = description[:197] + "..."
                 name = meta.get("name") or child.name
-                self._skills[child.name] = Skill(
+                canonical_name = _canonical_skill_name(name)
+                if canonical_name in claimed_names:
+                    continue
+                document_sha256 = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+                sidecar = child / "kernel.py"
+                sidecar_sha256 = None
+                if sidecar.exists():
+                    try:
+                        sidecar_sha256 = hashlib.sha256(
+                            sidecar.read_bytes()
+                        ).hexdigest()
+                    except OSError:
+                        sidecar_sha256 = None
+                version = str(meta.get("version") or "").strip()
+                if not version:
+                    version = (sidecar_sha256 or document_sha256)[:12]
+                discovered[child.name] = Skill(
                     name=name,
                     root=child,
                     doc=body,
                     has_kernel=(child / "kernel.py").exists(),
                     description=description,
                     origin=origin,
+                    source=source,
                     keywords=_tokenize(name, description, body),
+                    version=version,
+                    document_sha256=document_sha256,
+                    sidecar_sha256=sidecar_sha256,
                 )
+                claimed_names.add(canonical_name)
+        self._skills = discovered
         return self._skills
 
-    def skills(self) -> dict[str, Skill]:
+    def bundled_name_collision(self, name: str) -> Skill | None:
+        """Return the bundled owner of a declared-name identity, if any."""
+
+        wanted = _canonical_skill_name(name)
+        if not wanted:
+            return None
+        for skill in self.discover().values():
+            if skill.read_only and _canonical_skill_name(skill.name) == wanted:
+                return skill
+        return None
+
+    def is_enabled(self, name: str) -> bool:
+        return self.capabilities.is_enabled("skill", name)
+
+    def set_enabled(
+        self,
+        name: str,
+        enabled: bool,
+        *,
+        scope: str = "global",
+        scope_id: str | None = None,
+    ) -> dict:
+        skill = self.get(name, include_disabled=True)
+        canonical = skill.name if skill is not None else str(name)
+        return self.capabilities.set_enabled(
+            "skill",
+            canonical,
+            enabled,
+            scope=scope,
+            scope_id=scope_id,
+            metadata={
+                "directory": skill.root.name if skill is not None else None,
+                "origin": skill.origin if skill is not None else None,
+                "version": skill.version if skill is not None else None,
+                "sidecar_sha256": (skill.sidecar_sha256 if skill is not None else None),
+            },
+        )
+
+    def skills(self, *, include_disabled: bool = False) -> dict[str, Skill]:
         if not self._skills:
             self.discover()
-        return self._skills
+        if include_disabled:
+            return self._skills
+        return {
+            key: skill
+            for key, skill in self._skills.items()
+            if self.is_enabled(skill.name)
+        }
 
-    def get(self, name: str) -> Skill | None:
-        skills = self.skills()
+    def get(self, name: str, *, include_disabled: bool = False) -> Skill | None:
+        skills = self.skills(include_disabled=include_disabled)
         if name in skills:
             return skills[name]
         # allow lookup by declared skill.name too
@@ -252,13 +607,84 @@ class SkillLoader:
                 return s
         return None
 
+    def read(self, name: str, path: str = "SKILL.md") -> str:
+        """Read an enabled skill resource without escaping its directory."""
+
+        skill = self.get(name)
+        if skill is None:
+            raise KeyError(f"no such skill (or disabled): {name!r}")
+        root = skill.root.resolve()
+        target = (root / path).resolve()
+        if target != root and root not in target.parents:
+            raise ValueError(f"path escapes skill dir: {path!r}")
+        return target.read_text("utf-8")
+
+    def bootstrap_manifest(self, *, persist: bool = True) -> dict:
+        """Build the exact enabled/disabled skill snapshot for a kernel.
+
+        A stored manifest is a bootstrap *intent* snapshot.  Sidecars remain
+        ``loaded=false`` until the generated import hook observes a successful
+        import in that kernel.
+        """
+
+        all_skills = self.skills(include_disabled=True)
+        states = self.capabilities.snapshot(
+            "skill",
+            [skill.name for skill in all_skills.values()],
+        )
+        entries = [
+            skill.manifest_entry(states[skill.name]) for skill in all_skills.values()
+        ]
+        digest = hashlib.sha256(
+            json.dumps(entries, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        manifest = {
+            "manifest_id": f"local-{digest[:20]}",
+            "kind": "skill",
+            "entries": entries,
+            "load_events": [],
+        }
+        if persist:
+            stored = self.capabilities.record_manifest("skill", entries)
+            if stored is not None:
+                manifest["manifest_id"] = stored["manifest_id"]
+        self._last_manifest = manifest
+        return manifest
+
     def bootstrap_code(self) -> str:
-        """Code the kernel runs at startup so skill sidecars import cleanly."""
-        return (
-            "import sys as _sys\n"
-            f"_sd = {str(self.skills_dir)!r}\n"
-            "if _sd not in _sys.path:\n"
-            "    _sys.path.insert(0, _sd)\n"
+        """Return a scoped sidecar import path, deny gate, and truthful tracker."""
+
+        manifest = self.bootstrap_manifest()
+        roots = [str(self.skills_dir)]
+        project_root = self.project_skills_dir()
+        if project_root is not None:
+            roots.append(str(project_root))
+        roots.append(str(self.user_skills_dir()))
+        return _bootstrap_runtime_code(manifest, roots)
+
+    def record_sidecar_loaded(
+        self,
+        name: str,
+        *,
+        module: str | None = None,
+        manifest_id: str | None = None,
+    ) -> dict:
+        """Persist a load event reported by a runtime/checkpoint integrator."""
+
+        skill = self.get(name, include_disabled=True)
+        if skill is None:
+            raise KeyError(f"no such skill: {name!r}")
+        return self.capabilities.record_event(
+            "skill",
+            skill.name,
+            "sidecar_loaded",
+            metadata={
+                "module": module or f"{skill.root.name}.kernel",
+                "manifest_id": manifest_id
+                or (self._last_manifest or {}).get("manifest_id"),
+                "version": skill.version,
+                "sidecar_sha256": skill.sidecar_sha256,
+            },
         )
 
     def search(self, query: str, *, limit: int = 5) -> list[dict]:
@@ -298,16 +724,21 @@ class SkillLoader:
             )
         return results
 
-    def catalog(self) -> list[dict]:
+    def catalog(self, *, include_disabled: bool = False) -> list[dict]:
         """Lightweight listing (name/description/origin) — no full docs."""
         return [
             {
                 "name": s.name,
                 "description": s.description,
                 "origin": s.origin,
+                "distribution_scope": s.source,
                 "has_kernel": s.has_kernel,
+                "enabled": self.is_enabled(s.name),
+                "version": s.version,
+                "document_sha256": s.document_sha256,
+                "sidecar_sha256": s.sidecar_sha256,
             }
-            for s in self.skills().values()
+            for s in self.skills(include_disabled=include_disabled).values()
         ]
 
     def system_context(self) -> str:

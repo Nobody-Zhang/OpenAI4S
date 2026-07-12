@@ -14,6 +14,7 @@ fresh random port on every call, so a byte-identical re-registration wrongly
 tripped the approval card (port is the name's mutex and must be reused).
 """
 import json
+import shutil
 import sqlite3
 
 import pytest
@@ -31,6 +32,17 @@ def session(tmp_path, monkeypatch):
     cfg = Config(data_dir=tmp_path)
     cfg.ensure_dirs()
     disp = build_dispatcher(cfg=cfg)
+    # Production is fail-closed without an attached approval channel.  This
+    # lifecycle test explicitly authorizes the two destructive transitions it
+    # intends to exercise.
+    for tool in ("skills_publish", "skills_delete"):
+        disp.store.set_permission_rule(
+            scope="global",
+            scope_id="",
+            tool=tool,
+            pattern="e2e-demo-skill",
+            decision="allow",
+        )
     disp.store.log_host_call(
         method="seed_ping", args=[{"x": 1}], ok=True, frame_id="frame-seed"
     )
@@ -39,6 +51,9 @@ def session(tmp_path, monkeypatch):
         yield cfg, disp, kernel
     finally:
         kernel.shutdown()
+        draft = cfg.data_dir / "user-skills" / "e2e-demo-skill"
+        if draft.exists():
+            shutil.rmtree(draft)
 
 
 def _emit(kernel, expr):
@@ -173,8 +188,12 @@ def test_compute_env_setup_pkgscan(session, tmp_path):
     _cfg, _disp, kernel = session
     caps = _emit(kernel, "host.capabilities()")
     # compute is advertised when a remote-compute provider/family is
-    # installed (the repo ships remote-compute-ssh); r_kernel stays off.
-    assert caps["compute"] is True and caps["r_kernel"] is False
+    # installed (the repo ships remote-compute-ssh); r_kernel mirrors whether
+    # an R interpreter is actually resolvable on this machine (live probe).
+    from openai4s.kernel.r_kernel import resolve_r_interpreter
+
+    assert caps["compute"] is True
+    assert caps["r_kernel"] == (resolve_r_interpreter() is not None)
 
     env = tmp_path / "fakeenv"
     (env / "conda-meta").mkdir(parents=True)

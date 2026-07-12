@@ -1,4 +1,7 @@
 """Agent loop + delegation + compaction tests, with the LLM mocked offline."""
+import json
+from pathlib import Path
+
 import pytest
 
 import openai4s.agent.compaction as comp_mod
@@ -56,6 +59,37 @@ def test_code_as_action_cycle(monkeypatch):
     assert len(scripted.calls) == 2
 
 
+def test_cli_save_artifact_resolves_relative_to_actual_kernel_cwd(
+    monkeypatch, tmp_path
+):
+    scripted = ScriptedLLM(
+        [
+            "```python\n"
+            "open('cli-result.txt', 'w').write('science')\n"
+            "saved = host.save_artifact('cli-result.txt')\n"
+            "print(saved['version_id'])\n"
+            "```",
+            "```python\n"
+            "host.submit_output({'saved': True}, ['Saved the CLI artifact'])\n"
+            "```",
+        ]
+    )
+    monkeypatch.setattr(loop_mod, "chat", scripted)
+    monkeypatch.chdir(tmp_path)
+
+    agent = Agent(use_skills=False, allow_delegate=False, max_turns=3)
+    result = agent.run("write and save a relative artifact")
+
+    assert result["stop_reason"] == "submitted"
+    artifact = agent.dispatcher.store.artifact_by_filename(
+        "cli-result.txt", agent.frame_id, strict=True
+    )
+    assert artifact is not None
+    metadata = agent.dispatcher.store.version_meta(artifact["latest_version_id"])
+    assert metadata["path"] == str(tmp_path / "cli-result.txt")
+    assert Path(metadata["snapshot_path"]).read_text() == "science"
+
+
 def test_no_code_block_nudge(monkeypatch):
     scripted = ScriptedLLM(
         [
@@ -66,6 +100,66 @@ def test_no_code_block_nudge(monkeypatch):
     monkeypatch.setattr(loop_mod, "chat", scripted)
     result = Agent(use_skills=False, allow_delegate=False).run("hi")
     assert result["stop_reason"] == "submitted"
+
+
+def test_cli_non_scientific_finalize_uses_live_catalog_and_engine_result(monkeypatch):
+    seen_tools = []
+    arguments = {
+        "summary": "The requested explanation was completed.",
+        "completion_bullets": ["Completed the requested explanation"],
+    }
+
+    def finalize_chat(messages, cfg, **kwargs):
+        del messages, cfg
+        seen_tools.append([tool.name for tool in kwargs["tools"]])
+        call = {
+            "id": "final-cli",
+            "wire_id": "wire-final-cli",
+            "name": "finalize_response",
+            "ordinal": 0,
+            "raw_arguments": json.dumps(arguments),
+            "arguments": arguments,
+            "parse_error": None,
+            "provider_meta": {"provider": "test"},
+        }
+        return {
+            "content": "",
+            "tool_calls": [call],
+            "assistant_message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [call],
+            },
+        }
+
+    monkeypatch.setattr(loop_mod, "chat", finalize_chat)
+
+    def unexpected_kernel(*_args, **_kwargs):
+        raise AssertionError("a structured-finalize-only CLI turn spawned a kernel")
+
+    monkeypatch.setattr(loop_mod, "Kernel", unexpected_kernel)
+    agent = Agent(
+        use_skills=False,
+        allow_delegate=False,
+        max_turns=1,
+    )
+    result = agent.run(
+        "Explain the already-known result without scientific computation"
+    )
+
+    assert "finalize_response" in seen_tools[0]
+    assert "bash" not in seen_tools[0]
+    assert "submit_output" not in seen_tools[0]
+    assert result["stop_reason"] == "submitted"
+    assert result["submitted_output"] == {
+        "output": {"summary": "The requested explanation was completed."},
+        "completion_bullets": ["Completed the requested explanation"],
+    }
+    assert result["final_message"] == "The requested explanation was completed."
+    assert [
+        group["kind"]
+        for group in agent.dispatcher.store.list_action_groups(agent.frame_id)
+    ] == ["user", "finalize", "terminal"]
 
 
 def test_submit_output_soft_fail_does_not_complete(monkeypatch):
@@ -106,6 +200,89 @@ def test_max_turns_stop(monkeypatch):
     agent = Agent(use_skills=False, allow_delegate=False, max_turns=3)
     result = agent.run("loop forever")
     assert result["stop_reason"] == "max_turns"
+
+
+# ---- R execution channel (```r) -------------------------------------------
+
+
+class _FakeRKernel:
+    """Stands in for the persistent R kernel in loop tests (no R needed)."""
+
+    def __init__(self):
+        self.cells = []
+        self.down = False
+
+    def is_alive(self):
+        return not self.down
+
+    def execute(self, code, origin="agent", on_chunk=None):
+        self.cells.append(code)
+        return {
+            "stdout": "[1] 42\n",
+            "stderr": "",
+            "error": None,
+            "interrupted": False,
+            "trace": {"error_lineno": None, "error_call": None},
+            "usage": {},
+        }
+
+    def shutdown(self):
+        self.down = True
+
+
+def test_r_cell_routes_to_r_kernel_and_is_non_terminal(monkeypatch):
+    """An ```r cell runs on the (lazily spawned) R kernel, its observation is
+    fed back, and — R being an analysis channel with no host object — the task
+    still completes only through a python host.submit_output cell. The R
+    kernel is shut down with the run."""
+    import openai4s.kernel.r_kernel as rk_mod
+
+    fake = _FakeRKernel()
+    spawns = []
+
+    def fake_spawn(**kw):
+        spawns.append(kw)
+        return fake
+
+    monkeypatch.setattr(rk_mod, "spawn_r_kernel", fake_spawn)
+    scripted = ScriptedLLM(
+        [
+            "R first.\n```r\nx <- 42\nprint(x)\n```",
+            "```python\nhost.submit_output({'a': 1}, ['Analyzed in R'])\n```",
+        ]
+    )
+    monkeypatch.setattr(loop_mod, "chat", scripted)
+    result = Agent(use_skills=False, allow_delegate=False, max_turns=4).run("use R")
+
+    assert result["stop_reason"] == "submitted"
+    assert fake.cells == ["x <- 42\nprint(x)\n"]
+    assert len(spawns) == 1  # lazy: spawned exactly once, on first ```r cell
+    obs = [t["content"] for t in result["transcript"] if t["role"] == "observation"]
+    assert any("[1] 42" in o for o in obs)
+    assert fake.down  # run-scoped lifecycle
+
+
+def test_r_cell_without_r_soft_fails_into_observation(monkeypatch):
+    """No R interpreter -> the ```r cell yields an ERROR observation (never a
+    crash), and the model can fall back to python and still finish."""
+    import openai4s.kernel.r_kernel as rk_mod
+
+    def no_r(**kw):
+        raise RuntimeError("no R interpreter available: build the 'r' env")
+
+    monkeypatch.setattr(rk_mod, "spawn_r_kernel", no_r)
+    scripted = ScriptedLLM(
+        [
+            "```r\n1 + 1\n```",
+            "```python\nhost.submit_output({'a': 1}, ['Fell back to python'])\n```",
+        ]
+    )
+    monkeypatch.setattr(loop_mod, "chat", scripted)
+    result = Agent(use_skills=False, allow_delegate=False, max_turns=4).run("try R")
+
+    assert result["stop_reason"] == "submitted"
+    obs = [t["content"] for t in result["transcript"] if t["role"] == "observation"]
+    assert any("R kernel unavailable" in o for o in obs)
 
 
 # ---- ReAct tool surface (```tool) ----------------------------------------
@@ -218,6 +395,114 @@ def test_estimate_tokens_monotonic():
     assert comp_mod.estimate_tokens(big) > comp_mod.estimate_tokens(small)
 
 
+def test_context_estimate_accounts_for_structured_components_independently():
+    estimate = comp_mod.estimate_context(
+        [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "look"},
+                    {"type": "image_url", "image_url": {"url": "https://x/i"}},
+                ],
+                "tool_calls": [{"id": "c1", "name": "lookup", "arguments": {}}],
+                "wire_state": {"response_id": "resp-1", "cursor": 9},
+            }
+        ],
+        tool_schemas=[{"name": "lookup", "parameters": {"type": "object"}}],
+    )
+
+    assert estimate.text > 0
+    assert estimate.images >= comp_mod.IMAGE_TOKEN_ESTIMATE
+    assert estimate.tool_calls > 0
+    assert estimate.tool_schemas > 0
+    assert estimate.wire_state > 0
+    components = estimate.as_dict()
+    assert components.pop("total") == sum(components.values())
+
+
+def test_context_estimate_separates_tool_results_and_artifact_refs():
+    estimate = comp_mod.estimate_context(
+        [
+            {
+                "role": "tool",
+                "content": "large structured result",
+                "artifact_refs": [{"artifact_id": "a-1", "version_id": "v-1"}],
+            }
+        ]
+    )
+    assert estimate.tool_results > 0
+    assert estimate.artifact_refs > 0
+    assert estimate.text == 0
+
+
+def test_large_tool_result_is_content_addressed_and_recoverable(tmp_path):
+    content = "measurement," * 100
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "task"},
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "name": "measure",
+            "content": content,
+        },
+    ]
+
+    projected = comp_mod.externalize_large_outputs(
+        messages,
+        tmp_path,
+        threshold_chars=32,
+        preview_chars=24,
+        archive_metadata={"branch": "branch-a", "ledger_cursor": 41},
+    )
+
+    reference = projected[2]["content_archive"]
+    assert len(reference["sha256"]) == 64
+    assert reference["sha256"] in projected[2]["content"]
+    assert "measurement" in projected[2]["content"]
+    assert comp_mod.load_archived_content(tmp_path, reference["sha256"]) == content
+    blob = json.loads((tmp_path / reference["archive_ref"]).read_text("utf-8"))
+    assert blob["metadata"]["branch"] == "branch-a"
+    assert blob["metadata"]["ledger_cursor"] == 41
+
+
+def test_large_tool_result_can_become_a_versioned_artifact_reference():
+    calls = []
+
+    def archive(content, message, metadata):
+        calls.append((content, message, metadata))
+        return {"artifact_id": "a-context", "version_id": "v-context"}
+
+    projected = comp_mod.externalize_large_outputs(
+        [{"role": "tool", "content": "x" * 100}],
+        None,
+        threshold_chars=20,
+        artifact_archiver=archive,
+    )
+    assert calls and calls[0][2]["original_chars"] == 100
+    assert projected[0]["artifact_refs"][0]["artifact_id"] == "a-context"
+    assert "version_id: v-context" in projected[0]["content"]
+
+
+def test_code_and_observation_are_one_atomic_compaction_segment():
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "```python\nx = 1\n```"},
+        {"role": "user", "content": "[Observation]\n(no output)"},
+        {"role": "assistant", "content": "next"},
+    ]
+
+    segments = comp_mod.segment_messages(messages)
+    assert any(
+        segment.kind == "code_observation" and (segment.start, segment.end) == (2, 4)
+        for segment in segments
+    )
+    # A fixed two-message tail would begin at the observation; V2 expands it
+    # back to include the source cell that produced that observation.
+    assert comp_mod.safe_keep_recent(messages, minimum=2) == 3
+
+
 def test_should_compact_uses_window(monkeypatch):
     cfg = get_config()
     # ~1000 tokens of content
@@ -243,6 +528,75 @@ def test_compact_shrinks_and_preserves_head(monkeypatch):
     assert out[1]["content"] == "task"  # original task preserved
     assert "SUMMARY TEXT" in out[2]["content"]  # summary injected
     assert out[-1]["content"] == "o5"  # most recent kept verbatim
+
+
+def test_compact_handoff_is_structured_and_never_invents_kernel_continuity(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(comp_mod, "chat", ScriptedLLM(["Finished old analysis."]))
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "old work"},
+        {"role": "user", "content": "old result"},
+        {"role": "assistant", "content": "recent"},
+    ]
+
+    archives = []
+    out = comp_mod.compact(
+        messages,
+        get_config(),
+        keep_recent=1,
+        archive_dir=tmp_path,
+        archive_metadata={
+            "branch": "experiment-b",
+            "ledger_cursor": 73,
+            "recovery_pointer": {"checkpoint": "cp-4"},
+        },
+        archive_sink=archives.append,
+    )
+
+    handoff = out[2]["content"]
+    for field in comp_mod.HANDOFF_FIELDS:
+        assert f"## {field}" in handoff
+    assert "Unknown" in handoff
+    assert "NOT assumed to exist" in handoff
+    assert "namespace still holds" not in handoff
+    archive_path = next(
+        path for path in tmp_path.glob("compaction-*.json") if path.is_file()
+    )
+    archive = json.loads(archive_path.read_text("utf-8"))
+    assert archive["schema_version"] == 2
+    assert archive["metadata"]["branch"] == "experiment-b"
+    assert archive["metadata"]["ledger_cursor"] == 73
+    assert archive["metadata"]["recovery_pointer"] == {"checkpoint": "cp-4"}
+    assert archives[0]["archive_id"] == archive["archive_id"]
+    assert archives[0]["context_estimate_before"]["total"] > 0
+
+
+def test_compact_handoff_marks_restarted_generation_as_non_persistent(monkeypatch):
+    monkeypatch.setattr(comp_mod, "chat", ScriptedLLM(["Summary"]))
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "old"},
+        {"role": "user", "content": "old result"},
+        {"role": "assistant", "content": "recent"},
+    ]
+
+    out = comp_mod.compact(
+        messages,
+        get_config(),
+        keep_recent=1,
+        archive_metadata={
+            "active_kernel_generation": "python:8",
+            "previous_kernel_generation": "python:7",
+        },
+    )
+
+    assert "python:8" in out[2]["content"]
+    assert "previous: python:7" in out[2]["content"]
+    assert "variables from earlier generations are NOT available" in out[2]["content"]
 
 
 # ---- delegation ----------------------------------------------------------
@@ -276,6 +630,34 @@ def test_delegate_single_and_list(monkeypatch):
     many = runner({"request": ["A", "B", "C"]})
     assert isinstance(many, list) and len(many) == 3
     assert {m["output"]["echo"] for m in many} == {"A", "B", "C"}
+
+
+def test_delegate_output_schema_uses_shared_completion_validation(monkeypatch):
+    def fake_run(self, task):
+        output = {"x": 1} if task == "valid" else {"y": 1}
+        return {
+            "stop_reason": "submitted",
+            "submitted_output": {
+                "output": output,
+                "completion_bullets": ["Computed the result"],
+            },
+            "final_message": None,
+        }
+
+    monkeypatch.setattr(loop_mod.Agent, "run", fake_run)
+    runner = DelegationRunner(get_config())
+    schema = {"type": "object", "required": ["x"]}
+
+    invalid = runner({"request": "invalid", "output_schema": schema})
+    assert invalid["error"] == (
+        "output_schema violation: output missing required field 'x'"
+    )
+    assert runner.children()[0]["status"] == "failed"
+
+    valid = runner({"request": "valid", "output_schema": schema})
+    assert "error" not in valid
+    assert valid["output"] == {"x": 1}
+    assert runner.children()[1]["status"] == "done"
 
 
 def test_delegate_session_cap(monkeypatch):

@@ -1,43 +1,16 @@
-"""Bash tool: run a shell command through the HostDispatcher.
+"""Static shell-command precheck for the kernel-local `host.bash`.
 
-Execution routes to the host `bash` method, which runs in the session
-workspace and is itself wrapped by the permission gate + egress fence. The
-`precheck_command` here is a cheap, static, best-effort defense-in-depth gate
-that SUPPLEMENTS (never replaces) those runtime layers and the code
-classifier: it refuses a handful of obviously-catastrophic literal commands
-before they are ever dispatched. It is not a sandbox and does not attempt to
-defeat obfuscation.
+The host executes only python/R cells — shell commands run INSIDE the kernel
+worker (`sdk/host.py` `bash()`), and `precheck_command` is the cheap, static,
+best-effort defense-in-depth gate that runs there before the shell does. It
+SUPPLEMENTS (never replaces) the pre-exec code classifier, the egress fence,
+and the in-kernel audit hook: it refuses a handful of obviously-catastrophic
+literal commands. It is not a sandbox and does not attempt to defeat
+obfuscation. Pure stdlib (it runs in the worker process).
 """
 from __future__ import annotations
 
 import re
-
-from openai4s.tools.base import Tool
-
-bash = Tool(
-    name="bash",
-    host_method="bash",
-    description="Run a shell command in the session workspace (networking available).",
-    parameters={
-        "properties": {
-            "command": {"type": "string", "description": "Shell command to run."},
-            "timeout": {
-                "type": "number",
-                "description": "Seconds before the command is killed (default 120).",
-            },
-            "workdir": {
-                "type": "string",
-                "description": "Working directory, relative to the workspace.",
-            },
-        },
-        "required": ["command"],
-    },
-    read_only=False,
-    dangerous=True,
-    mutates_cwd=True,
-    needs_network=True,
-)
-
 
 # Cheap static blocklist. Each entry is (compiled regex, human reason). These
 # match a few unambiguous catastrophes only; anything subtler is left to the

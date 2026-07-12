@@ -7,6 +7,8 @@ Connectors feature has a real server to attach to and exercise end-to-end:
   initialize  →  serverInfo + capabilities
   tools/list  →  {echo, now, calc, random_int}
   tools/call  →  {content:[{type:"text", text:...}]}
+  resources/list + resources/read → a small text resource
+  prompts/list + prompts/get → a parameterized summarization prompt
 
 Run: `python3 -m openai4s.mcp_servers.example_server` (stdin/stdout are the wire).
 """
@@ -56,6 +58,30 @@ TOOLS = [
             "required": ["low", "high"],
         },
     },
+]
+
+RESOURCE_URI = "openai4s://example/guide"
+RESOURCES = [
+    {
+        "uri": RESOURCE_URI,
+        "name": "OpenAI4S example connector guide",
+        "description": "A local text resource for exercising MCP resources/read.",
+        "mimeType": "text/plain",
+    }
+]
+
+PROMPTS = [
+    {
+        "name": "summarize",
+        "description": "Ask for a concise summary of supplied text.",
+        "arguments": [
+            {
+                "name": "text",
+                "description": "Text to summarize.",
+                "required": True,
+            }
+        ],
+    }
 ]
 
 _OPS = {
@@ -111,7 +137,7 @@ def _handle(msg: dict) -> dict | None:
             "id": mid,
             "result": {
                 "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {"tools": {}},
+                "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
                 "serverInfo": {"name": "openai4s-example", "version": "1.0.0"},
             },
         }
@@ -142,6 +168,70 @@ def _handle(msg: dict) -> dict | None:
                     "isError": True,
                 },
             }
+    if method == "resources/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": mid,
+            "result": {"resources": RESOURCES},
+        }
+    if method == "resources/read":
+        uri = (msg.get("params") or {}).get("uri")
+        if uri != RESOURCE_URI:
+            return {
+                "jsonrpc": "2.0",
+                "id": mid,
+                "error": {"code": -32002, "message": f"resource not found: {uri}"},
+            }
+        return {
+            "jsonrpc": "2.0",
+            "id": mid,
+            "result": {
+                "contents": [
+                    {
+                        "uri": RESOURCE_URI,
+                        "mimeType": "text/plain",
+                        "text": (
+                            "This bundled connector demonstrates MCP tools, "
+                            "resources, and prompts without third-party packages."
+                        ),
+                    }
+                ]
+            },
+        }
+    if method == "prompts/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": mid,
+            "result": {"prompts": PROMPTS},
+        }
+    if method == "prompts/get":
+        params = msg.get("params") or {}
+        if params.get("name") != "summarize":
+            return {
+                "jsonrpc": "2.0",
+                "id": mid,
+                "error": {
+                    "code": -32602,
+                    "message": f"unknown prompt: {params.get('name')}",
+                },
+            }
+        text = str((params.get("arguments") or {}).get("text", ""))
+        return {
+            "jsonrpc": "2.0",
+            "id": mid,
+            "result": {
+                "description": "A concise summarization request.",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": {
+                            "type": "text",
+                            "text": f"Summarize this text concisely:\n\n{text}",
+                        },
+                    }
+                ],
+            },
+        }
     if mid is not None:
         return {
             "jsonrpc": "2.0",

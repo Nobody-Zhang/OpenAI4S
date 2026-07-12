@@ -1,10 +1,14 @@
 """Kernel tests: persistent namespace, print capture, error attribution,
 usage accounting, and host_call RPC round-trip (dispatcher stubbed)."""
+import os
 import threading
 
 import pytest
 
-from openai4s.kernel import Kernel
+from openai4s.config import Config, LLMConfig
+from openai4s.host_dispatch import build_dispatcher
+from openai4s.kernel import Kernel, KernelBusyError
+from openai4s.kernel.environment import build_kernel_environment
 
 
 def _echo_dispatcher(method, args):
@@ -13,6 +17,26 @@ def _echo_dispatcher(method, args):
     if method == "add":
         return sum(args[0]["nums"])
     raise ValueError(f"unknown method {method}")
+
+
+def _authorized_bash_dispatcher(tmp_path):
+    """Real Host policy/authorization with an explicit test-only allow rule."""
+
+    cfg = Config(
+        data_dir=tmp_path / ".data",
+        llm=LLMConfig(provider="deepseek", api_key="test-only"),
+    )
+    dispatcher = build_dispatcher(cfg, workspace=tmp_path)
+    frame_id = dispatcher.store.new_frame(kind="turn")
+    dispatcher.frame_id = frame_id
+    dispatcher.store.set_permission_rule(
+        scope="conversation",
+        scope_id=frame_id,
+        tool="bash",
+        pattern="*",
+        decision="allow",
+    )
+    return dispatcher
 
 
 def test_print_capture():
@@ -27,6 +51,204 @@ def test_persistent_namespace():
         k.execute("x = 41")
         r = k.execute("print(x + 1)")
         assert r["stdout"].strip() == "42"
+
+
+def test_variable_inspector_reads_only_safe_builtins_without_repr_hooks():
+    with Kernel(dispatcher=_echo_dispatcher) as kernel:
+        setup = kernel.execute(
+            "events = []\n"
+            "class Meta(type):\n"
+            "    def __getattribute__(cls, name):\n"
+            "        if name == '__name__': events.append('metaclass-name')\n"
+            "        return super().__getattribute__(name)\n"
+            "class Hostile(metaclass=Meta):\n"
+            "    def __repr__(self): events.append('repr'); raise RuntimeError('repr')\n"
+            "    def __len__(self): events.append('len'); raise RuntimeError('len')\n"
+            "    def __sizeof__(self): events.append('sizeof'); raise RuntimeError('sizeof')\n"
+            "class TrapList(list):\n"
+            "    def __repr__(self): events.append('list-repr'); raise RuntimeError('repr')\n"
+            "    def __iter__(self): events.append('list-iter'); raise RuntimeError('iter')\n"
+            "    def __len__(self): events.append('list-len'); raise RuntimeError('len')\n"
+            "score = 0.93\n"
+            "title = 'protein'\n"
+            "samples = [1, 2, 3]\n"
+            "mixed = [1, Hostile()]\n"
+            "hostile = Hostile()\n"
+            "trap = TrapList([1, 2])"
+        )
+        assert setup["error"] is None
+
+        response = kernel.inspect_variables()
+        variables = {item["name"]: item for item in response["variables"]}
+
+        assert variables["score"]["preview"] == 0.93
+        assert variables["title"]["preview"] == "protein"
+        assert variables["samples"]["length"] == 3
+        assert len(variables["samples"]["fingerprint"]) == 64
+        assert variables["mixed"] == {
+            "name": "mixed",
+            "type": "list",
+            "kind": "container",
+            "length": 2,
+        }
+        assert variables["hostile"] == {"name": "hostile", "type": "Hostile"}
+        assert variables["trap"] == {"name": "trap", "type": "TrapList"}
+        assert "host" not in variables and "openai4s" not in variables
+        assert kernel.execute("print(events)")["stdout"].strip() == "[]"
+
+
+def test_variable_inspector_fails_busy_without_competing_frame_reader():
+    with Kernel(dispatcher=_echo_dispatcher) as kernel:
+        started = threading.Event()
+        result = {}
+
+        def run():
+            result["cell"] = kernel.execute(
+                "print('started')\nimport time\ntime.sleep(30)",
+                on_chunk=lambda _text: started.set(),
+            )
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        # A completely cold optional-science install may build Matplotlib's
+        # font cache before the first user byte is emitted. The cache now has a
+        # stable writable location, but this concurrency assertion should not
+        # mistake that one-time initialization for a protocol deadlock.
+        assert started.wait(60)
+        with pytest.raises(KernelBusyError, match="busy"):
+            kernel.inspect_variables()
+        kernel.interrupt()
+        thread.join(timeout=15)
+        assert not thread.is_alive()
+        assert result["cell"]["interrupted"] is True
+        # The failed busy read consumed no frame; the next request is aligned.
+        assert isinstance(kernel.inspect_variables()["variables"], list)
+
+
+def test_variable_inspector_limit_validation_is_local():
+    with Kernel(dispatcher=_echo_dispatcher) as kernel:
+        with pytest.raises(ValueError, match="between 1 and 500"):
+            kernel.inspect_variables(limit=0)
+        with pytest.raises(TypeError, match="integer"):
+            kernel.inspect_variables(limit=True)
+        assert kernel.execute("print('aligned')")["stdout"].strip() == "aligned"
+
+
+def test_kernel_child_environment_is_rebuilt_from_strict_allowlist(tmp_path):
+    source = {
+        "PATH": "/host/bin",
+        "HOME": "/home/scientist",
+        "LANG": "en_US.UTF-8",
+        "TMPDIR": "/safe/tmp",
+        "MPLBACKEND": "Agg",
+        "VIRTUAL_ENV": "/host/venv",
+        "PYTHONPATH": "/host/injected-pythonpath",
+        "CONDA_PREFIX": "/host/wrong-conda",
+        "OPENAI4S_PROVENANCE_OFF": "1",
+        "OPENAI4S_SAFETY_AUDIT_HOOK": "0",
+        "OPENAI4S_KERNEL_MODE": "host-override",
+        "OPENAI4S_KERNEL_GENERATION": "host-forged-generation",
+        "OPENAI4S_WORKSPACE": "/host/wrong-workspace",
+        "OPENAI4S_LLM_API_KEY": "llm-secret",
+        "OPENAI4S_ARK_API_KEY": "ark-secret",
+        "OPENAI_API_KEY": "openai-secret",
+        "ANTHROPIC_API_KEY": "anthropic-secret",
+        "HF_TOKEN": "hf-secret",
+        "AWS_SECRET_ACCESS_KEY": "aws-secret",
+        "SYNTHETIC_OAUTH_CREDENTIAL": "oauth-secret",
+        "DATABASE_PASSWORD": "db-secret",
+        "SSH_AUTH_SOCK": "/tmp/agent.sock",
+        "HTTPS_PROXY": "https://user:password@proxy.invalid",
+        "LD_PRELOAD": "/tmp/evil.so",
+        "LD_LIBRARY_PATH": "/tmp/evil-libs",
+        "DYLD_INSERT_LIBRARIES": "/tmp/evil.dylib",
+        "DYLD_LIBRARY_PATH": "/tmp/evil-dylibs",
+        "BASH_ENV": "/tmp/evil-bashrc",
+        "NODE_OPTIONS": "--require=/tmp/evil.js",
+    }
+    repo_root = tmp_path / "trusted-repo"
+    env_root = tmp_path / "conda" / "science"
+
+    env = build_kernel_environment(
+        source=source,
+        mode="python",
+        cwd=str(tmp_path),
+        env_root=str(env_root),
+        env_name="science",
+        kernel_generation="kernel:test-generation",
+        repo_root=str(repo_root),
+    )
+
+    assert env["PATH"].split(os.pathsep)[0] == str(env_root / "bin")
+    assert env["HOME"] == "/home/scientist"
+    assert env["LANG"] == "en_US.UTF-8"
+    assert env["TMPDIR"] == "/safe/tmp"
+    assert env["MPLBACKEND"] == "Agg"
+    assert env["MPLCONFIGDIR"] == "/safe/tmp/openai4s-matplotlib"
+    assert env["OPENAI4S_PROVENANCE_OFF"] == "1"
+    assert env["OPENAI4S_SAFETY_AUDIT_HOOK"] == "0"
+    assert env["OPENAI4S_KERNEL_MODE"] == "python"
+    assert env["OPENAI4S_KERNEL_GENERATION"] == "kernel:test-generation"
+    assert env["OPENAI4S_WORKSPACE"] == str(tmp_path.resolve())
+    assert env["PWD"] == str(tmp_path.resolve())
+    assert env["PYTHONPATH"] == str(repo_root.resolve())
+    assert env["CONDA_PREFIX"] == str(env_root)
+    assert env["CONDA_DEFAULT_ENV"] == "science"
+    assert env["CONDA_SHLVL"] == "1"
+    assert "VIRTUAL_ENV" not in env  # selected conda runtime wins
+
+    forbidden = {
+        "OPENAI4S_LLM_API_KEY",
+        "OPENAI4S_ARK_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "HF_TOKEN",
+        "AWS_SECRET_ACCESS_KEY",
+        "SYNTHETIC_OAUTH_CREDENTIAL",
+        "DATABASE_PASSWORD",
+        "SSH_AUTH_SOCK",
+        "HTTPS_PROXY",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "BASH_ENV",
+        "NODE_OPTIONS",
+    }
+    assert forbidden.isdisjoint(env)
+    assert "/host/injected-pythonpath" not in env["PYTHONPATH"]
+    assert source["OPENAI4S_LLM_API_KEY"] == "llm-secret"  # source not mutated
+
+
+def test_python_kernel_and_its_subprocesses_cannot_inherit_host_api_key(
+    monkeypatch, tmp_path
+):
+    marker = "synthetic-host-llm-secret-never-in-kernel"
+    monkeypatch.setenv("OPENAI4S_LLM_API_KEY", marker)
+    monkeypatch.setenv("OPENAI4S_ARK_API_KEY", marker)
+    monkeypatch.setenv("OPENAI_API_KEY", marker)
+    monkeypatch.setenv("HF_TOKEN", marker)
+    monkeypatch.setenv("LD_PRELOAD", "/tmp/openai4s-never-load.so")
+    monkeypatch.setenv("DYLD_INSERT_LIBRARIES", "/tmp/openai4s-never-load.dylib")
+    monkeypatch.setenv("OPENAI4S_PROVENANCE_OFF", "1")
+
+    code = """
+import os, shlex, subprocess, sys
+probe = "import os; print(os.environ.get('OPENAI4S_LLM_API_KEY', '<missing>'))"
+print(os.environ.get('OPENAI4S_LLM_API_KEY', '<missing>'))
+print(subprocess.check_output([sys.executable, '-c', probe], text=True).strip())
+cmd = shlex.quote(sys.executable) + ' -c ' + shlex.quote(probe)
+print(host.bash(cmd)['stdout'].strip())
+print(os.environ.get('OPENAI4S_PROVENANCE_OFF', '<missing>'))
+"""
+    with Kernel(
+        dispatcher=_authorized_bash_dispatcher(tmp_path), cwd=str(tmp_path)
+    ) as kernel:
+        result = kernel.execute(code)
+
+    assert result["error"] is None
+    assert result["stdout"].splitlines() == ["<missing>", "<missing>", "<missing>", "1"]
+    assert marker not in result["stdout"]
 
 
 def test_expr_echo():
@@ -130,6 +352,67 @@ def test_stdout_chunks_stream_via_on_chunk():
         r = k.execute("print('live')", on_chunk=chunks.append)
         assert "live" in "".join(chunks)
         assert r["stdout"] == "live\n"
+
+
+def test_explicit_cell_id_roundtrips_through_worker_response():
+    with Kernel(dispatcher=_echo_dispatcher) as kernel:
+        result = kernel.execute("print('identified')", cell_id="cell-shared")
+        automatic_one = kernel.execute("pass")
+        automatic_two = kernel.execute("pass")
+
+    assert result["id"] == "cell-shared"
+    assert result["stdout"] == "identified\n"
+    assert automatic_one["id"]
+    assert automatic_one["id"] != automatic_two["id"]
+
+
+def test_save_artifact_host_call_carries_canonical_and_declared_cell_ids():
+    calls = []
+
+    def dispatcher(method, args):
+        calls.append((method, args))
+        return {"ok": True}
+
+    with Kernel(dispatcher=dispatcher) as kernel:
+        inherited = kernel.execute(
+            "print(host.save_artifact('result.csv')['ok'])",
+            cell_id="cell-artifact",
+        )
+        explicit = kernel.execute(
+            "host.save_artifact('result.csv', producing_cell_id='manual-cell')",
+            cell_id="cell-other",
+        )
+
+    assert inherited["error"] is None
+    assert inherited["stdout"].strip() == "True"
+    assert explicit["error"] is None
+    save_calls = [call for call in calls if call[0] == "save_artifact"]
+    assert save_calls == [
+        (
+            "save_artifact",
+            [
+                {
+                    "path": "result.csv",
+                    "inputVersionIds": [],
+                    "priority": 0,
+                    "executionCellId": "cell-artifact",
+                    "producingCellId": "cell-artifact",
+                }
+            ],
+        ),
+        (
+            "save_artifact",
+            [
+                {
+                    "path": "result.csv",
+                    "inputVersionIds": [],
+                    "producingCellId": "manual-cell",
+                    "priority": 0,
+                    "executionCellId": "cell-other",
+                }
+            ],
+        ),
+    ]
 
 
 def test_host_call_soft_fail_single_key_error_dict():
@@ -318,6 +601,75 @@ def test_user_raised_keyboardinterrupt_is_normal_error_with_lineno():
         assert "KeyboardInterrupt" in r["error"]
         assert r["trace"]["error_lineno"] == 2
         assert k.is_alive()
+
+
+def test_host_bash_is_kernel_local_and_never_rpcs(tmp_path):
+    """host.bash runs INSIDE the worker process — the host executes only
+    python/R cells. A dispatcher that rejects a 'bash' method proves no RPC
+    happens; the command's output is captured in the cell like any subprocess."""
+
+    authorized = _authorized_bash_dispatcher(tmp_path)
+
+    def no_bash_dispatcher(method, args):
+        if method == "bash":
+            raise AssertionError("host.bash must not reach the host dispatcher")
+        return authorized(method, args)
+
+    with Kernel(dispatcher=no_bash_dispatcher, cwd=str(tmp_path)) as k:
+        r = k.execute("r = host.bash('echo kernel-local'); print(r['stdout'])")
+        assert r["error"] is None
+        assert "kernel-local" in r["stdout"]
+        # the shell ran in the worker's cwd (the workspace)
+        r2 = k.execute("print(host.bash('pwd')['workdir'])")
+        assert str(tmp_path.resolve()) in r2["stdout"]
+
+    methods = [
+        row[0]
+        for row in authorized.store._conn.execute(
+            "SELECT method FROM host_call_log ORDER BY created_at"
+        ).fetchall()
+    ]
+    assert "bash" in methods  # safe result audit
+    assert "authorize_bash" in methods
+
+
+def test_host_bash_capability_is_bound_to_exact_worker_spawn(tmp_path):
+    dispatcher = _authorized_bash_dispatcher(tmp_path)
+    observed: list[tuple[str, str | int | None]] = []
+    authorize = dispatcher._bash_authorization.authorize
+
+    def inspect_binding(spec):
+        observed.append((spec.get("generation"), dispatcher.bash_generation_id))
+        return authorize(spec)
+
+    dispatcher._bash_authorization.authorize = inspect_binding
+    with Kernel(dispatcher=dispatcher, cwd=str(tmp_path)) as kernel:
+        first_generation = kernel.authorization_generation
+        first = kernel.execute("print(host.bash('echo first')['stdout'])")
+        assert first["error"] is None
+        kernel.restart()
+        second_generation = kernel.authorization_generation
+        second = kernel.execute("print(host.bash('echo second')['stdout'])")
+        assert second["error"] is None
+
+    assert first_generation != second_generation
+    assert observed == [
+        (first_generation, first_generation),
+        (second_generation, second_generation),
+    ]
+    assert dispatcher.bash_generation_id is None
+
+
+def test_host_bash_static_precheck_blocks_catastrophe(tmp_path):
+    with Kernel(dispatcher=_echo_dispatcher, cwd=str(tmp_path)) as k:
+        r = k.execute(
+            "try:\n"
+            "    host.bash('rm -rf /')\n"
+            "except RuntimeError as e:\n"
+            "    print('BLOCKED:', e)\n"
+        )
+        assert r["error"] is None
+        assert "BLOCKED:" in r["stdout"] and "precheck" in r["stdout"]
 
 
 if __name__ == "__main__":

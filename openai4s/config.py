@@ -83,6 +83,7 @@ def _default_data_dir() -> Path:
 _NATIVE_KEY_ENV = {
     "ark": ("ARK_API_KEY", "DOUBAO_API_KEY"),
     "chatgpt": ("OPENAI_API_KEY",),
+    "openai_responses": ("OPENAI_API_KEY",),
     "claude": ("ANTHROPIC_API_KEY", "CLAUDE_API_KEY"),
     "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
 }
@@ -93,7 +94,7 @@ class LLMConfig:
     """Multi-provider base-model config.
 
     A single `provider` selects one of the wire adapters in ``llm.PROVIDERS``
-    (ark / chatgpt / claude / gemini). ``base_url``
+    (ark / chatgpt / openai_responses / claude / gemini). ``base_url``
     and ``model`` are left empty by default — ``llm.chat`` fills in the
     provider's built-in defaults — but can be overridden per provider.
 
@@ -186,7 +187,7 @@ def _env_flag(name: str, default: bool) -> bool:
 class SecurityConfig:
     """Toggles for the defense-in-depth safety layer (openai4s.security).
 
-    Mirrors the three-layer pipeline reverse-engineered from Claude Science:
+    A three-layer defense pipeline:
     a pre-exec code-safety classifier, an in-kernel CPython audit hook, and the
     biosecurity / prompt-injection screeners. Everything is opt-out via env so a
     single-user local install keeps working, but the cheap static gates default
@@ -198,14 +199,14 @@ class SecurityConfig:
             "llm"        - static fast-path + the e6w LLM classifier for the
                            residual "uncertain" code (needs an API key)
         audit_hook (OPENAI4S_SAFETY_AUDIT_HOOK, default on):
-            install the in-kernel `_operon_audit` dlopen guard.
+            install the in-kernel dlopen guard.
         biosecurity (OPENAI4S_BIOSECURITY, default on):
             splice the calibrated-accountability (oiO) prompt AND run the diO
             trajectory screener when biosecurity-relevant content is detected.
         injection_scan (OPENAI4S_INJECTION_SCAN, default on):
             screen tool-returned content (web/pdf/mcp) for prompt injection.
 
-    Also carries the network egress fence (report §5.1). ``egress_mode``
+    Also carries the network egress fence. ``egress_mode``
     mirrors the enforcement mode read by :mod:`openai4s.egress`:
 
     * ``off`` (default) — fail-open; no allowlist enforcement, so an install that

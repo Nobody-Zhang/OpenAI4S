@@ -16,31 +16,252 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from openai4s.tools.artifacts import (
+    GetArtifactMetadataTool,
+    ListArtifactsTool,
+    ListArtifactVersionsTool,
+    RestoreArtifactVersionTool,
+    SaveArtifactTool,
+)
+from openai4s.tools.background import (
+    InterruptBackgroundExecTool,
+    ListBackgroundExecsTool,
+    PeekBackgroundExecTool,
+    SubmitBackgroundExecTool,
+)
 from openai4s.tools.base import Tool
-from openai4s.tools.bash import bash, precheck_command
-from openai4s.tools.edit import edit_file, static_edit_precheck
-from openai4s.tools.env import env_create, env_list, env_use
-from openai4s.tools.fs import list_dir, read_text_file, write_file
-from openai4s.tools.search import content_search, glob_files
-from openai4s.tools.web import web_fetch, web_search
+from openai4s.tools.capabilities import SearchCapabilitiesTool
+from openai4s.tools.content_search import ContentSearchTool
+from openai4s.tools.data import (
+    FramesTool,
+    LineageGetTool,
+    LineageGraphTool,
+    QuerySchemaTool,
+    ReadOnlyQueryTool,
+)
+from openai4s.tools.delegation import (
+    CollectChildrenTool,
+    DelegateTaskTool,
+    ListChildrenTool,
+    SendChildMessageTool,
+    StopChildTool,
+)
+from openai4s.tools.dynamic_control import (
+    ActivateDynamicToolVersion,
+    DefineDynamicTool,
+    ListDynamicTools,
+    ListDynamicToolVersions,
+    PromoteDynamicTool,
+    RollbackDynamicToolVersion,
+)
+from openai4s.tools.edit import EditFileTool
+from openai4s.tools.env_create import EnvCreateTool
+from openai4s.tools.env_list import EnvListTool
+from openai4s.tools.env_use import EnvUseTool
+from openai4s.tools.glob_files import GlobFilesTool
+from openai4s.tools.list_directory import ListDirectoryTool
+from openai4s.tools.mcp import (
+    CallMCPTool,
+    GetMCPPromptTool,
+    ListMCPPromptsTool,
+    ListMCPResourcesTool,
+    ListMCPServersTool,
+    ListMCPToolsTool,
+    ReadMCPResourceTool,
+)
+from openai4s.tools.network_access import RequestNetworkAccessTool
+from openai4s.tools.progress import (
+    ReadPlanTool,
+    ReadTodosTool,
+    ReviewStatusTool,
+    UpdatePlanStepTool,
+    WriteTodosTool,
+)
+from openai4s.tools.read_text_file import ReadTextFileTool
+from openai4s.tools.remote_capabilities import (
+    RegisterRemoteCapabilityTool,
+    RemoteGPUStatusTool,
+)
+from openai4s.tools.remote_compute import (
+    CancelRemoteComputeJobTool,
+    CloseRemoteComputeTool,
+    GetRemoteComputeJobResultTool,
+    RemoteComputeStatusTool,
+    SubmitRemoteComputeJobTool,
+)
+from openai4s.tools.schema import SchemaDefinitionError
+from openai4s.tools.session import (
+    CreateCheckpointTool,
+    ForkSessionTool,
+    PendingPermissionsTool,
+    RevertPreviewTool,
+    SessionStatusTool,
+)
+from openai4s.tools.skills import (
+    LoadSkillTool,
+    RollbackSkillVersionTool,
+    SearchSkillsTool,
+    SkillHistoryTool,
+    SkillStatusTool,
+)
+from openai4s.tools.taxonomy import READ_ONLY, SIDE_EFFECT_CLASSES
+from openai4s.tools.web_fetch import WebFetchTool
+from openai4s.tools.web_search import WebSearchTool
+from openai4s.tools.write_file import WriteFileTool
 
 # Ordered, canonical tool surface. Order here is the order shown in the prompt.
-REGISTRY: list[Tool] = [
-    list_dir,
-    read_text_file,
-    write_file,
-    glob_files,
-    content_search,
-    edit_file,
-    bash,
-    env_list,
-    env_use,
-    env_create,
-    web_search,
-    web_fetch,
-]
+# There is deliberately NO shell tool: the host executes only python/R cells —
+# shell commands run inside the kernel (`host.bash` in sdk/host.py, or
+# subprocess in a cell), never in the host process.
+TOOL_TYPES: tuple[type[Tool], ...] = (
+    ListDirectoryTool,
+    ReadTextFileTool,
+    WriteFileTool,
+    GlobFilesTool,
+    ContentSearchTool,
+    EditFileTool,
+    EnvListTool,
+    EnvUseTool,
+    EnvCreateTool,
+    WebSearchTool,
+    WebFetchTool,
+    SearchCapabilitiesTool,
+    SearchSkillsTool,
+    LoadSkillTool,
+    SkillStatusTool,
+    SkillHistoryTool,
+    RollbackSkillVersionTool,
+    ListArtifactsTool,
+    GetArtifactMetadataTool,
+    ListArtifactVersionsTool,
+    SaveArtifactTool,
+    RestoreArtifactVersionTool,
+    QuerySchemaTool,
+    ReadOnlyQueryTool,
+    FramesTool,
+    LineageGetTool,
+    LineageGraphTool,
+    ReadTodosTool,
+    WriteTodosTool,
+    ReadPlanTool,
+    ReviewStatusTool,
+    UpdatePlanStepTool,
+    SessionStatusTool,
+    CreateCheckpointTool,
+    ForkSessionTool,
+    RevertPreviewTool,
+    PendingPermissionsTool,
+    DelegateTaskTool,
+    ListChildrenTool,
+    CollectChildrenTool,
+    StopChildTool,
+    SendChildMessageTool,
+    SubmitBackgroundExecTool,
+    ListBackgroundExecsTool,
+    PeekBackgroundExecTool,
+    InterruptBackgroundExecTool,
+    ListMCPServersTool,
+    ListMCPToolsTool,
+    ListMCPResourcesTool,
+    ReadMCPResourceTool,
+    ListMCPPromptsTool,
+    GetMCPPromptTool,
+    CallMCPTool,
+    RequestNetworkAccessTool,
+    RemoteGPUStatusTool,
+    RegisterRemoteCapabilityTool,
+    SubmitRemoteComputeJobTool,
+    RemoteComputeStatusTool,
+    GetRemoteComputeJobResultTool,
+    CancelRemoteComputeJobTool,
+    CloseRemoteComputeTool,
+    DefineDynamicTool,
+    ListDynamicTools,
+    PromoteDynamicTool,
+    ListDynamicToolVersions,
+    ActivateDynamicToolVersion,
+    RollbackDynamicToolVersion,
+)
+FILE_TOOL_TYPES = TOOL_TYPES[:6]
 
-_BY_NAME: dict[str, Tool] = {t.name: t for t in REGISTRY}
+_FORBIDDEN_CONTROL_NAMES = frozenset({"bash", "submit_output"})
+_PORTABLE_TOOL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$")
+REGISTRY: list[Tool] = []
+_BY_NAME: dict[str, Tool] = {}
+_BY_HOST_METHOD: dict[str, Tool] = {}
+
+
+def register_tool(tool: Tool) -> Tool:
+    """Register one executable class instance during application bootstrap."""
+    if not isinstance(tool, Tool) or type(tool).execute is Tool.execute:
+        raise TypeError("control tools must be concrete Tool subclasses")
+    if not tool.name or not tool.host_method:
+        raise ValueError("control tools require a name and host_method")
+    if not _PORTABLE_TOOL_NAME.fullmatch(tool.name):
+        raise ValueError(f"tool name is not provider-portable: {tool.name!r}")
+    if (
+        tool.name in _FORBIDDEN_CONTROL_NAMES
+        or tool.host_method in _FORBIDDEN_CONTROL_NAMES
+    ):
+        raise ValueError("shell and completion cannot be registered as control tools")
+    if tool.name in _BY_NAME:
+        raise ValueError(f"duplicate public tool name: {tool.name!r}")
+    if tool.host_method in _BY_HOST_METHOD:
+        raise ValueError(f"duplicate host method: {tool.host_method!r}")
+    if tool.needs_network and not tool.screen_untrusted_output:
+        raise ValueError("network tools must screen untrusted output")
+    if tool.side_effect_class not in SIDE_EFFECT_CLASSES:
+        raise ValueError(
+            f"unknown side_effect_class for {tool.name!r}: "
+            f"{tool.side_effect_class!r}"
+        )
+    if not tool.read_only and tool.side_effect_class == READ_ONLY:
+        raise ValueError(
+            f"mutating tool {tool.name!r} must declare a side_effect_class"
+        )
+    try:
+        tool.input_schema()
+    except SchemaDefinitionError as error:
+        raise ValueError(f"invalid schema for tool {tool.name!r}: {error}") from error
+    if tool.provider_strict is True and not tool.supports_provider_strict():
+        raise ValueError(
+            f"tool {tool.name!r} opts into provider strict mode with an "
+            "incompatible schema"
+        )
+    try:
+        keys = tool.resource_keys({})
+    except Exception as error:  # noqa: BLE001 — reject broken extension metadata
+        raise ValueError(
+            f"tool {tool.name!r} could not derive resource keys: {error}"
+        ) from error
+    if (
+        not isinstance(keys, tuple)
+        or not keys
+        or not all(isinstance(key, str) and ":" in key for key in keys)
+    ):
+        raise ValueError(
+            f"tool {tool.name!r} resource_keys() must return non-empty namespaced "
+            "strings"
+        )
+    REGISTRY.append(tool)
+    _BY_NAME[tool.name] = tool
+    _BY_HOST_METHOD[tool.host_method] = tool
+    return tool
+
+
+def _unregister_tool(name: str) -> None:
+    """Test/plugin-cleanup counterpart; runtime hot-unload is unsupported."""
+    tool = _BY_NAME.pop(name, None)
+    if tool is None:
+        return
+    _BY_HOST_METHOD.pop(tool.host_method, None)
+    REGISTRY.remove(tool)
+
+
+for _tool_type in TOOL_TYPES:
+    register_tool(_tool_type())
+
+BUILTIN_CONTROL_HOST_METHODS = frozenset(tool.host_method for tool in REGISTRY)
 
 
 def get_tool(name: str) -> Tool | None:
@@ -48,9 +269,27 @@ def get_tool(name: str) -> Tool | None:
     return _BY_NAME.get(name)
 
 
+def get_tool_by_host_method(host_method: str) -> Tool | None:
+    """Look up the concrete implementation behind one protected host method."""
+    tool = _BY_HOST_METHOD.get(host_method)
+    if tool is None or type(tool).execute is Tool.execute:
+        return None
+    return tool
+
+
 def all_tools() -> list[Tool]:
     """A copy of the registry list (callers may reorder/filter freely)."""
     return list(REGISTRY)
+
+
+def _catalog_tool(name: str, catalog: Any = None) -> Tool | None:
+    if catalog is None:
+        return get_tool(name)
+    resolver = getattr(catalog, "get", None)
+    if not callable(resolver):
+        raise TypeError("tool catalog must provide get(name)")
+    tool = resolver(name)
+    return tool if isinstance(tool, Tool) else None
 
 
 # --- parsing model replies -------------------------------------------------
@@ -194,7 +433,12 @@ def _coerce_call(obj: Any) -> tuple[dict | None, str | None]:
     return {"name": name, "arguments": args}, None
 
 
-def _parse_tool_body(body: str, calls: list[dict], errors: list[str]) -> None:
+def _parse_tool_body(
+    body: str,
+    calls: list[dict],
+    errors: list[str],
+    catalog: Any = None,
+) -> None:
     """Decode one ```tool block body (a JSON object or list) into calls/errors."""
     body = (body or "").strip()
     if not body:
@@ -211,13 +455,16 @@ def _parse_tool_body(body: str, calls: list[dict], errors: list[str]) -> None:
         if err is not None:
             errors.append(err)
             continue
-        if get_tool(call["name"]) is None:
+        if _catalog_tool(call["name"], catalog) is None:
             errors.append(f"unknown tool: {call['name']!r}")
             continue
         calls.append(call)
 
 
-def parse_tool_calls(reply: str) -> tuple[list[dict], list[str]]:
+def parse_tool_calls(
+    reply: str,
+    catalog: Any = None,
+) -> tuple[list[dict], list[str]]:
     """Scan `reply` for TOP-LEVEL ```tool blocks and return (calls, errors).
 
     Fences are paired by character and run length, so a ```tool token nested
@@ -243,14 +490,14 @@ def parse_tool_calls(reply: str) -> tuple[list[dict], list[str]]:
         if not block.closed:
             errors.append("unclosed ```tool block")
             continue
-        _parse_tool_body(block.body, calls, errors)
+        _parse_tool_body(block.body, calls, errors, catalog)
     return calls, errors
 
 
 # --- prompt rendering ------------------------------------------------------
 
 
-def render_tools_prompt() -> str:
+def render_tools_prompt(catalog: Any = None) -> str:
     """A concise system-prompt section describing the ```tool convention and
     listing every tool as "- signature(): description"."""
     lines = [
@@ -270,14 +517,18 @@ def render_tools_prompt() -> str:
         "",
         "Use a tool for small, deterministic operations — listing a directory, "
         "reading/writing a file, glob, grep, a web search or fetch, an "
-        "environment switch, or a single-string edit. Use a ```python cell for "
-        "analysis, plotting, modeling, simulations, and any multi-step "
-        "computation needing persistent kernel state. NEVER write a python cell "
-        "merely to list files, grep, or fetch a URL — use the tool.",
+        "environment switch, or a single-string edit. Use a ```python cell "
+        "(or an ```r cell for R) for analysis, plotting, modeling, simulations, "
+        "and any multi-step computation needing persistent kernel state. NEVER "
+        "write a python cell merely to list files, grep, or fetch a URL — use "
+        "the tool. There is no shell tool: run shell commands from a python "
+        "cell (host.bash(...) or subprocess), which executes them inside the "
+        "kernel.",
         "",
         "Available tools:",
     ]
-    for tool in REGISTRY:
+    tools = REGISTRY if catalog is None else tuple(catalog.tools())
+    for tool in tools:
         lines.append(f"- {tool.signature_line()}: {tool.description}")
     return "\n".join(lines)
 
@@ -313,6 +564,10 @@ def _render_result_body(result: Any) -> str:
     if set(result.keys()) == {"error"}:
         return f"error: {result['error']}"
     parts: list[str] = []
+    warning = result.get("_security_warning")
+    if isinstance(warning, str) and warning:
+        parts.append(f"[SECURITY WARNING]\n{warning}")
+    warning_parts = len(parts)
     for key in ("content", "stdout", "output"):
         val = result.get(key)
         if isinstance(val, str) and val:
@@ -329,6 +584,12 @@ def _render_result_body(result: Any) -> str:
         parts.append(f"ok={result['ok']}")
     if result.get("error"):
         parts.append(f"error: {result['error']}")
+    if len(parts) == warning_parts:
+        payload = {
+            key: value for key, value in result.items() if key != "_security_warning"
+        }
+        if payload:
+            parts.append(_safe_json(payload))
     if not parts:
         return _safe_json(result)
     return "\n".join(parts)
@@ -352,7 +613,27 @@ def format_tool_result(tool: Tool, result: Any) -> str:
     return _truncate_with_marker(text, tool.output_limit, "\n… [truncated]")
 
 
-def execute_tool_call(dispatcher: Any, call: Any) -> tuple[str, bool]:
+def tool_validation_error(
+    name: str,
+    arguments: Any,
+    catalog: Any = None,
+) -> str | None:
+    """Return the canonical tool-result text for invalid known-tool input."""
+    tool = _catalog_tool(name, catalog)
+    if tool is None:
+        return None
+    detail = tool.validation_error(arguments)
+    if detail is None:
+        return None
+    text = f"[Tool error] {tool.name}: {detail}"
+    return _truncate_with_marker(text, tool.output_limit, "\n… [truncated]")
+
+
+def execute_tool_call(
+    dispatcher: Any,
+    call: Any,
+    catalog: Any = None,
+) -> tuple[str, bool]:
     """Run one parsed tool call through `dispatcher` and return
     (observation_text, ok).
 
@@ -371,7 +652,7 @@ def execute_tool_call(dispatcher: Any, call: Any) -> tuple[str, bool]:
             return "[Tool error] tool call must be a JSON object", False
         raw_name = call.get("name")
         name = raw_name if type(raw_name) is str else "unknown"
-        tool = get_tool(name)
+        tool = _catalog_tool(name, catalog)
         if tool is None:
             return f"[Tool error] unknown tool: {name!r}", False
 
@@ -385,19 +666,15 @@ def execute_tool_call(dispatcher: Any, call: Any) -> tuple[str, bool]:
             )
         spec = dict(raw_spec)
 
-        if tool.dangerous and tool.host_method == "bash":
-            reason = precheck_command(spec.get("command", ""))
-            if reason:
-                return (
-                    f"[Tool: {tool.name}] blocked by static safety precheck: {reason}",
-                    False,
-                )
-        if tool.host_method == "edit_file":
-            err = static_edit_precheck(spec)
-            if err:
-                return f"[Tool: {tool.name}] {err}", False
+        validation_error = tool_validation_error(tool.name, spec, catalog)
+        if validation_error is not None:
+            return validation_error, False
 
-        result = dispatcher(tool.host_method, [spec])
+        err = tool.native_precheck(spec)
+        if err:
+            return f"[Tool: {tool.name}] {err}", False
+
+        result = tool.invoke(dispatcher, spec)
         ok = not (isinstance(result, dict) and set(result.keys()) == {"error"})
         return format_tool_result(tool, result), ok
     except Exception as e:  # noqa: BLE001 — a tool error must not crash the loop
@@ -443,7 +720,12 @@ def finalize_tool_batch(parts: list[str], n_total: int, errors: list[str]) -> st
     )
 
 
-def run_tool_calls(dispatcher: Any, calls: list[dict], errors: list[str]) -> str:
+def run_tool_calls(
+    dispatcher: Any,
+    calls: list[dict],
+    errors: list[str],
+    catalog: Any = None,
+) -> str:
     """Execute a batch of parsed tool calls through `dispatcher` (up to
     MAX_TOOL_CALLS_PER_TURN) and return a single bounded observation string.
 
@@ -453,6 +735,6 @@ def run_tool_calls(dispatcher: Any, calls: list[dict], errors: list[str]) -> str
     """
     parts: list[str] = []
     for call in calls[:MAX_TOOL_CALLS_PER_TURN]:
-        text, _ok = execute_tool_call(dispatcher, call)
+        text, _ok = execute_tool_call(dispatcher, call, catalog)
         parts.append(text)
     return finalize_tool_batch(parts, len(calls), errors)

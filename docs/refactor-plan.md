@@ -1,5 +1,12 @@
 # OpenAI4S Refactor Plan
 
+> Historical planning record. The backend migration described here and in the
+> later hybrid architecture has been implemented. For current ownership and
+> extension rules, use [`architecture.md`](architecture.md),
+> [`backend-refactor-architecture.md`](backend-refactor-architecture.md), and
+> [`backend-extension-guide.md`](backend-extension-guide.md). The blocker list
+> below records the pre-refactor baseline; it is not current status.
+
 This document is an architecture exploration and staged refactor plan. It is not
 an implementation patch. The intended workflow is:
 

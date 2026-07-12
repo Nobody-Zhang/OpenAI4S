@@ -4,6 +4,11 @@ store.py is a future extraction target (docs/refactor-plan.md) — these lock
 the row shapes and id conventions callers depend on TODAY, so an extraction
 that drops or renames a column fails here first.
 """
+import hashlib
+import sqlite3
+
+import pytest
+
 from openai4s.config import Config, LLMConfig
 from openai4s.store import get_store
 
@@ -14,6 +19,37 @@ def _store(tmp_path):
         llm=LLMConfig(provider="deepseek", api_key="test-key"),
     )
     return get_store(cfg.db_path)
+
+
+def test_legacy_execution_log_gets_dependency_metadata_backfill(tmp_path):
+    db_path = Config(data_dir=tmp_path).db_path
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "CREATE TABLE execution_log ("
+            "producing_cell_id TEXT PRIMARY KEY,frame_id TEXT,root_frame_id TEXT,"
+            "project_id TEXT NOT NULL DEFAULT 'default',cell_seq INTEGER,"
+            "cell_index INTEGER,state_revision INTEGER,kernel_id TEXT,"
+            "language TEXT,status TEXT,origin TEXT,code TEXT NOT NULL,"
+            "stdout TEXT,stderr TEXT,error TEXT,figures TEXT,files_read TEXT,"
+            "files_written TEXT,interrupted INTEGER NOT NULL DEFAULT 0,"
+            "wall_s REAL,cpu_s REAL,peak_rss_kb INTEGER,created_at INTEGER NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO execution_log(producing_cell_id,language,origin,code,"
+            "created_at) VALUES('legacy-cell','python','system','x = source + 1',1)"
+        )
+
+    store = get_store(db_path)
+    cell = store.cell_detail("legacy-cell")
+
+    assert cell["code_hash"] == hashlib.sha256(b"x = source + 1").hexdigest()
+    assert cell["visibility"] == "system"
+    assert cell["pin"] is False
+    assert cell["replay_policy"] == "never"
+    assert cell["variable_reads"] == ["source"]
+    assert cell["variable_writes"] == ["x"]
+    assert cell["variable_deletes"] == []
+    assert cell["mutation_uncertain"] is False
 
 
 # --- frames ------------------------------------------------------------------
@@ -107,6 +143,256 @@ def test_save_artifact_return_shape_and_version_row_columns(tmp_path):
     assert store.version_meta("v-does-not-exist") is None
 
 
+def test_record_cell_artifact_coalesces_metadata_and_lineage_atomically(tmp_path):
+    store = _store(tmp_path)
+    frame_id = store.new_frame(kind="turn", project_id="default")
+    source = tmp_path / "input.txt"
+    source.write_text("science")
+    source_record = store.save_artifact(
+        path=str(source),
+        filename=source.name,
+        content_type="text/plain",
+        size_bytes=7,
+        checksum="source",
+        frame_id=frame_id,
+    )
+    output = tmp_path / "output.csv"
+    output.write_text("value\n1\n")
+    checksum = "same-bytes"
+
+    provenance = store.record_cell_artifact(
+        path=str(output),
+        filename=output.name,
+        content_type="text/plain",
+        size_bytes=8,
+        checksum=checksum,
+        producing_cell_id="cell-1",
+        frame_id=frame_id,
+        input_version_ids=[source_record["version_id"], source_record["version_id"]],
+    )
+    repeated = store.record_cell_artifact(
+        path=str(output),
+        filename=output.name,
+        content_type="text/plain",
+        size_bytes=8,
+        checksum=checksum,
+        producing_cell_id="cell-1",
+        frame_id=frame_id,
+        input_version_ids=[source_record["version_id"]],
+    )
+    assert repeated["version_id"] == provenance["version_id"]
+    env_id = store.upsert_env_snapshot(
+        {"kind": "python", "packages": [], "package_count": 0}
+    )
+    capture = store.record_cell_artifact(
+        path=str(output),
+        filename=output.name,
+        content_type="text/csv",
+        size_bytes=8,
+        checksum=checksum,
+        producing_cell_id="cell-1",
+        frame_id=frame_id,
+        root_frame_id=frame_id,
+        env_snapshot_id=env_id,
+    )
+
+    assert capture["artifact_id"] == provenance["artifact_id"]
+    assert capture["version_id"] == provenance["version_id"]
+    assert capture["content_type"] == "text/csv"
+    assert len(store.list_versions(provenance["artifact_id"])) == 1
+    metadata = store.version_meta(provenance["version_id"])
+    assert metadata["content_type"] == "text/csv"
+    assert metadata["env_snapshot_id"] == env_id
+    assert store.get_artifact(provenance["artifact_id"])["content_type"] == "text/csv"
+    assert store.lineage_inputs(provenance["version_id"]) == [
+        {
+            "version_id": source_record["version_id"],
+            "filename": "input.txt",
+            "path": str(source),
+        }
+    ]
+
+    next_cell = store.record_cell_artifact(
+        path=str(output),
+        filename=output.name,
+        content_type="text/csv",
+        size_bytes=8,
+        checksum=checksum,
+        producing_cell_id="cell-2",
+        frame_id=frame_id,
+    )
+    assert next_cell["artifact_id"] == provenance["artifact_id"]
+    assert next_cell["version_id"] != provenance["version_id"]
+    assert len(store.list_versions(provenance["artifact_id"])) == 2
+
+
+def test_record_cell_artifact_finds_exact_version_before_newer_duplicate(tmp_path):
+    store = _store(tmp_path)
+    frame_id = store.new_frame(kind="turn", project_id="default")
+    output = tmp_path / "result.csv"
+    output.write_text("value\n1\n")
+    checksum = "provenance-bytes"
+
+    provenance = store.record_cell_artifact(
+        path=str(output),
+        filename=output.name,
+        content_type=None,
+        size_bytes=8,
+        checksum=checksum,
+        producing_cell_id="cell-provenance",
+        frame_id=frame_id,
+    )
+    intervening = store.save_artifact(
+        path=str(tmp_path / "explicit-copy.csv"),
+        filename=output.name,
+        content_type="text/csv",
+        size_bytes=8,
+        checksum="explicit-bytes",
+        producing_cell_id="cell-explicit",
+        frame_id=frame_id,
+    )
+
+    capture = store.record_cell_artifact(
+        path=str(output),
+        filename=output.name,
+        content_type="text/csv",
+        size_bytes=8,
+        checksum=checksum,
+        producing_cell_id="cell-provenance",
+        frame_id=frame_id,
+    )
+
+    assert capture["artifact_id"] == provenance["artifact_id"]
+    assert capture["version_id"] == provenance["version_id"]
+    assert store.get_artifact(provenance["artifact_id"])["latest_version_id"] == (
+        provenance["version_id"]
+    )
+    assert store.get_artifact(intervening["artifact_id"])["latest_version_id"] == (
+        intervening["version_id"]
+    )
+
+
+def test_provisional_policy_keeps_distinct_explicit_aliases(tmp_path):
+    store = _store(tmp_path)
+    frame_id = store.new_frame(kind="turn", project_id="default")
+    output = tmp_path / "physical.csv"
+    output.write_text("value\n1\n")
+    first_snapshot = tmp_path / "first.snapshot"
+    second_snapshot = tmp_path / "second.snapshot"
+    first_snapshot.write_bytes(output.read_bytes())
+    second_snapshot.write_bytes(output.read_bytes())
+
+    first = store.record_cell_artifact(
+        path=str(output),
+        filename="first.csv",
+        content_type="text/csv",
+        size_bytes=8,
+        checksum="same-bytes",
+        producing_cell_id="cell-alias",
+        frame_id=frame_id,
+        snapshot_path=str(first_snapshot),
+        reuse_policy="provisional",
+    )
+    second = store.record_cell_artifact(
+        path=str(output),
+        filename="second.csv",
+        content_type="text/csv",
+        size_bytes=8,
+        checksum="same-bytes",
+        producing_cell_id="cell-alias",
+        frame_id=frame_id,
+        snapshot_path=str(second_snapshot),
+        reuse_policy="provisional",
+    )
+
+    assert second["artifact_id"] != first["artifact_id"]
+    assert store.get_artifact(first["artifact_id"])["filename"] == "first.csv"
+    assert store.get_artifact(second["artifact_id"])["filename"] == "second.csv"
+    assert len(store.list_versions(first["artifact_id"])) == 1
+    assert len(store.list_versions(second["artifact_id"])) == 1
+
+
+def test_record_cell_artifact_coalesces_unframed_alias_and_versions_new_bytes(
+    tmp_path,
+):
+    store = _store(tmp_path)
+    output = tmp_path / "unframed.txt"
+    output.write_text("first")
+    alias = tmp_path / "unframed-alias.txt"
+    alias.symlink_to(output)
+
+    first = store.record_cell_artifact(
+        path=str(output),
+        filename="result.txt",
+        content_type=None,
+        size_bytes=5,
+        checksum="first-bytes",
+        producing_cell_id="cell-unframed",
+        frame_id=None,
+    )
+    finalized = store.record_cell_artifact(
+        path=str(alias),
+        filename="result.txt",
+        content_type="text/plain",
+        size_bytes=5,
+        checksum="first-bytes",
+        producing_cell_id="cell-unframed",
+        frame_id=None,
+    )
+
+    assert finalized["artifact_id"] == first["artifact_id"]
+    assert finalized["version_id"] == first["version_id"]
+    assert finalized["content_type"] == "text/plain"
+
+    output.write_text("second")
+    changed = store.record_cell_artifact(
+        path=str(output),
+        filename="result.txt",
+        content_type="text/plain",
+        size_bytes=6,
+        checksum="second-bytes",
+        producing_cell_id="cell-unframed",
+        frame_id=None,
+    )
+
+    assert changed["artifact_id"] == first["artifact_id"]
+    assert changed["version_id"] != first["version_id"]
+    assert len(store.list_versions(first["artifact_id"])) == 2
+
+
+def test_record_cell_artifact_rolls_back_version_when_lineage_fails(tmp_path):
+    store = _store(tmp_path)
+    frame_id = store.new_frame(kind="turn", project_id="default")
+    source = store.save_artifact(
+        path=str(tmp_path / "input.txt"),
+        filename="input.txt",
+        content_type="text/plain",
+        size_bytes=1,
+        checksum="input",
+        frame_id=frame_id,
+    )
+    store._conn.execute(
+        "CREATE TRIGGER fail_lineage BEFORE INSERT ON lineage_edges "
+        "BEGIN SELECT RAISE(ABORT, 'lineage failed'); END"
+    )
+    store._conn.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="lineage failed"):
+        store.record_cell_artifact(
+            path=str(tmp_path / "output.txt"),
+            filename="output.txt",
+            content_type="text/plain",
+            size_bytes=1,
+            checksum="output",
+            producing_cell_id="cell-fail",
+            frame_id=frame_id,
+            input_version_ids=[source["version_id"]],
+        )
+
+    assert store.artifact_by_filename("output.txt", frame_id, strict=True) is None
+    assert store.version_for_path(str(tmp_path / "output.txt")) is None
+
+
 def test_list_versions_row_shape_ordering_and_latest_pointer(tmp_path):
     store = _store(tmp_path)
     rec1 = store.save_artifact(
@@ -168,6 +454,94 @@ def test_resolve_artifact_path_prefers_snapshot_keeps_live_path(tmp_path):
     assert store.version_meta(rec["version_id"])["path"] == "/live/file.txt"
     assert store.version_for_path("/live/file.txt") == rec["version_id"]
     assert store.resolve_artifact_path("nope") is None
+
+
+def test_version_for_path_breaks_timestamp_ties_by_newest_row(monkeypatch, tmp_path):
+    import openai4s.store as store_module
+
+    monkeypatch.setattr(store_module, "_now_ms", lambda: 123456)
+    store = _store(tmp_path)
+    first = store.save_artifact(
+        path="/live/tied.txt",
+        filename="tied.txt",
+        content_type="text/plain",
+        size_bytes=1,
+        checksum="first",
+    )
+    second = store.save_artifact(
+        path="/live/tied.txt",
+        filename="tied.txt",
+        content_type="text/plain",
+        size_bytes=1,
+        checksum="second",
+        artifact_id=first["artifact_id"],
+    )
+
+    assert store.version_for_path("/live/tied.txt") == second["version_id"]
+
+
+def test_version_for_path_resolves_legacy_relative_and_symlink_aliases(
+    monkeypatch, tmp_path
+):
+    store = _store(tmp_path / "data")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "relative.txt"
+    target.write_text("data")
+    monkeypatch.chdir(workspace)
+    relative = store.save_artifact(
+        path="relative.txt",
+        filename="relative.txt",
+        content_type="text/plain",
+        size_bytes=4,
+        checksum="relative",
+    )
+    assert store.version_for_path(str(target)) == relative["version_id"]
+
+    physical = tmp_path / "physical"
+    physical.mkdir()
+    aliased = tmp_path / "alias"
+    aliased.symlink_to(physical, target_is_directory=True)
+    alias_path = aliased / "linked.txt"
+    real_path = physical / "linked.txt"
+    real_path.write_text("linked")
+    exact = store.save_artifact(
+        path=str(real_path),
+        filename="linked.txt",
+        content_type="text/plain",
+        size_bytes=6,
+        checksum="exact-older",
+    )
+    linked = store.save_artifact(
+        path=str(alias_path),
+        filename="linked.txt",
+        content_type="text/plain",
+        size_bytes=6,
+        checksum="linked",
+        artifact_id=exact["artifact_id"],
+    )
+    assert store.version_for_path(str(real_path)) == linked["version_id"]
+    assert store.version_for_path(str(alias_path)) == linked["version_id"]
+
+    external = tmp_path / "external"
+    external_dir = external / "dir"
+    external_dir.mkdir(parents=True)
+    traversal_link = workspace / "traversal-link"
+    traversal_link.symlink_to(external_dir, target_is_directory=True)
+    external_secret = external / "secret.txt"
+    workspace_secret = workspace / "secret.txt"
+    external_secret.write_text("outside")
+    workspace_secret.write_text("inside")
+    lexical_traversal = traversal_link / ".." / "secret.txt"
+    traversed = store.save_artifact(
+        path=str(lexical_traversal),
+        filename="secret.txt",
+        content_type="text/plain",
+        size_bytes=7,
+        checksum="outside",
+    )
+    assert store.version_for_path(str(external_secret)) == traversed["version_id"]
+    assert store.version_for_path(str(workspace_secret)) is None
 
 
 # --- lineage_edges -----------------------------------------------------------
