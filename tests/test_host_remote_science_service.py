@@ -59,22 +59,25 @@ def fold_output(*, provenance: str | None = None, manifest: str | None = None):
         }
     )
     provenance_block = (
-        "===PROVENANCE_JSON===\n"
-        f"{provenance}\n"
-        "===END_PROVENANCE_JSON===\n"
+        "===PROVENANCE_JSON===\n" f"{provenance}\n" "===END_PROVENANCE_JSON===\n"
         if provenance is not None
         else ""
     )
+    # Precompute encodings: py3.10 forbids a backslash inside an f-string
+    # expression, and these payloads contain newlines.
+    pdb_b64 = encoded("ATOM\n")
+    plddt_b64 = encoded("residue,plddt\n1,90\n")
+    confidence_b64 = encoded({"overall": 0.9})
     return (
         "===FOLD_RESULT_JSON===\n"
         f"{manifest}\n"
         "===END_FOLD_RESULT_JSON===\n"
         "===FOLD_PDB_B64===\n"
-        f"{encoded('ATOM\n')}\n"
+        f"{pdb_b64}\n"
         "===FOLD_PLDDT_CSV_B64===\n"
-        f"{encoded('residue,plddt\n1,90\n')}\n"
+        f"{plddt_b64}\n"
         "===FOLD_CONFIDENCE_JSON_B64===\n"
-        f"{encoded({'overall': 0.9})}\n"
+        f"{confidence_b64}\n"
         f"{provenance_block}"
         "===FOLD_DONE===\n"
     )
@@ -89,18 +92,17 @@ def mutation_output(*, provenance: str | None = None, summary: str | None = None
         }
     )
     provenance_block = (
-        "===PROVENANCE_JSON===\n"
-        f"{provenance}\n"
-        "===END_PROVENANCE_JSON===\n"
+        "===PROVENANCE_JSON===\n" f"{provenance}\n" "===END_PROVENANCE_JSON===\n"
         if provenance is not None
         else ""
     )
+    csv_b64 = encoded("mutation,score\nA1C,1.2\n")
     return (
         "===MUT_RESULT_JSON===\n"
         f"{summary}\n"
         "===END_MUT_RESULT_JSON===\n"
         "===MUT_CSV_B64===\n"
-        f"{encoded('mutation,score\nA1C,1.2\n')}\n"
+        f"{csv_b64}\n"
         f"{provenance_block}"
         "===MUT_DONE===\n"
     )

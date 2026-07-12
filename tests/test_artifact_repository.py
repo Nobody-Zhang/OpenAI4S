@@ -72,15 +72,17 @@ def test_save_scopes_versions_and_exact_ownership_errors(tmp_path):
     assert artifact["is_user_upload"] == 1
     assert artifact["priority"] == 2
     assert repository.version_meta(first["version_id"])["frame_id"] == child
-    assert repository.artifact_by_filename(
-        "result.txt", root, strict=True
-    )["artifact_id"] == first["artifact_id"]
-    assert repository.artifact_by_filename(
-        "result.txt", "wrong-root", strict=True
-    ) is None
-    assert repository.artifact_by_filename(
-        "result.txt", "wrong-root"
-    )["artifact_id"] == first["artifact_id"]
+    assert (
+        repository.artifact_by_filename("result.txt", root, strict=True)["artifact_id"]
+        == first["artifact_id"]
+    )
+    assert (
+        repository.artifact_by_filename("result.txt", "wrong-root", strict=True) is None
+    )
+    assert (
+        repository.artifact_by_filename("result.txt", "wrong-root")["artifact_id"]
+        == first["artifact_id"]
+    )
 
     second = _save(
         repository,
@@ -98,9 +100,7 @@ def test_save_scopes_versions_and_exact_ownership_errors(tmp_path):
     with pytest.raises(KeyError, match="no such artifact 'missing'"):
         _save(repository, tmp_path / "missing", artifact_id="missing")
     other = store.new_frame(kind="turn", project_id="other", status="ready")
-    with pytest.raises(
-        ValueError, match="artifact belongs to a different root frame"
-    ):
+    with pytest.raises(ValueError, match="artifact belongs to a different root frame"):
         _save(
             repository,
             tmp_path / "wrong-root",
@@ -282,7 +282,10 @@ def test_record_cell_reuses_provisional_version_and_merges_lineage(tmp_path):
 
 def test_record_cell_rolls_back_the_whole_transaction_on_lineage_failure(tmp_path):
     _store, repository = _repository(tmp_path)
-    with pytest.raises(sqlite3.ProgrammingError):
+    # Binding an unsupported parameter type raises sqlite3.InterfaceError on
+    # Python 3.10 and sqlite3.ProgrammingError on 3.12; both derive from
+    # sqlite3.Error, and the point of the test is the rollback either way.
+    with pytest.raises(sqlite3.Error):
         repository.record_cell_artifact(
             path="/tmp/rollback.txt",
             filename="rollback.txt",
@@ -309,8 +312,7 @@ def test_environment_snapshots_deduplicate_decode_and_bind_versions(tmp_path):
     }
     snapshot_id = repository.upsert_env_snapshot(snapshot)
     assert (
-        repository.upsert_env_snapshot(dict(snapshot, package_count=1))
-        == snapshot_id
+        repository.upsert_env_snapshot(dict(snapshot, package_count=1)) == snapshot_id
     )
     decoded = repository.get_env_snapshot(snapshot_id)
     assert decoded["created_at"] == 1000
@@ -325,9 +327,7 @@ def test_environment_snapshots_deduplicate_decode_and_bind_versions(tmp_path):
     )
     assert repository.env_snapshot_for_artifact(first["artifact_id"]) == decoded
     assert (
-        repository.env_snapshot_for_artifact(
-            first["artifact_id"], first["version_id"]
-        )
+        repository.env_snapshot_for_artifact(first["artifact_id"], first["version_id"])
         == decoded
     )
     assert repository.env_snapshot_for_artifact("wrong", first["version_id"]) is None
@@ -378,9 +378,10 @@ def test_listing_paths_versions_priority_and_restore_contracts(tmp_path):
         second["version_id"],
         first["version_id"],
     ]
-    assert repository.list_artifacts({"project_id": "science"})[0][
-        "artifact_id"
-    ] == first["artifact_id"]
+    assert (
+        repository.list_artifacts({"project_id": "science"})[0]["artifact_id"]
+        == first["artifact_id"]
+    )
     assert repository.list_artifacts({"unknown": "ignored"})
 
     repository.update_version_path(
@@ -395,9 +396,12 @@ def test_listing_paths_versions_priority_and_restore_contracts(tmp_path):
     )
     assert metadata["snapshot_path"] == "/new/snapshot"
     assert repository.set_priority(first["artifact_id"], "-2")["priority"] == -2
-    assert repository.set_latest_version(first["artifact_id"], first["version_id"])[
-        "latest_version_id"
-    ] == first["version_id"]
+    assert (
+        repository.set_latest_version(first["artifact_id"], first["version_id"])[
+            "latest_version_id"
+        ]
+        == first["version_id"]
+    )
     assert repository.set_latest_version(first["artifact_id"], "missing") is None
 
 

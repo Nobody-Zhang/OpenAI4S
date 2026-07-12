@@ -20,6 +20,17 @@ from openai4s.security.sandbox import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _reset_warn_once_dedup():
+    """``_warn_once`` dedups by message for the whole process, so a warning
+    already emitted by an earlier test (e.g. a real kernel on a bwrap-less CI
+    runner) would make a later ``pytest.warns`` assertion see nothing.  Reset
+    the cache before each test so the security-warning assertions are
+    order-independent."""
+    sandbox_module._warned_details.clear()
+    yield
+
+
 def _passing_runner(calls: list | None = None):
     def run(command, **kwargs):
         if calls is not None:
