@@ -101,6 +101,52 @@ def test_startup_reconciliation_only_abandons_an_older_daemon(tmp_path):
     assert current_row["ended_at"] is None
 
 
+def test_bootstrap_compare_and_swap_is_content_addressed_and_never_updates_ended(
+    tmp_path,
+):
+    store = _store(tmp_path)
+    generation = store.create_kernel_generation(
+        root_frame_id="root-cas",
+        language="python",
+        bootstrap={"version": 1, "sidecars": []},
+        state="active",
+        started_at=100,
+    )
+    old_id = generation["bootstrap_manifest_id"]
+    updated = store.compare_and_swap_kernel_bootstrap(
+        generation["generation_id"],
+        expected_manifest_id=old_id,
+        bootstrap={"version": 1, "sidecars": [{"name": "stats.kernel"}]},
+        at=200,
+    )
+    assert updated is not None
+    assert updated["bootstrap_manifest_id"] != old_id
+    assert updated["last_activity_at"] == 200
+
+    assert (
+        store.compare_and_swap_kernel_bootstrap(
+            generation["generation_id"],
+            expected_manifest_id=old_id,
+            bootstrap={"version": 1, "sidecars": [{"name": "wrong.kernel"}]},
+        )
+        is None
+    )
+    store.finish_kernel_generation(
+        generation["generation_id"],
+        state="released",
+        reason="done",
+        ended_at=300,
+    )
+    assert (
+        store.compare_and_swap_kernel_bootstrap(
+            generation["generation_id"],
+            expected_manifest_id=updated["bootstrap_manifest_id"],
+            bootstrap={"version": 1, "sidecars": []},
+        )
+        is None
+    )
+
+
 def test_lazy_attempt_generation_binding_is_write_once(tmp_path):
     store = _store(tmp_path)
     group = store.append_action_group(

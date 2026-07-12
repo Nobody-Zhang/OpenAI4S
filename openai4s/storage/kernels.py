@@ -261,6 +261,53 @@ class KernelGenerationRepository:
             row = self._row_locked(generation_id)
         return self._normalize(row)
 
+    def compare_and_swap_bootstrap(
+        self,
+        generation_id: str,
+        *,
+        expected_manifest_id: str | None,
+        bootstrap: Any,
+        at: int | None = None,
+    ) -> KernelGenerationDTO | None:
+        """Atomically replace one live generation's bootstrap manifest.
+
+        Sidecar imports can extend a manifest after the initial bootstrap Cell.
+        The expected content-addressed id prevents two observers from losing an
+        import record by overwriting the same prior snapshot.  ``None`` means
+        the generation ended or its manifest changed; callers may re-read and
+        retry only after revalidating their exact worker lease.
+        """
+
+        generation_id = _required_text("generation_id", generation_id)
+        now = self._clock_ms() if at is None else int(at)
+        bootstrap_json = _canonical_json(bootstrap)
+        manifest_id = _manifest_id("boot", bootstrap_json)
+        with self._lock:
+            row = self._row_locked(generation_id)
+            if row["ended_at"] is not None:
+                return None
+            if row["bootstrap_manifest_id"] != expected_manifest_id:
+                return None
+            cursor = self._connection.execute(
+                "UPDATE kernel_generations SET bootstrap_json=?,"
+                "bootstrap_manifest_id=?,last_activity_at=? "
+                "WHERE generation_id=? AND ended_at IS NULL "
+                "AND bootstrap_manifest_id IS ?",
+                (
+                    bootstrap_json,
+                    manifest_id,
+                    now,
+                    generation_id,
+                    expected_manifest_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                self._connection.rollback()
+                return None
+            self._connection.commit()
+            row = self._row_locked(generation_id)
+        return self._normalize(row)
+
     def finish(
         self,
         generation_id: str,

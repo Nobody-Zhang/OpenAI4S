@@ -8,6 +8,16 @@ import sqlite3
 import uuid
 from typing import Any, Callable
 
+from openai4s.execution.dependencies import (
+    REPLAY_POLICIES,
+    VISIBILITIES,
+    analyze_code,
+    default_replay_policy,
+    default_visibility,
+    normalize_string_list,
+)
+from openai4s.storage.deletion import SessionDeletionRepository
+
 
 class FrameRepository:
     """Own the persisted conversation hierarchy on a Store connection.
@@ -33,6 +43,7 @@ class FrameRepository:
         self._get_frame = get_frame
         self._resolve_scope = resolve_frame_scope
         self._get_project = get_project
+        self._deletions = SessionDeletionRepository(connection, lock)
 
     # --- frames ------------------------------------------------------
     def new_frame(
@@ -205,108 +216,10 @@ class FrameRepository:
         )
 
     def delete_project(self, project_id: str) -> dict:
-        """Cascade-delete a project and return paths/frame IDs for cleanup."""
-        with self._lock:
-            cursor = self._connection
-            frame_ids = [
-                row["frame_id"]
-                for row in cursor.execute(
-                    "SELECT frame_id FROM frames WHERE project_id=?",
-                    (project_id,),
-                ).fetchall()
-            ]
-            stale_paths = [
-                row["path"]
-                for row in cursor.execute(
-                    "SELECT v.path FROM artifact_versions v JOIN artifacts a "
-                    "ON v.artifact_id=a.artifact_id WHERE a.project_id=? "
-                    "AND v.path IS NOT NULL",
-                    (project_id,),
-                ).fetchall()
-            ]
-            cursor.execute(
-                "DELETE FROM lineage_edges WHERE input_version_id IN "
-                "(SELECT version_id FROM artifact_versions WHERE artifact_id IN "
-                "(SELECT artifact_id FROM artifacts WHERE project_id=?)) "
-                "OR output_version_id IN "
-                "(SELECT version_id FROM artifact_versions WHERE artifact_id IN "
-                "(SELECT artifact_id FROM artifacts WHERE project_id=?))",
-                (project_id, project_id),
-            )
-            cursor.execute(
-                "DELETE FROM artifact_versions WHERE artifact_id IN "
-                "(SELECT artifact_id FROM artifacts WHERE project_id=?)",
-                (project_id,),
-            )
-            cursor.execute(
-                "DELETE FROM artifacts WHERE project_id=?",
-                (project_id,),
-            )
-            if frame_ids:
-                placeholders = ",".join("?" * len(frame_ids))
-                cursor.execute(
-                    f"DELETE FROM messages WHERE root_frame_id IN ({placeholders})",
-                    frame_ids,
-                )
-                cursor.execute(
-                    f"DELETE FROM execution_log WHERE root_frame_id IN "
-                    f"({placeholders}) OR frame_id IN ({placeholders})",
-                    frame_ids + frame_ids,
-                )
-                cursor.execute(
-                    f"DELETE FROM host_call_log WHERE frame_id IN ({placeholders})",
-                    frame_ids,
-                )
-                cursor.execute(
-                    f"DELETE FROM frame_steps WHERE frame_id IN ({placeholders})",
-                    frame_ids,
-                )
-                cursor.execute(
-                    f"DELETE FROM plans WHERE frame_id IN ({placeholders})",
-                    frame_ids,
-                )
-                cursor.execute(
-                    f"DELETE FROM annotations WHERE root_frame_id IN "
-                    f"({placeholders})",
-                    frame_ids,
-                )
-                for frame_id in frame_ids:
-                    cursor.execute(
-                        "DELETE FROM settings WHERE key LIKE ?",
-                        (f"fb:{frame_id}:%",),
-                    )
-                    cursor.execute(
-                        "DELETE FROM permission_rules WHERE scope='conversation' "
-                        "AND scope_id=?",
-                        (frame_id,),
-                    )
-            cursor.execute(
-                "DELETE FROM permission_rules WHERE scope='project' AND scope_id=?",
-                (project_id,),
-            )
-            cursor.execute(
-                "DELETE FROM frames WHERE project_id=?",
-                (project_id,),
-            )
-            cursor.execute(
-                "DELETE FROM folders WHERE project_id=?",
-                (project_id,),
-            )
-            cursor.execute("DELETE FROM notes WHERE project_id=?", (project_id,))
-            cursor.execute(
-                "DELETE FROM memories WHERE project_id=?",
-                (project_id,),
-            )
-            cursor.execute(
-                "DELETE FROM compaction_archives WHERE project_id=?",
-                (project_id,),
-            )
-            cursor.execute(
-                "DELETE FROM projects WHERE project_id=?",
-                (project_id,),
-            )
-            self._connection.commit()
-        return {"stale_paths": stale_paths, "frame_ids": frame_ids}
+        return self._deletions.delete_project(project_id)
+
+    def project_session_ids(self, project_id: str) -> list[str]:
+        return self._deletions.project_session_ids(project_id)
 
     def list_projects(self) -> list[dict]:
         """Return projects with conversation count and last activity."""
@@ -334,6 +247,7 @@ class FrameRepository:
         self,
         *,
         root_frame_id: str,
+        branch_id: str | None = None,
         role: str,
         content: str,
         frame_id: str | None = None,
@@ -342,6 +256,7 @@ class FrameRepository:
     ) -> dict:
         now = created_at if created_at is not None else self._clock_ms()
         message_id = f"m-{uuid.uuid4().hex[:12]}"
+        branch_id = branch_id or root_frame_id
         with self._lock:
             seq = self._connection.execute(
                 "SELECT COALESCE(MAX(seq),-1)+1 AS s FROM messages "
@@ -349,11 +264,12 @@ class FrameRepository:
                 (root_frame_id,),
             ).fetchone()["s"]
             self._connection.execute(
-                "INSERT INTO messages(message_id,root_frame_id,frame_id,seq,role,"
-                "content,metadata,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                "INSERT INTO messages(message_id,root_frame_id,branch_id,frame_id,"
+                "seq,role,content,metadata,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                 (
                     message_id,
                     root_frame_id,
+                    branch_id,
                     frame_id,
                     seq,
                     role,
@@ -366,6 +282,7 @@ class FrameRepository:
         return {
             "message_id": message_id,
             "root_frame_id": root_frame_id,
+            "branch_id": branch_id,
             "seq": seq,
             "role": role,
             "content": content,
@@ -376,16 +293,64 @@ class FrameRepository:
         self,
         root_frame_id: str,
         *,
+        branch_id: str | None = None,
         start: int = 0,
-        limit: int = 300,
+        limit: int | None = 300,
     ) -> list[dict]:
+        where = "root_frame_id=?"
+        params: list[Any] = [root_frame_id]
+        if branch_id is not None:
+            where += " AND branch_id=?"
+            params.append(branch_id)
+        suffix = ""
+        if limit is not None:
+            suffix = " LIMIT ? OFFSET ?"
+            params.extend((max(0, int(limit)), max(0, int(start))))
         with self._lock:
             rows = self._connection.execute(
-                "SELECT role,content,metadata,created_at,seq FROM messages "
-                "WHERE root_frame_id=? ORDER BY seq ASC LIMIT ? OFFSET ?",
-                (root_frame_id, limit, start),
+                "SELECT role,content,metadata,created_at,seq FROM messages WHERE "
+                + where
+                + " ORDER BY seq ASC"
+                + suffix,
+                tuple(params),
             ).fetchall()
-        return [dict(row) for row in rows]
+        values = [dict(row) for row in rows]
+        return values[start:] if limit is None and start else values
+
+    def list_message_boundaries(
+        self,
+        root_frame_id: str,
+        *,
+        branch_id: str | None = None,
+        start: int = 0,
+        limit: int | None = 300,
+    ) -> list[dict]:
+        """Return public message identities plus exact fork proof, if present."""
+
+        where = "m.root_frame_id=?"
+        params: list[Any] = [root_frame_id]
+        if branch_id is not None:
+            where += " AND m.branch_id=?"
+            params.append(branch_id)
+        suffix = ""
+        if limit is not None:
+            suffix = " LIMIT ? OFFSET ?"
+            params.extend((max(0, int(limit)), max(0, int(start))))
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT m.message_id,m.root_frame_id,m.branch_id,m.seq,m.role,"
+                "m.content,m.created_at,(SELECT "
+                "c.checkpoint_id FROM session_checkpoints AS c WHERE "
+                "c.root_frame_id=m.root_frame_id AND c.source_kind='message' "
+                "AND c.source_id=m.message_id LIMIT 1) AS fork_checkpoint_id "
+                "FROM messages AS m WHERE "
+                + where
+                + " ORDER BY m.seq ASC"
+                + suffix,
+                tuple(params),
+            ).fetchall()
+        values = [dict(row) for row in rows]
+        return values[start:] if limit is None and start else values
 
     def message_count(self, root_frame_id: str) -> int:
         with self._lock:
@@ -659,11 +624,25 @@ class FrameRepository:
         state_revision: int | None = None,
         kernel_id: str = "python",
         language: str = "python",
+        visibility: str | None = None,
+        pin: bool = False,
+        replay_policy: str | None = None,
         figures: list | None = None,
         files_read: list | None = None,
         files_written: list | None = None,
     ) -> str:
         cell_id = result.get("id") or f"c-{uuid.uuid4().hex[:12]}"
+        if visibility is None:
+            visibility = default_visibility(origin)
+        if visibility not in VISIBILITIES:
+            raise ValueError(f"unknown Cell visibility: {visibility}")
+        if type(pin) is not bool:
+            raise TypeError("pin must be a boolean")
+        if replay_policy is None:
+            replay_policy = default_replay_policy(visibility)
+        if replay_policy not in REPLAY_POLICIES:
+            raise ValueError(f"unknown Cell replay_policy: {replay_policy}")
+        dependencies = analyze_code(code, language)
         usage = result.get("usage") or {}
         status = (
             "interrupted"
@@ -721,9 +700,11 @@ class FrameRepository:
             "INSERT INTO execution_log(producing_cell_id,frame_id,"
             "root_frame_id,project_id,cell_seq,cell_index,state_revision,"
             "kernel_id,language,"
-            "status,origin,code,stdout,stderr,error,figures,files_read,"
+            "status,origin,code,code_hash,visibility,pin,replay_policy,"
+            "variable_reads,variable_writes,variable_deletes,"
+            "mutation_uncertain,stdout,stderr,error,figures,files_read,"
             "files_written,interrupted,wall_s,cpu_s,peak_rss_kb,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 cell_id,
                 frame_id,
@@ -737,6 +718,14 @@ class FrameRepository:
                 status,
                 origin,
                 code,
+                dependencies.code_hash,
+                visibility,
+                1 if pin else 0,
+                replay_policy,
+                json.dumps(dependencies.reads, ensure_ascii=False),
+                json.dumps(dependencies.writes, ensure_ascii=False),
+                json.dumps(dependencies.deletes, ensure_ascii=False),
+                1 if dependencies.uncertain else 0,
                 result.get("stdout"),
                 result.get("stderr"),
                 result.get("error"),
@@ -752,30 +741,69 @@ class FrameRepository:
         )
         return cell_id
 
-    def list_cells(self, root_frame_id: str) -> list[dict]:
+    def list_cells(
+        self, root_frame_id: str, *, branch_id: str | None = None
+    ) -> list[dict]:
         """Return a session's notebook execution log oldest first."""
+        branch_filter = ""
+        params: list[Any] = [root_frame_id]
+        if branch_id is not None:
+            branch_filter = (
+                " AND (EXISTS (SELECT 1 FROM execution_attempts AS ba "
+                "JOIN action_groups AS bg ON bg.group_id=ba.group_id "
+                "WHERE ba.producing_cell_id=e.producing_cell_id "
+                "AND bg.root_frame_id=? AND bg.branch_id=?)"
+            )
+            params.extend((root_frame_id, branch_id))
+            if branch_id == root_frame_id:
+                branch_filter += (
+                    " OR NOT EXISTS (SELECT 1 FROM execution_attempts AS legacy "
+                    "WHERE legacy.producing_cell_id=e.producing_cell_id)"
+                )
+            branch_filter += ")"
         with self._lock:
             rows = self._connection.execute(
                 "SELECT e.producing_cell_id,e.cell_index,e.state_revision,"
                 "e.kernel_id,e.language,e.status,e.origin,e.code,e.stdout,"
-                "e.stderr,e.error,e.figures,e.files_read,e.files_written,"
+                "e.code_hash,e.visibility,e.pin,e.replay_policy,"
+                "e.variable_reads,e.variable_writes,e.variable_deletes,"
+                "e.mutation_uncertain,e.stderr,e.error,e.figures,e.files_read,e.files_written,"
                 "e.cpu_s,e.peak_rss_kb,e.created_at,(SELECT a.generation_id "
                 "FROM execution_attempts AS a WHERE a.producing_cell_id="
                 "e.producing_cell_id AND a.generation_id IS NOT NULL "
                 "ORDER BY a.attempt_ordinal DESC LIMIT 1) AS generation_id "
                 "FROM execution_log AS e WHERE e.root_frame_id=? "
+                + branch_filter
+                + " "
                 "ORDER BY COALESCE(e.state_revision,e.cell_index) ASC,"
                 "e.created_at ASC,e.producing_cell_id ASC",
-                (root_frame_id,),
+                tuple(params),
             ).fetchall()
         cells = []
         for row in rows:
             cell = dict(row)
-            for key in ("figures", "files_read", "files_written"):
+            for key in (
+                "figures",
+                "files_read",
+                "files_written",
+                "variable_reads",
+                "variable_writes",
+                "variable_deletes",
+            ):
                 try:
                     cell[key] = json.loads(cell.get(key) or "[]")
                 except (TypeError, ValueError):
                     cell[key] = []
+            for key in (
+                "variable_reads",
+                "variable_writes",
+                "variable_deletes",
+            ):
+                cell[key] = list(normalize_string_list(cell.get(key)))
+            cell["pin"] = bool(cell.get("pin"))
+            cell["mutation_uncertain"] = bool(
+                cell.get("mutation_uncertain")
+            )
             if cell.get("state_revision") is None:
                 cell["state_revision"] = cell.get("cell_index")
             cells.append(cell)
@@ -794,48 +822,34 @@ class FrameRepository:
         if not row:
             return None
         cell = dict(row)
-        for key in ("figures", "files_read", "files_written"):
+        for key in (
+            "figures",
+            "files_read",
+            "files_written",
+            "variable_reads",
+            "variable_writes",
+            "variable_deletes",
+        ):
             try:
                 cell[key] = json.loads(cell.get(key) or "[]")
             except (TypeError, ValueError):
                 cell[key] = []
+        for key in (
+            "variable_reads",
+            "variable_writes",
+            "variable_deletes",
+        ):
+            cell[key] = list(normalize_string_list(cell.get(key)))
+        cell["pin"] = bool(cell.get("pin"))
+        cell["mutation_uncertain"] = bool(cell.get("mutation_uncertain"))
         if cell.get("state_revision") is None:
             cell["state_revision"] = cell.get("cell_index")
         return cell
 
-    def delete_frame(self, frame_id: str) -> None:
-        """Delete a root session and the records covered by its legacy cascade."""
-        with self._lock:
-            self._connection.execute(
-                "DELETE FROM messages WHERE root_frame_id=?",
-                (frame_id,),
-            )
-            self._connection.execute(
-                "DELETE FROM execution_log WHERE root_frame_id=? OR frame_id=?",
-                (frame_id, frame_id),
-            )
-            self._connection.execute(
-                "DELETE FROM frame_steps WHERE frame_id=?",
-                (frame_id,),
-            )
-            self._connection.execute(
-                "DELETE FROM plans WHERE frame_id=?",
-                (frame_id,),
-            )
-            self._connection.execute(
-                "DELETE FROM annotations WHERE root_frame_id=?",
-                (frame_id,),
-            )
-            self._connection.execute(
-                "DELETE FROM permission_rules WHERE scope='conversation' "
-                "AND scope_id=?",
-                (frame_id,),
-            )
-            self._connection.execute(
-                "DELETE FROM frames WHERE frame_id=? OR root_frame_id=?",
-                (frame_id, frame_id),
-            )
-            self._connection.commit()
+    def delete_frame(self, frame_id: str) -> dict[str, Any]:
+        """Delete one complete root-session aggregate in a single transaction."""
+
+        return self._deletions.delete_session(frame_id)
 
     def get_frame(self, frame_id: str) -> dict | None:
         with self._lock:

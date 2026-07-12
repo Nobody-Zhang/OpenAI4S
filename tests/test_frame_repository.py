@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
@@ -383,6 +384,14 @@ def test_execution_log_status_json_fallback_append_only_and_clock(tmp_path):
     assert cells[0]["files_written"] == ["output.csv"]
     assert cells[0]["state_revision"] == 7
     assert cells[0]["generation_id"] is None
+    assert cells[0]["code_hash"] == hashlib.sha256(b"compute()").hexdigest()
+    assert cells[0]["visibility"] == "scientific"
+    assert cells[0]["pin"] is False
+    assert cells[0]["replay_policy"] == "conditional"
+    assert cells[0]["variable_reads"] == ["compute"]
+    assert cells[0]["variable_writes"] == []
+    assert cells[0]["variable_deletes"] == []
+    assert cells[0]["mutation_uncertain"] is False
     assert cells[1]["status"] == "interrupted"
     assert cells[1]["state_revision"] == 8
     assert repository.cell_detail("missing") is None
@@ -451,6 +460,52 @@ def test_execution_log_status_json_fallback_append_only_and_clock(tmp_path):
         assert independent.execute(
             "SELECT COUNT(*) FROM execution_log"
         ).fetchone() == (2,)
+
+
+def test_cell_projection_metadata_is_validated_and_round_trips(tmp_path):
+    _store, repository, _clock = _repository(tmp_path)
+    frame = repository.new_frame(project_id="science")
+
+    repository.log_cell(
+        frame_id=frame,
+        root_frame_id=frame,
+        code="data = load(raw)\nscore = data.mean()",
+        result={"id": "cell-meta"},
+        visibility="scratch",
+        pin=True,
+        replay_policy="safe",
+    )
+
+    detail = repository.cell_detail("cell-meta")
+    assert detail["visibility"] == "scratch"
+    assert detail["pin"] is True
+    assert detail["replay_policy"] == "safe"
+    assert detail["variable_reads"] == ["load", "raw"]
+    assert detail["variable_writes"] == ["data", "score"]
+    assert detail["variable_deletes"] == []
+    assert detail["mutation_uncertain"] is False
+
+    with pytest.raises(ValueError, match="visibility"):
+        repository.log_cell(
+            frame_id=frame,
+            code="pass",
+            result={"id": "bad-visibility"},
+            visibility="private",
+        )
+    with pytest.raises(TypeError, match="pin"):
+        repository.log_cell(
+            frame_id=frame,
+            code="pass",
+            result={"id": "bad-pin"},
+            pin=1,
+        )
+    with pytest.raises(ValueError, match="replay_policy"):
+        repository.log_cell(
+            frame_id=frame,
+            code="pass",
+            result={"id": "bad-replay"},
+            replay_policy="always",
+        )
 
 
 def test_execution_log_orders_equal_timestamps_by_state_revision(tmp_path):
@@ -530,7 +585,7 @@ def test_execution_log_consumes_matching_attempt_revision_without_reallocating(
         )
 
 
-def test_delete_frame_preserves_exact_legacy_aggregate_boundary(tmp_path):
+def test_delete_frame_removes_complete_session_aggregate(tmp_path):
     store, repository, _clock = _repository(tmp_path)
     root = repository.new_frame(project_id="science")
     child = repository.new_frame(parent_id=root, kind="delegate")
@@ -596,10 +651,9 @@ def test_delete_frame_preserves_exact_legacy_aggregate_boundary(tmp_path):
         "execution_log": 0,
         "annotations": 0,
     }
-    # The legacy frame deletion only targets root-owned step/plan/rule rows.
-    assert steps == [("child-step",)]
-    assert plans == [("child-plan",)]
-    assert rules == [("child-rule",)]
+    assert steps == []
+    assert plans == []
+    assert rules == []
 
 
 def test_delete_project_cascade_paths_rows_and_single_commit(tmp_path):

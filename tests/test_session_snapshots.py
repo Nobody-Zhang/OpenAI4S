@@ -158,6 +158,77 @@ def test_checkpoint_branches_are_append_only_and_head_updates_are_cas_guarded(tm
         connection.close()
 
 
+def test_cursor_checkpoint_binding_is_exact_internal_and_idempotent(tmp_path):
+    connection, repository = _repository(tmp_path)
+    try:
+        first = repository.create_checkpoint(
+            root_frame_id="root-cursor",
+            reason="cursor_cell",
+            workspace_tree_id="a" * 64,
+            source_kind="cell",
+            source_id="cell-1",
+            internal=True,
+            cell_cursor=1,
+        )
+        repeated = repository.create_checkpoint(
+            root_frame_id="root-cursor",
+            reason="cursor_cell",
+            workspace_tree_id="b" * 64,
+            source_kind="cell",
+            source_id="cell-1",
+            internal=True,
+            cell_cursor=99,
+        )
+
+        assert repeated["checkpoint_id"] == first["checkpoint_id"]
+        assert repeated["workspace_tree_id"] == "a" * 64
+        assert repeated["cell_cursor"] == 1
+        assert repeated["source_kind"] == "cell"
+        assert repeated["source_id"] == "cell-1"
+        assert repeated["internal"] is True
+        assert repository.get_checkpoint_for_source(
+            "root-cursor", source_kind="cell", source_id="cell-1"
+        )["checkpoint_id"] == first["checkpoint_id"]
+        assert repository.checkpoint_source_map(
+            "root-cursor", source_kind="cell"
+        ) == {"cell-1": first["checkpoint_id"]}
+        assert len(repository.list_checkpoints("root-cursor")) == 1
+    finally:
+        connection.close()
+
+
+def test_existing_checkpoint_table_gets_additive_cursor_migration(tmp_path):
+    database = tmp_path / "legacy.sqlite"
+    connection = sqlite3.connect(database)
+    connection.row_factory = sqlite3.Row
+    connection.execute(
+        "CREATE TABLE session_checkpoints ("
+        "checkpoint_id TEXT PRIMARY KEY,root_frame_id TEXT NOT NULL,"
+        "branch_id TEXT NOT NULL,parent_checkpoint_id TEXT,reason TEXT NOT NULL,"
+        "action_cursor INTEGER,message_cursor INTEGER,cell_cursor INTEGER,"
+        "workspace_tree_id TEXT,artifact_versions TEXT NOT NULL,"
+        "environment_pins TEXT NOT NULL,generation_refs TEXT NOT NULL,"
+        "capability_state TEXT NOT NULL,permission_state TEXT NOT NULL,"
+        "recovery_recipe TEXT NOT NULL,metadata TEXT NOT NULL,created_at INTEGER NOT NULL)"
+    )
+    connection.commit()
+    try:
+        SessionSnapshotRepository(
+            connection,
+            __import__("threading").RLock(),
+            clock_ms=lambda: 1234,
+        )
+        columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(session_checkpoints)"
+            ).fetchall()
+        }
+        assert {"source_kind", "source_id", "internal"} <= columns
+    finally:
+        connection.close()
+
+
 def test_imported_tree_rejects_path_traversal(tmp_path):
     cas = WorkspaceCAS(tmp_path / "cas")
     with pytest.raises(ValueError, match="unsafe snapshot path"):

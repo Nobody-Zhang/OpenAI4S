@@ -238,6 +238,40 @@ def test_compaction_archive_unicode_shape_and_clock_after_serialization(tmp_path
     assert calls == [4000]
 
 
+def test_compaction_archive_persists_context_v2_linkage(tmp_path):
+    store = _store(tmp_path)
+    repository = CompactionRepository(
+        store._conn, store._lock, clock_ms=lambda: 5000
+    )
+    archive_id = repository.archive(
+        frame_id="root-context",
+        project_id="science",
+        branch_id="branch-a",
+        ledger_cursor={"group_id": "ag-1", "ordinal": 4},
+        recovery_pointer={"checkpoint_id": "cp-1"},
+        generation_id="generation-1",
+        metadata={"kernel_restarted": False},
+        summary="summary",
+        handoff="structured handoff",
+        compacted=[{"role": "tool", "content": "preview"}],
+        context_before={"total": 900},
+        context_after={"total": 300},
+        artifact_refs=[
+            {"artifact_id": "a-1", "version_id": "v-1", "sha256": "a" * 64}
+        ],
+    )
+
+    archived = repository.list("root-context")
+    assert [item["archive_id"] for item in archived] == [archive_id]
+    item = archived[0]
+    assert item["branch_id"] == "branch-a"
+    assert item["ledger_cursor"] == {"group_id": "ag-1", "ordinal": 4}
+    assert item["recovery_pointer"] == {"checkpoint_id": "cp-1"}
+    assert item["context_before"]["total"] == 900
+    assert item["context_after"]["total"] == 300
+    assert item["artifact_refs"][0]["version_id"] == "v-1"
+
+
 def test_host_call_log_scrubs_skips_truncates_and_commits(tmp_path):
     store = _store(tmp_path)
     now, calls = _clock(5000)

@@ -124,6 +124,13 @@ class PermissionRuleRepository:
             )
             self._connection.commit()
 
+    def get_rule(self, rule_id: str) -> dict | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM permission_rules WHERE rule_id=?", (rule_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
     def get_rules(self, *, scope: str, scope_id: str = "") -> list[dict]:
         with self._lock:
             rows = self._connection.execute(
@@ -247,34 +254,78 @@ class PermissionRuleRepository:
         root_frame_id: str | None = None,
         frame_id: str | None = None,
         project_id: str | None = None,
+        action_group_id: str | None = None,
+        action_id: str | None = None,
+        tool_call_id: str | None = None,
+        side_effect_class: str | None = None,
+        resource_keys: list[str] | tuple[str, ...] | None = None,
         payload: dict | None = None,
         expires_at: int | None = None,
         created_at: int | None = None,
     ) -> dict:
-        """Append one immutable pending approval identity."""
+        """Append one immutable pending approval identity.
+
+        When the caller supplies an ``action_group_id``, the durable request
+        and its ``permission_pending`` ledger event are published in the same
+        SQLite transaction.  Approval therefore cannot become visible without
+        also being attributable to the exact canonical action that requested
+        it.
+        """
         if not decision_id or not tool:
             raise ValueError("decision_id and tool are required")
+        if resource_keys is not None and (
+            not isinstance(resource_keys, (list, tuple))
+            or not all(isinstance(value, str) for value in resource_keys)
+        ):
+            raise TypeError("resource_keys must be a list or tuple of strings")
         now = self._clock_ms() if created_at is None else int(created_at)
         encoded = json.dumps(payload or {}, ensure_ascii=False, separators=(",", ":"))
+        encoded_resources = json.dumps(
+            list(resource_keys or ()), ensure_ascii=False, separators=(",", ":")
+        )
         with self._lock:
             try:
                 self._connection.execute(
                     "INSERT INTO permission_requests("
-                    "decision_id,root_frame_id,frame_id,project_id,tool,target,"
-                    "payload,state,created_at,expires_at) "
-                    "VALUES(?,?,?,?,?,?,?,'pending',?,?)",
+                    "decision_id,root_frame_id,frame_id,project_id,"
+                    "action_group_id,action_id,tool_call_id,tool,target,"
+                    "side_effect_class,resource_keys,payload,state,created_at,"
+                    "expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,"
+                    "'pending',?,?)",
                     (
                         decision_id,
                         root_frame_id,
                         frame_id,
                         project_id,
+                        action_group_id,
+                        action_id,
+                        tool_call_id,
                         tool,
                         target or "",
+                        side_effect_class,
+                        encoded_resources,
                         encoded,
                         now,
                         expires_at,
                     ),
                 )
+                if action_group_id:
+                    self._append_permission_event_locked(
+                        group_id=action_group_id,
+                        event_type="permission_pending",
+                        decision_id=decision_id,
+                        action_id=action_id,
+                        tool_call_id=tool_call_id,
+                        side_effect_class=side_effect_class,
+                        resource_keys=list(resource_keys or ()),
+                        result={
+                            "decision_id": decision_id,
+                            "state": "pending",
+                            "tool": tool,
+                            "target": target or "",
+                        },
+                        created_at=now,
+                    )
             except Exception:
                 self._connection.rollback()
                 raise
@@ -325,6 +376,29 @@ class PermissionRuleRepository:
             if cursor.rowcount != 1:
                 self._connection.rollback()
                 raise RuntimeError(f"permission request {decision_id!r} raced")
+            if row["action_group_id"]:
+                try:
+                    resources = json.loads(row["resource_keys"] or "[]")
+                except (TypeError, ValueError):
+                    resources = []
+                self._append_permission_event_locked(
+                    group_id=row["action_group_id"],
+                    event_type="permission_resolved",
+                    decision_id=decision_id,
+                    action_id=row["action_id"],
+                    tool_call_id=row["tool_call_id"],
+                    side_effect_class=row["side_effect_class"],
+                    resource_keys=(resources if isinstance(resources, list) else []),
+                    result={
+                        "decision_id": decision_id,
+                        "state": state,
+                        "scope": scope,
+                        "pattern": pattern,
+                        "message": message,
+                        "resolution_context": resolution_context,
+                    },
+                    created_at=now,
+                )
             self._connection.commit()
             row = self._request_row_locked(decision_id)
         return self._normalize_request(row)
@@ -467,7 +541,68 @@ class PermissionRuleRepository:
         except (TypeError, ValueError):
             payload = {}
         data["payload"] = payload if isinstance(payload, dict) else {}
+        try:
+            resource_keys = json.loads(data.get("resource_keys") or "[]")
+        except (TypeError, ValueError):
+            resource_keys = []
+        data["resource_keys"] = (
+            resource_keys if isinstance(resource_keys, list) else []
+        )
         return data
+
+    def _append_permission_event_locked(
+        self,
+        *,
+        group_id: str,
+        event_type: str,
+        decision_id: str,
+        action_id: str | None,
+        tool_call_id: str | None,
+        side_effect_class: str | None,
+        resource_keys: list[str],
+        result: dict,
+        created_at: int,
+    ) -> None:
+        """Insert one ledger event inside the caller's open transaction."""
+
+        if self._connection.execute(
+            "SELECT 1 FROM action_groups WHERE group_id=?", (group_id,)
+        ).fetchone() is None:
+            raise KeyError(f"unknown action group {group_id!r}")
+        sequence = int(
+            self._connection.execute(
+                "SELECT COALESCE(MAX(sequence),-1)+1 AS n FROM action_events "
+                "WHERE group_id=?",
+                (group_id,),
+            ).fetchone()["n"]
+        )
+        self._connection.execute(
+            "INSERT INTO action_events("
+            "event_id,group_id,sequence,type,action_id,tool_call_id,wire_id,"
+            "canonical_arguments,raw_arguments,result,side_effect_class,"
+            "resource_keys,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                f"ae-{uuid.uuid4().hex[:16]}",
+                group_id,
+                sequence,
+                event_type,
+                action_id,
+                tool_call_id,
+                None,
+                json.dumps(
+                    {"decision_id": decision_id},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                None,
+                json.dumps(result, ensure_ascii=False, separators=(",", ":")),
+                side_effect_class,
+                json.dumps(
+                    list(resource_keys), ensure_ascii=False, separators=(",", ":")
+                ),
+                created_at,
+            ),
+        )
 
 
 __all__ = [

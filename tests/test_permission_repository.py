@@ -348,6 +348,72 @@ def test_durable_permission_request_is_append_only_and_terminal_is_immutable(tmp
         store.resolve_permission_request("perm-request-1", state="denied")
 
 
+def test_permission_request_is_atomically_bound_to_action_ledger(tmp_path):
+    store = get_store(Config(data_dir=tmp_path).db_path)
+    group = store.append_action_group(
+        root_frame_id="root-ledger",
+        turn_id="turn-ledger",
+        kind="native_tools",
+    )
+    store.append_action_event(
+        group_id=group["group_id"],
+        type="proposed",
+        action_id="call-1",
+        tool_call_id="call-1",
+        side_effect_class="external_side_effect",
+        resource_keys=["mcp:lab/run"],
+    )
+
+    request = store.create_permission_request(
+        decision_id="perm-ledger-1",
+        root_frame_id="root-ledger",
+        frame_id="root-ledger",
+        project_id="science",
+        action_group_id=group["group_id"],
+        action_id="call-1",
+        tool_call_id="call-1",
+        side_effect_class="external_side_effect",
+        resource_keys=["mcp:lab/run"],
+        tool="mcp_call",
+        target="lab/run",
+        payload={"type": "await_permission"},
+    )
+    assert request["action_group_id"] == group["group_id"]
+    assert request["action_id"] == "call-1"
+    assert request["resource_keys"] == ["mcp:lab/run"]
+    assert [
+        event["type"] for event in store.get_action_group(group["group_id"])["events"]
+    ] == ["proposed", "permission_pending"]
+
+    store.resolve_permission_request(
+        "perm-ledger-1",
+        state="allowed",
+        scope="once",
+        resolution_context="live_thread",
+    )
+    events = store.get_action_group(group["group_id"])["events"]
+    assert [event["type"] for event in events] == [
+        "proposed",
+        "permission_pending",
+        "permission_resolved",
+    ]
+    assert events[-1]["action_id"] == "call-1"
+    assert events[-1]["result"]["state"] == "allowed"
+    assert events[-1]["resource_keys"] == ["mcp:lab/run"]
+
+
+def test_permission_request_rolls_back_when_action_group_is_unknown(tmp_path):
+    store = get_store(Config(data_dir=tmp_path).db_path)
+    with pytest.raises(KeyError, match="unknown action group"):
+        store.create_permission_request(
+            decision_id="perm-no-group",
+            action_group_id="missing-group",
+            action_id="call-1",
+            tool="mcp_call",
+        )
+    assert store.get_permission_request("perm-no-group") is None
+
+
 def test_restart_once_grant_is_exact_and_consumed_atomically(tmp_path):
     store = get_store(Config(data_dir=tmp_path).db_path)
     store.create_permission_request(
@@ -466,6 +532,11 @@ def test_existing_permission_request_table_gains_restart_continuation_columns(tm
             "continuation_required",
             "continuation_expires_at",
             "continuation_consumed_at",
+            "action_group_id",
+            "action_id",
+            "tool_call_id",
+            "side_effect_class",
+            "resource_keys",
         } <= columns
         request = store.get_permission_request("legacy")
         assert request["continuation_required"] == 0

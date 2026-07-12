@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import uuid
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 # Credential reads are derivable and must never be duplicated in the audit log.
-DERIVABLE_HOST_CALLS = frozenset({"credentials_get", "credentials_list"})
+DERIVABLE_HOST_CALLS = frozenset(
+    {
+        "credentials_get",
+        "credentials_issue",
+        "credentials_redeem",
+        "credentials_list",
+    }
+)
 
 # Secret-bearing RPCs remain auditable by method name, but their raw arguments
 # do not cross the persistence boundary.
@@ -227,22 +235,77 @@ class CompactionRepository:
         summary: str,
         compacted: list[dict],
         project_id: str = "default",
+        branch_id: str | None = None,
+        ledger_cursor: Any = None,
+        recovery_pointer: Any = None,
+        generation_id: Any = None,
+        metadata: Mapping[str, Any] | None = None,
+        handoff: str | None = None,
+        context_before: Mapping[str, Any] | None = None,
+        context_after: Mapping[str, Any] | None = None,
+        artifact_refs: list[dict] | None = None,
     ) -> str:
         archive_id = f"ca-{uuid.uuid4().hex[:12]}"
         self._execute(
-            "INSERT INTO compaction_archives(archive_id,frame_id,project_id,"
-            "summary,compacted,n_messages,created_at) VALUES(?,?,?,?,?,?,?)",
+            "INSERT INTO compaction_archives("
+            "archive_id,frame_id,project_id,branch_id,ledger_cursor,"
+            "recovery_pointer,generation_id,metadata,summary,handoff,compacted,"
+            "n_messages,context_before,context_after,artifact_refs,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 archive_id,
                 frame_id,
                 project_id,
+                branch_id,
+                self._json(ledger_cursor),
+                self._json(recovery_pointer),
+                None if generation_id is None else str(generation_id),
+                self._json(dict(metadata or {})),
                 summary,
+                handoff,
                 json.dumps(compacted, ensure_ascii=False),
                 len(compacted),
+                self._json(dict(context_before or {})),
+                self._json(dict(context_after or {})),
+                self._json(list(artifact_refs or [])),
                 self._clock_ms(),
             ),
         )
         return archive_id
+
+    def list(self, frame_id: str, *, limit: int = 50) -> list[dict]:
+        limit = max(1, min(int(limit), 500))
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM compaction_archives WHERE frame_id=? "
+                "ORDER BY created_at DESC,archive_id DESC LIMIT ?",
+                (frame_id, limit),
+            ).fetchall()
+        result: list[dict] = []
+        for row in rows:
+            item = dict(row)
+            for key in (
+                "ledger_cursor",
+                "recovery_pointer",
+                "metadata",
+                "context_before",
+                "context_after",
+                "artifact_refs",
+            ):
+                try:
+                    item[key] = json.loads(item.get(key) or "null")
+                except (TypeError, ValueError):
+                    item[key] = None
+            try:
+                item["compacted"] = json.loads(item.get("compacted") or "[]")
+            except (TypeError, ValueError):
+                item["compacted"] = []
+            result.append(item)
+        return result
+
+    @staticmethod
+    def _json(value: Any) -> str:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
     def _execute(self, sql: str, params: tuple = ()) -> None:
         with self._lock:
@@ -271,6 +334,12 @@ class HostCallRepository:
         args: list,
         ok: bool,
         frame_id: str | None = None,
+        result: Any = None,
+        action_group_id: str | None = None,
+        action_id: str | None = None,
+        permission_decision_id: str | None = None,
+        side_effect_class: str | None = None,
+        resource_keys: list[str] | tuple[str, ...] | None = None,
     ) -> None:
         if method in DERIVABLE_HOST_CALLS:
             return
@@ -281,18 +350,69 @@ class HostCallRepository:
                 preview = json.dumps(args, ensure_ascii=False)[:500]
             except (TypeError, ValueError):
                 preview = "<unserializable>"
+        result_preview, result_digest = self._result_audit(method, result)
         self._execute(
-            "INSERT INTO host_call_log(call_id,frame_id,method,args_preview,ok,"
-            "created_at) VALUES(?,?,?,?,?,?)",
+            "INSERT INTO host_call_log("
+            "call_id,frame_id,action_group_id,action_id,permission_decision_id,"
+            "method,args_preview,result_preview,result_digest,"
+            "side_effect_class,resource_keys,ok,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 f"hc-{uuid.uuid4().hex[:12]}",
                 frame_id,
+                action_group_id,
+                action_id,
+                permission_decision_id,
                 method,
                 preview,
+                result_preview,
+                result_digest,
+                side_effect_class,
+                json.dumps(list(resource_keys or ()), separators=(",", ":")),
                 1 if ok else 0,
                 self._clock_ms(),
             ),
         )
+
+    @staticmethod
+    def _result_audit(method: str, result: Any) -> tuple[str, str | None]:
+        """Return a bounded shape preview plus a content-integrity digest.
+
+        Raw Host results may contain research data or credential material.  The
+        audit row records that an output existed and whether it later changed,
+        without becoming a second plaintext data store.
+        """
+
+        if method in SECRET_ARG_HOST_CALLS:
+            return "<redacted secret-bearing result>", None
+        try:
+            encoded = json.dumps(
+                result,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=repr,
+            )
+            digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        except Exception:  # noqa: BLE001 - audit must never break execution
+            encoded = repr(result)
+            digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        if isinstance(result, dict):
+            shape = {
+                "type": "object",
+                "keys": sorted(str(key)[:80] for key in result)[:64],
+                "size": len(result),
+                "error": bool(result.get("error")),
+            }
+        elif isinstance(result, (list, tuple)):
+            shape = {"type": "array", "size": len(result)}
+        elif isinstance(result, str):
+            shape = {"type": "string", "length": len(result)}
+        elif result is None:
+            shape = {"type": "null"}
+        else:
+            shape = {"type": type(result).__name__}
+        return json.dumps(shape, separators=(",", ":")), digest
 
     def _execute(self, sql: str, params: tuple = ()) -> None:
         with self._lock:

@@ -13,6 +13,7 @@ as turns/cells/artifacts/compactions happen. Schema and write paths:
   compaction_archives  compacted history slices
   agents            agent profile definitions
   custom_skills     user-authored SKILL.md bodies
+  skill_*           immutable Skill blobs/versions and activation history
   capability_*      scoped enablement events/state + bootstrap manifests
   memories          memory blocks (scope/block-listed in host.query)
   managed_endpoints local model endpoints
@@ -39,14 +40,23 @@ from pathlib import Path
 from typing import Any
 
 from openai4s.capabilities import CapabilityStateService, SpecialistProfileService
+from openai4s.execution.dependencies import (
+    analyze_code,
+    default_replay_policy,
+    default_visibility,
+)
 from openai4s.storage.actions import ActionLedgerRepository
+from openai4s.storage.activation import SessionActivationRepository
 from openai4s.storage.agents import AgentProfileRepository
 from openai4s.storage.annotations import AnnotationRepository
 from openai4s.storage.artifacts import ArtifactRepository
 from openai4s.storage.artifacts import file_identity as _file_identity
 from openai4s.storage.artifacts import same_file_path as _same_file_path
+from openai4s.storage.branch_projection import count_cursor, project_branch_records
 from openai4s.storage.capabilities import CapabilityStateRepository
+from openai4s.storage.checkpoint_state import CheckpointStateRepository
 from openai4s.storage.connectors import ConnectorRepository
+from openai4s.storage.delegation import DelegationProjectionRepository
 from openai4s.storage.frames import FrameRepository
 from openai4s.storage.kernels import KernelGenerationRepository
 from openai4s.storage.memories import MemoryRepository
@@ -67,6 +77,7 @@ from openai4s.storage.permissions import perm_match as _perm_match
 from openai4s.storage.plans import PlanRepository
 from openai4s.storage.recovery import RecoveryJournalRepository
 from openai4s.storage.settings import SettingsRepository
+from openai4s.storage.skills import SkillVersionRepository
 from openai4s.storage.snapshots import SessionSnapshotRepository
 
 _SCHEMA = """
@@ -105,6 +116,7 @@ CREATE TABLE IF NOT EXISTS projects (
 CREATE TABLE IF NOT EXISTS messages (
     message_id    TEXT PRIMARY KEY,
     root_frame_id TEXT NOT NULL,
+    branch_id     TEXT,
     frame_id      TEXT,
     seq           INTEGER NOT NULL,
     role          TEXT NOT NULL,      -- 'user' | 'assistant'
@@ -127,6 +139,17 @@ CREATE TABLE IF NOT EXISTS execution_log (
     status        TEXT,
     origin        TEXT,
     code          TEXT NOT NULL,
+    code_hash     TEXT NOT NULL,
+    visibility    TEXT NOT NULL DEFAULT 'scientific'
+                  CHECK (visibility IN ('scientific','scratch','recovery','system')),
+    pin           INTEGER NOT NULL DEFAULT 0 CHECK (pin IN (0,1)),
+    replay_policy TEXT NOT NULL DEFAULT 'conditional'
+                  CHECK (replay_policy IN ('safe','conditional','never')),
+    variable_reads TEXT NOT NULL DEFAULT '[]',
+    variable_writes TEXT NOT NULL DEFAULT '[]',
+    variable_deletes TEXT NOT NULL DEFAULT '[]',
+    mutation_uncertain INTEGER NOT NULL DEFAULT 0
+                  CHECK (mutation_uncertain IN (0,1)),
     stdout        TEXT,
     stderr        TEXT,
     error         TEXT,
@@ -189,9 +212,18 @@ CREATE TABLE IF NOT EXISTS compaction_archives (
     archive_id    TEXT PRIMARY KEY,
     frame_id      TEXT,
     project_id    TEXT NOT NULL DEFAULT 'default',
+    branch_id     TEXT,
+    ledger_cursor TEXT,
+    recovery_pointer TEXT,
+    generation_id TEXT,
+    metadata      TEXT,
     summary       TEXT,
+    handoff       TEXT,
     compacted     TEXT,               -- JSON of the raw slice
     n_messages    INTEGER,
+    context_before TEXT,
+    context_after TEXT,
+    artifact_refs TEXT,
     created_at    INTEGER NOT NULL
 );
 
@@ -298,8 +330,15 @@ CREATE INDEX IF NOT EXISTS ix_edge_in  ON lineage_edges(input_version_id);
 CREATE TABLE IF NOT EXISTS host_call_log (
     call_id       TEXT PRIMARY KEY,
     frame_id      TEXT,
+    action_group_id TEXT,
+    action_id     TEXT,
+    permission_decision_id TEXT,
     method        TEXT NOT NULL,
     args_preview  TEXT,
+    result_preview TEXT,
+    result_digest TEXT,
+    side_effect_class TEXT,
+    resource_keys TEXT,
     ok            INTEGER NOT NULL DEFAULT 1,
     created_at    INTEGER NOT NULL
 );
@@ -399,8 +438,13 @@ CREATE TABLE IF NOT EXISTS permission_requests (
     root_frame_id  TEXT,
     frame_id       TEXT,
     project_id     TEXT,
+    action_group_id TEXT,
+    action_id      TEXT,
+    tool_call_id   TEXT,
     tool           TEXT NOT NULL,
     target         TEXT NOT NULL DEFAULT '',
+    side_effect_class TEXT,
+    resource_keys  TEXT,
     payload        TEXT,
     state          TEXT NOT NULL DEFAULT 'pending',
     scope          TEXT,
@@ -441,8 +485,18 @@ QUERY_DENYLIST = frozenset(
         "capability_states",
         "capability_events",
         "capability_manifests",
+        "skill_blobs",
+        "skill_versions",
+        "skill_version_files",
+        "skill_installations",
+        "skill_installation_events",
+        "delegation_sessions",
+        "delegation_children",
+        "delegation_steering",
         "session_branches",
+        "session_branch_selection",
         "session_checkpoints",
+        "checkpoint_state_snapshots",
         "snapshot_operations",
         "recovery_journal",
     }
@@ -494,12 +548,29 @@ class Store:
             self._lock,
             clock_ms=lambda: _now_ms(),
         )
-        self._session_snapshots = SessionSnapshotRepository(
+        self._checkpoint_states = CheckpointStateRepository(
             self._conn,
             self._lock,
             clock_ms=lambda: _now_ms(),
         )
+        self._session_snapshots = SessionSnapshotRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+            checkpoint_state=self._checkpoint_states,
+        )
+        self._session_activation = SessionActivationRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+            checkpoint_state=self._checkpoint_states,
+        )
         self._recovery_journal = RecoveryJournalRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
+        self._delegations = DelegationProjectionRepository(
             self._conn,
             self._lock,
             clock_ms=lambda: _now_ms(),
@@ -547,6 +618,11 @@ class Store:
             clock_ms=lambda: _now_ms(),
         )
         self._capabilities = CapabilityStateService(self._capability_repository)
+        self._skill_versions = SkillVersionRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
         self._specialists = SpecialistProfileService(
             self._agents,
             self._capabilities,
@@ -606,6 +682,7 @@ class Store:
 
     # --- migration (add columns missing from a pre-existing DB) -----------
     _MIGRATIONS = {
+        "messages": [("branch_id", "TEXT")],
         "frames": [
             ("task_summary", "TEXT"),
             ("folder_id", "TEXT"),
@@ -621,6 +698,14 @@ class Store:
             ("kernel_id", "TEXT"),
             ("language", "TEXT"),
             ("status", "TEXT"),
+            ("code_hash", "TEXT"),
+            ("visibility", "TEXT NOT NULL DEFAULT 'scientific'"),
+            ("pin", "INTEGER NOT NULL DEFAULT 0"),
+            ("replay_policy", "TEXT NOT NULL DEFAULT 'conditional'"),
+            ("variable_reads", "TEXT NOT NULL DEFAULT '[]'"),
+            ("variable_writes", "TEXT NOT NULL DEFAULT '[]'"),
+            ("variable_deletes", "TEXT NOT NULL DEFAULT '[]'"),
+            ("mutation_uncertain", "INTEGER NOT NULL DEFAULT 0"),
             ("figures", "TEXT"),
             ("files_read", "TEXT"),
             ("files_written", "TEXT"),
@@ -630,6 +715,31 @@ class Store:
             ("continuation_required", "INTEGER NOT NULL DEFAULT 0"),
             ("continuation_expires_at", "INTEGER"),
             ("continuation_consumed_at", "INTEGER"),
+            ("action_group_id", "TEXT"),
+            ("action_id", "TEXT"),
+            ("tool_call_id", "TEXT"),
+            ("side_effect_class", "TEXT"),
+            ("resource_keys", "TEXT"),
+        ],
+        "host_call_log": [
+            ("action_group_id", "TEXT"),
+            ("action_id", "TEXT"),
+            ("permission_decision_id", "TEXT"),
+            ("result_preview", "TEXT"),
+            ("result_digest", "TEXT"),
+            ("side_effect_class", "TEXT"),
+            ("resource_keys", "TEXT"),
+        ],
+        "compaction_archives": [
+            ("branch_id", "TEXT"),
+            ("ledger_cursor", "TEXT"),
+            ("recovery_pointer", "TEXT"),
+            ("generation_id", "TEXT"),
+            ("metadata", "TEXT"),
+            ("handoff", "TEXT"),
+            ("context_before", "TEXT"),
+            ("context_after", "TEXT"),
+            ("artifact_refs", "TEXT"),
         ],
     }
 
@@ -672,6 +782,17 @@ class Store:
                 "WHERE actor.frame_id=artifacts.root_frame_id),root_frame_id) "
                 "WHERE root_frame_id IN (SELECT frame_id FROM frames)"
             )
+            # Messages written before branch-aware history belonged to the
+            # canonical root.  Keep the rows immutable and backfill only their
+            # newly-added routing projection.
+            self._conn.execute(
+                "UPDATE messages SET branch_id=root_frame_id "
+                "WHERE branch_id IS NULL OR branch_id=''"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_msg_branch "
+                "ON messages(root_frame_id,branch_id,seq)"
+            )
             # ``cell_index`` was already the session-monotonic allocation for
             # historical Web Cells.  Backfill the explicitly named runtime
             # revision without pretending that rows which never had an index
@@ -680,6 +801,43 @@ class Store:
                 "UPDATE execution_log SET state_revision=cell_index "
                 "WHERE state_revision IS NULL AND cell_index IS NOT NULL"
             )
+            # Capture the same immutable dependency metadata for historical
+            # Cells as for newly recorded ones.  Rows are selected by the hash
+            # sentinel, making the additive migration idempotent.
+            legacy_cells = self._conn.execute(
+                "SELECT producing_cell_id,code,language,origin,visibility,"
+                "replay_policy FROM execution_log WHERE code_hash IS NULL"
+            ).fetchall()
+            for cell in legacy_cells:
+                visibility = cell["visibility"] or default_visibility(
+                    cell["origin"]
+                )
+                if visibility == "scientific" and str(
+                    cell["origin"] or ""
+                ).lower() in {"system", "recovery"}:
+                    visibility = default_visibility(cell["origin"])
+                replay_policy = cell["replay_policy"]
+                if not replay_policy or visibility in {"system", "recovery"}:
+                    replay_policy = default_replay_policy(visibility)
+                metadata = analyze_code(
+                    cell["code"] or "", cell["language"] or "python"
+                )
+                self._conn.execute(
+                    "UPDATE execution_log SET code_hash=?,visibility=?,"
+                    "replay_policy=?,variable_reads=?,variable_writes=?,"
+                    "variable_deletes=?,mutation_uncertain=? "
+                    "WHERE producing_cell_id=?",
+                    (
+                        metadata.code_hash,
+                        visibility,
+                        replay_policy,
+                        json.dumps(metadata.reads, ensure_ascii=False),
+                        json.dumps(metadata.writes, ensure_ascii=False),
+                        json.dumps(metadata.deletes, ensure_ascii=False),
+                        1 if metadata.uncertain else 0,
+                        cell["producing_cell_id"],
+                    ),
+                )
             self._conn.commit()
 
     # --- low-level -------------------------------------------------------
@@ -774,6 +932,9 @@ class Store:
     def delete_project(self, project_id: str) -> dict:
         return self._frames.delete_project(project_id)
 
+    def project_session_ids(self, project_id: str) -> list[str]:
+        return self._frames.project_session_ids(project_id)
+
     def list_projects(self) -> list[dict]:
         return self._frames.list_projects()
 
@@ -782,6 +943,7 @@ class Store:
         self,
         *,
         root_frame_id: str,
+        branch_id: str | None = None,
         role: str,
         content: str,
         frame_id: str | None = None,
@@ -790,6 +952,7 @@ class Store:
     ) -> dict:
         return self._frames.add_message(
             root_frame_id=root_frame_id,
+            branch_id=branch_id,
             role=role,
             content=content,
             frame_id=frame_id,
@@ -798,12 +961,83 @@ class Store:
         )
 
     def list_messages(
-        self, root_frame_id: str, *, start: int = 0, limit: int = 300
+        self,
+        root_frame_id: str,
+        *,
+        branch_id: str | None = None,
+        start: int = 0,
+        limit: int | None = 300,
     ) -> list[dict]:
         return self._frames.list_messages(
             root_frame_id,
+            branch_id=branch_id,
             start=start,
             limit=limit,
+        )
+
+    def list_message_boundaries(
+        self,
+        root_frame_id: str,
+        *,
+        branch_id: str | None = None,
+        start: int = 0,
+        limit: int | None = 300,
+    ) -> list[dict]:
+        return self._frames.list_message_boundaries(
+            root_frame_id,
+            branch_id=branch_id,
+            start=start,
+            limit=limit,
+        )
+
+    def list_branch_messages(
+        self,
+        root_frame_id: str,
+        *,
+        branch_id: str | None = None,
+        start: int = 0,
+        limit: int | None = 300,
+        boundaries: bool = False,
+    ) -> list[dict]:
+        """Project one branch's visible conversation without deleting rows."""
+
+        reader = (
+            self._frames.list_message_boundaries
+            if boundaries
+            else self._frames.list_messages
+        )
+        projected = project_branch_records(
+            self,
+            root_frame_id,
+            branch_id or self.active_session_branch(root_frame_id),
+            list_local=lambda selected: reader(
+                root_frame_id,
+                branch_id=selected,
+                limit=None,
+            ),
+            record_position=lambda message: int(message.get("seq") or 0),
+            cursor_key="message_cursor",
+            normalize_cursor=count_cursor,
+        )
+        start = max(0, int(start))
+        if limit is None:
+            return projected[start:]
+        return projected[start : start + max(0, int(limit))]
+
+    def list_branch_message_boundaries(
+        self,
+        root_frame_id: str,
+        *,
+        branch_id: str | None = None,
+        start: int = 0,
+        limit: int | None = 300,
+    ) -> list[dict]:
+        return self.list_branch_messages(
+            root_frame_id,
+            branch_id=branch_id,
+            start=start,
+            limit=limit,
+            boundaries=True,
         )
 
     def message_count(self, root_frame_id: str) -> int:
@@ -911,6 +1145,9 @@ class Store:
         state_revision: int | None = None,
         kernel_id: str = "python",
         language: str = "python",
+        visibility: str | None = None,
+        pin: bool = False,
+        replay_policy: str | None = None,
         figures: list | None = None,
         files_read: list | None = None,
         files_written: list | None = None,
@@ -927,13 +1164,18 @@ class Store:
             state_revision=state_revision,
             kernel_id=kernel_id,
             language=language,
+            visibility=visibility,
+            pin=pin,
+            replay_policy=replay_policy,
             figures=figures,
             files_read=files_read,
             files_written=files_written,
         )
 
-    def list_cells(self, root_frame_id: str) -> list[dict]:
-        return self._frames.list_cells(root_frame_id)
+    def list_cells(
+        self, root_frame_id: str, *, branch_id: str | None = None
+    ) -> list[dict]:
+        return self._frames.list_cells(root_frame_id, branch_id=branch_id)
 
     def cell_detail(self, producing_cell_id: str) -> dict | None:
         return self._frames.cell_detail(producing_cell_id)
@@ -952,6 +1194,8 @@ class Store:
         wire_state: Any = None,
         assistant_content: str | None = None,
         assistant_message: Any = None,
+        usage: dict[str, Any] | None = None,
+        cost_usd: float | None = None,
         group_id: str | None = None,
         created_at: int | None = None,
     ) -> dict:
@@ -966,6 +1210,8 @@ class Store:
             wire_state=wire_state,
             assistant_content=assistant_content,
             assistant_message=assistant_message,
+            usage=usage,
+            cost_usd=cost_usd,
             group_id=group_id,
             created_at=created_at,
         )
@@ -1016,6 +1262,8 @@ class Store:
         wire_state: Any = None,
         assistant_content: str | None = None,
         assistant_message: Any = None,
+        usage: dict[str, Any] | None = None,
+        cost_usd: float | None = None,
         group_id: str | None = None,
         created_at: int | None = None,
     ) -> dict:
@@ -1030,6 +1278,8 @@ class Store:
             wire_state=wire_state,
             assistant_content=assistant_content,
             assistant_message=assistant_message,
+            usage=usage,
+            cost_usd=cost_usd,
             group_id=group_id,
             created_at=created_at,
         )
@@ -1163,6 +1413,21 @@ class Store:
     ) -> dict:
         return self._kernel_generations.touch(generation_id, **fields)
 
+    def compare_and_swap_kernel_bootstrap(
+        self,
+        generation_id: str,
+        *,
+        expected_manifest_id: str | None,
+        bootstrap: Any,
+        at: int | None = None,
+    ) -> dict | None:
+        return self._kernel_generations.compare_and_swap_bootstrap(
+            generation_id,
+            expected_manifest_id=expected_manifest_id,
+            bootstrap=bootstrap,
+            at=at,
+        )
+
     def finish_kernel_generation(
         self,
         generation_id: str,
@@ -1227,11 +1492,108 @@ class Store:
     def create_session_checkpoint(self, **fields: Any) -> dict:
         return self._session_snapshots.create_checkpoint(**fields)
 
+    def get_checkpoint_state_snapshot(
+        self,
+        checkpoint_id: str,
+        *,
+        include_state: bool = False,
+    ) -> dict | None:
+        return self._checkpoint_states.get(
+            checkpoint_id,
+            include_state=include_state,
+        )
+
+    def list_checkpoint_state_snapshots(
+        self,
+        root_frame_id: str,
+        *,
+        branch_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        return self._checkpoint_states.list(
+            root_frame_id,
+            branch_id=branch_id,
+            limit=limit,
+        )
+
+    def import_quarantined_checkpoint_state(
+        self,
+        source: dict,
+        *,
+        checkpoint_id: str,
+        root_frame_id: str,
+        branch_id: str,
+        project_id: str,
+        artifact_id_map: dict[str, str] | None = None,
+        source_checkpoint_id: str | None = None,
+    ) -> dict:
+        return self._checkpoint_states.import_quarantined_snapshot(
+            source,
+            checkpoint_id=checkpoint_id,
+            root_frame_id=root_frame_id,
+            branch_id=branch_id,
+            project_id=project_id,
+            artifact_id_map=artifact_id_map,
+            source_checkpoint_id=source_checkpoint_id,
+        )
+
+    def validate_checkpoint_state_import(
+        self,
+        source: dict,
+        *,
+        include_state: bool = False,
+    ) -> dict:
+        return self._checkpoint_states.validate_checkpoint_state_import(
+            source,
+            include_state=include_state,
+        )
+
+    def restore_checkpoint_state_snapshot(
+        self,
+        *,
+        checkpoint_id: str,
+        root_frame_id: str,
+        project_id: str,
+    ) -> dict:
+        """Restore only the structured plan/review/memory projection.
+
+        Normal branch activation calls the same repository inside its broader
+        atomic publication transaction.  This narrow facade exists for repair
+        tooling and direct repository contract tests.
+        """
+
+        return self._checkpoint_states.restore_checkpoint(
+            checkpoint_id=checkpoint_id,
+            root_frame_id=root_frame_id,
+            project_id=project_id,
+        )
+
     def fork_session_branch(self, **fields: Any) -> dict:
         return self._session_snapshots.fork_branch(**fields)
 
     def get_session_checkpoint(self, checkpoint_id: str) -> dict | None:
         return self._session_snapshots.get_checkpoint(checkpoint_id)
+
+    def get_session_checkpoint_for_source(
+        self,
+        root_frame_id: str,
+        *,
+        source_kind: str,
+        source_id: str,
+    ) -> dict | None:
+        return self._session_snapshots.get_checkpoint_for_source(
+            root_frame_id,
+            source_kind=source_kind,
+            source_id=source_id,
+        )
+
+    def session_checkpoint_source_map(
+        self, root_frame_id: str, *, source_kind: str
+    ) -> dict[str, str]:
+        return self._session_snapshots.checkpoint_source_map(
+            root_frame_id,
+            source_kind=source_kind,
+        )
 
     def list_session_checkpoints(
         self,
@@ -1246,11 +1608,23 @@ class Store:
             limit=limit,
         )
 
+    def retained_workspace_tree_ids(self) -> tuple[str, ...]:
+        return self._session_snapshots.retained_tree_ids()
+
     def get_session_branch(self, branch_id: str) -> dict | None:
         return self._session_snapshots.get_branch(branch_id)
 
     def list_session_branches(self, root_frame_id: str) -> list[dict]:
         return self._session_snapshots.list_branches(root_frame_id)
+
+    def ensure_active_session_branch(self, root_frame_id: str) -> str:
+        return self._session_activation.ensure(root_frame_id)
+
+    def active_session_branch(self, root_frame_id: str) -> str:
+        return self._session_activation.current(root_frame_id)
+
+    def activate_session_branch_checkpoint(self, **fields: Any) -> dict:
+        return self._session_activation.activate_checkpoint(**fields)
 
     def record_snapshot_operation(self, **fields: Any) -> dict:
         return self._session_snapshots.record_operation(**fields)
@@ -1296,8 +1670,27 @@ class Store:
             newest=newest,
         )
 
-    def delete_frame(self, frame_id: str) -> None:
-        self._frames.delete_frame(frame_id)
+    # --- durable sub-agent delegation projection ----------------------
+    def restore_delegation_tree(self, **fields: Any) -> dict:
+        return self._delegations.restore(**fields)
+
+    def reserve_delegation_children(self, **fields: Any) -> dict:
+        return self._delegations.reserve(**fields)
+
+    def release_delegation_budget(self, **fields: Any) -> dict:
+        return self._delegations.release(**fields)
+
+    def persist_delegation_child(self, **fields: Any) -> dict | None:
+        return self._delegations.persist_child(**fields)
+
+    def delegation_tree(self, root_frame_id: str) -> dict:
+        return self._delegations.project(root_frame_id)
+
+    def delegation_budget(self, root_frame_id: str) -> dict | None:
+        return self._delegations.budget(root_frame_id)
+
+    def delete_frame(self, frame_id: str) -> dict[str, Any]:
+        return self._frames.delete_frame(frame_id)
 
     def get_frame(self, frame_id: str) -> dict | None:
         return self._frames.get_frame(frame_id)
@@ -1405,8 +1798,41 @@ class Store:
             preserve_content_type=preserve_content_type,
             reuse_policy=reuse_policy,
         )
+
+    def record_artifact_restore(
+        self,
+        *,
+        artifact_id: str,
+        source_version_id: str,
+        expected_latest_version_id: str,
+        version_id: str,
+        path: str,
+        snapshot_path: str,
+        size_bytes: int,
+        checksum: str,
+        frame_id: str | None,
+        root_frame_id: str | None = None,
+        project_id: str | None = None,
+    ) -> dict:
+        return self._artifacts.record_artifact_restore(
+            artifact_id=artifact_id,
+            source_version_id=source_version_id,
+            expected_latest_version_id=expected_latest_version_id,
+            version_id=version_id,
+            path=path,
+            snapshot_path=snapshot_path,
+            size_bytes=size_bytes,
+            checksum=checksum,
+            frame_id=frame_id,
+            root_frame_id=root_frame_id,
+            project_id=project_id,
+        )
+
     def upsert_env_snapshot(self, snapshot: dict) -> str:
         return self._artifacts.upsert_env_snapshot(snapshot)
+
+    def delete_env_snapshots_if_unreferenced(self, snapshot_ids) -> int:
+        return self._artifacts.delete_env_snapshots_if_unreferenced(snapshot_ids)
 
     def get_env_snapshot(self, snapshot_id: str) -> dict | None:
         return self._artifacts.get_env_snapshot(snapshot_id)
@@ -1506,6 +1932,9 @@ class Store:
     def set_setting(self, key: str, value: str) -> None:
         self._settings.set(key, value)
 
+    def delete_setting(self, key: str) -> None:
+        self._settings.delete(key)
+
     # --- model profiles (saved LLM/API configs) --------------------------
     # Stored as a JSON list under the `model_profiles` setting so users can keep
     # several full API configs (provider + base_url + model + key) side by side
@@ -1539,6 +1968,9 @@ class Store:
 
     def delete_permission_rule(self, rule_id: str) -> None:
         self._permissions.delete_rule(rule_id)
+
+    def get_permission_rule(self, rule_id: str) -> dict | None:
+        return self._permissions.get_rule(rule_id)
 
     def get_permission_rules(self, *, scope: str, scope_id: str = "") -> list[dict]:
         return self._permissions.get_rules(scope=scope, scope_id=scope_id)
@@ -1854,6 +2286,11 @@ class Store:
             session_id=session_id,
         )
 
+    def skill_versions(self) -> SkillVersionRepository:
+        """Return the Store-owned immutable Skill package repository."""
+
+        return self._skill_versions
+
     def set_capability_enabled(
         self,
         kind: str,
@@ -2001,13 +2438,20 @@ class Store:
         summary: str,
         compacted: list[dict],
         project_id: str = "default",
+        **metadata: Any,
     ) -> str:
         return self._compactions.archive(
             frame_id=frame_id,
             summary=summary,
             compacted=compacted,
             project_id=project_id,
+            **metadata,
         )
+
+    def list_compaction_archives(
+        self, frame_id: str, *, limit: int = 50
+    ) -> list[dict]:
+        return self._compactions.list(frame_id, limit=limit)
 
     # --- endpoints ----------------------------------------------
     def upsert_endpoint(self, name: str, **fields: Any) -> None:
@@ -2018,13 +2462,30 @@ class Store:
 
     # --- host_call audit ----------------------------------------
     def log_host_call(
-        self, *, method: str, args: list, ok: bool, frame_id: str | None = None
+        self,
+        *,
+        method: str,
+        args: list,
+        ok: bool,
+        frame_id: str | None = None,
+        result: Any = None,
+        action_group_id: str | None = None,
+        action_id: str | None = None,
+        permission_decision_id: str | None = None,
+        side_effect_class: str | None = None,
+        resource_keys: list[str] | tuple[str, ...] | None = None,
     ) -> None:
         self._host_calls.log(
             method=method,
             args=args,
             ok=ok,
             frame_id=frame_id,
+            result=result,
+            action_group_id=action_group_id,
+            action_id=action_id,
+            permission_decision_id=permission_decision_id,
+            side_effect_class=side_effect_class,
+            resource_keys=resource_keys,
         )
 
     # --- generic read-only query (host.query backing) -------------------

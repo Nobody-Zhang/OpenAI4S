@@ -4,6 +4,7 @@ store.py is a future extraction target (docs/refactor-plan.md) — these lock
 the row shapes and id conventions callers depend on TODAY, so an extraction
 that drops or renames a column fails here first.
 """
+import hashlib
 import sqlite3
 
 import pytest
@@ -18,6 +19,37 @@ def _store(tmp_path):
         llm=LLMConfig(provider="deepseek", api_key="test-key"),
     )
     return get_store(cfg.db_path)
+
+
+def test_legacy_execution_log_gets_dependency_metadata_backfill(tmp_path):
+    db_path = Config(data_dir=tmp_path).db_path
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "CREATE TABLE execution_log ("
+            "producing_cell_id TEXT PRIMARY KEY,frame_id TEXT,root_frame_id TEXT,"
+            "project_id TEXT NOT NULL DEFAULT 'default',cell_seq INTEGER,"
+            "cell_index INTEGER,state_revision INTEGER,kernel_id TEXT,"
+            "language TEXT,status TEXT,origin TEXT,code TEXT NOT NULL,"
+            "stdout TEXT,stderr TEXT,error TEXT,figures TEXT,files_read TEXT,"
+            "files_written TEXT,interrupted INTEGER NOT NULL DEFAULT 0,"
+            "wall_s REAL,cpu_s REAL,peak_rss_kb INTEGER,created_at INTEGER NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO execution_log(producing_cell_id,language,origin,code,"
+            "created_at) VALUES('legacy-cell','python','system','x = source + 1',1)"
+        )
+
+    store = get_store(db_path)
+    cell = store.cell_detail("legacy-cell")
+
+    assert cell["code_hash"] == hashlib.sha256(b"x = source + 1").hexdigest()
+    assert cell["visibility"] == "system"
+    assert cell["pin"] is False
+    assert cell["replay_policy"] == "never"
+    assert cell["variable_reads"] == ["source"]
+    assert cell["variable_writes"] == ["x"]
+    assert cell["variable_deletes"] == []
+    assert cell["mutation_uncertain"] is False
 
 
 # --- frames ------------------------------------------------------------------

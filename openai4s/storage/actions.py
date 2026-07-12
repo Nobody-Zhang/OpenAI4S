@@ -13,6 +13,7 @@ be filled.  In particular, a finished attempt can never be rewritten.
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import uuid
 from typing import Any, Callable, TypedDict, cast
@@ -30,6 +31,8 @@ CREATE TABLE IF NOT EXISTS action_groups (
     wire_state         TEXT,
     assistant_content  TEXT,
     assistant_message  TEXT,
+    usage              TEXT,
+    cost_usd           REAL,
     created_at         INTEGER NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_action_group_ordinal
@@ -115,6 +118,8 @@ class ActionGroupDTO(TypedDict):
     wire_state: Any
     assistant_content: str | None
     assistant_message: Any
+    usage: Any
+    cost_usd: float | None
     created_at: int
     events: list[ActionEventDTO]
 
@@ -179,6 +184,25 @@ def _ordinal(name: str, value: int) -> int:
     return value
 
 
+def _optional_cost_usd(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("cost_usd must be a non-negative finite number or None")
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        raise ValueError("cost_usd must be a non-negative finite number or None")
+    return parsed
+
+
+def _optional_usage(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise TypeError("usage must be a dict or None")
+    return dict(value)
+
+
 class ActionLedgerRepository:
     """Persist immutable action groups/events and monotonic attempts."""
 
@@ -207,6 +231,14 @@ class ActionLedgerRepository:
             if "assistant_message" not in columns:
                 self._connection.execute(
                     "ALTER TABLE action_groups ADD COLUMN assistant_message TEXT"
+                )
+            if "usage" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE action_groups ADD COLUMN usage TEXT"
+                )
+            if "cost_usd" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE action_groups ADD COLUMN cost_usd REAL"
                 )
             attempt_columns = {
                 row["name"]
@@ -238,6 +270,8 @@ class ActionLedgerRepository:
         wire_state: Any = None,
         assistant_content: str | None = None,
         assistant_message: Any = None,
+        usage: dict[str, Any] | None = None,
+        cost_usd: float | None = None,
         group_id: str | None = None,
         created_at: int | None = None,
     ) -> ActionGroupDTO:
@@ -248,6 +282,8 @@ class ActionLedgerRepository:
         group_id = _required_text(
             "group_id", group_id or f"ag-{uuid.uuid4().hex[:16]}"
         )
+        usage = _optional_usage(usage)
+        cost_usd = _optional_cost_usd(cost_usd)
         now = self._clock_ms() if created_at is None else created_at
         with self._lock:
             if ordinal is None:
@@ -267,6 +303,8 @@ class ActionLedgerRepository:
                     wire_state=wire_state,
                     assistant_content=assistant_content,
                     assistant_message=assistant_message,
+                    usage=usage,
+                    cost_usd=cost_usd,
                     created_at=now,
                 )
             except Exception:
@@ -343,6 +381,8 @@ class ActionLedgerRepository:
         wire_state: Any = None,
         assistant_content: str | None = None,
         assistant_message: Any = None,
+        usage: dict[str, Any] | None = None,
+        cost_usd: float | None = None,
         group_id: str | None = None,
         created_at: int | None = None,
     ) -> ActionGroupDTO:
@@ -360,6 +400,8 @@ class ActionLedgerRepository:
         group_id = _required_text(
             "group_id", group_id or f"ag-{uuid.uuid4().hex[:16]}"
         )
+        usage = _optional_usage(usage)
+        cost_usd = _optional_cost_usd(cost_usd)
         now = self._clock_ms() if created_at is None else created_at
         normalized_events: list[dict[str, Any]] = []
         for index, source in enumerate(events):
@@ -394,6 +436,8 @@ class ActionLedgerRepository:
                     wire_state=wire_state,
                     assistant_content=assistant_content,
                     assistant_message=assistant_message,
+                    usage=usage,
+                    cost_usd=cost_usd,
                     created_at=now,
                 )
                 for event in normalized_events:
@@ -811,8 +855,8 @@ class ActionLedgerRepository:
         self._connection.execute(
             "INSERT INTO action_groups("
             "group_id,root_frame_id,branch_id,turn_id,ordinal,kind,provider,model,"
-            "wire_state,assistant_content,assistant_message,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            "wire_state,assistant_content,assistant_message,usage,cost_usd,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 values["group_id"],
                 values["root_frame_id"],
@@ -825,6 +869,8 @@ class ActionLedgerRepository:
                 _json_dump(values["wire_state"]),
                 values["assistant_content"],
                 _json_dump(values["assistant_message"]),
+                _json_dump(values["usage"]),
+                values["cost_usd"],
                 values["created_at"],
             ),
         )
@@ -909,6 +955,7 @@ class ActionLedgerRepository:
         data = dict(row)
         data["wire_state"] = _json_load(data.get("wire_state"))
         data["assistant_message"] = _json_load(data.get("assistant_message"))
+        data["usage"] = _json_load(data.get("usage"))
         data["events"] = events
         return cast(ActionGroupDTO, data)
 

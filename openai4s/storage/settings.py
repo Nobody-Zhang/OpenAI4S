@@ -37,6 +37,9 @@ class SettingsRepository:
             (key, value, self._clock_ms()),
         )
 
+    def delete(self, key: str) -> None:
+        self._execute("DELETE FROM settings WHERE key=?", (key,))
+
     def list_model_profiles(self) -> list[dict]:
         raw = self.get("model_profiles")
         if not raw:

@@ -95,16 +95,31 @@ class ArtifactRepository:
         """Remove an artifact and return paths no surviving version references."""
         with self._lock:
             rows = self._connection.execute(
-                "SELECT path, snapshot_path FROM artifact_versions "
-                "WHERE artifact_id=?",
+                "SELECT version_id,path,snapshot_path,env_snapshot_id "
+                "FROM artifact_versions WHERE artifact_id=?",
                 (artifact_id,),
             ).fetchall()
+            version_ids = tuple(str(row["version_id"]) for row in rows)
+            env_snapshot_ids = tuple(
+                dict.fromkeys(
+                    str(row["env_snapshot_id"])
+                    for row in rows
+                    if row["env_snapshot_id"]
+                )
+            )
             paths = {
                 path
                 for row in rows
                 for path in (row["path"], row["snapshot_path"])
                 if path
             }
+            if version_ids:
+                marks = "(" + ",".join("?" for _ in version_ids) + ")"
+                self._connection.execute(
+                    "DELETE FROM lineage_edges WHERE input_version_id IN "
+                    f"{marks} OR output_version_id IN {marks}",
+                    version_ids + version_ids,
+                )
             self._connection.execute(
                 "DELETE FROM artifact_versions WHERE artifact_id=?", (artifact_id,)
             )
@@ -114,15 +129,33 @@ class ArtifactRepository:
             self._connection.execute(
                 "DELETE FROM annotations WHERE artifact_id=?", (artifact_id,)
             )
+            self._connection.execute(
+                "UPDATE plans SET artifact_id=NULL WHERE artifact_id=?", (artifact_id,)
+            )
+            if env_snapshot_ids:
+                marks = "(" + ",".join("?" for _ in env_snapshot_ids) + ")"
+                self._connection.execute(
+                    "DELETE FROM env_snapshots WHERE snapshot_id IN "
+                    f"{marks} AND NOT EXISTS (SELECT 1 FROM artifact_versions "
+                    "WHERE artifact_versions.env_snapshot_id="
+                    "env_snapshots.snapshot_id)",
+                    env_snapshot_ids,
+                )
             self._connection.commit()
-            keep = set()
-            for path in paths:
-                if self._connection.execute(
-                    "SELECT 1 FROM artifact_versions "
-                    "WHERE path=? OR snapshot_path=? LIMIT 1",
-                    (path, path),
-                ).fetchone():
-                    keep.add(path)
+            surviving_rows = self._connection.execute(
+                "SELECT path,snapshot_path FROM artifact_versions"
+            ).fetchall()
+            surviving_paths = tuple(
+                value
+                for row in surviving_rows
+                for value in (row["path"], row["snapshot_path"])
+                if value
+            )
+            keep = {
+                path
+                for path in paths
+                if any(self._paths_match(path, other) for other in surviving_paths)
+            }
         return [path for path in paths if path not in keep]
 
     def rename_artifact(self, artifact_id: str, filename: str) -> None:
@@ -529,6 +562,126 @@ class ArtifactRepository:
             "created_at": created_at,
         }
 
+    def record_artifact_restore(
+        self,
+        *,
+        artifact_id: str,
+        source_version_id: str,
+        expected_latest_version_id: str,
+        version_id: str,
+        path: str,
+        snapshot_path: str,
+        size_bytes: int,
+        checksum: str,
+        frame_id: str | None,
+        root_frame_id: str | None = None,
+        project_id: str | None = None,
+    ) -> dict:
+        """Append one restored version and its lineage edge atomically.
+
+        Restoring never makes the historical row current again.  The source
+        version is read inside the same transaction, a fresh immutable version
+        is inserted, and only that new identity becomes the Artifact head.
+        Filesystem confinement and byte verification belong to the Host data
+        service; this repository owns the exact persistence transaction.
+        """
+        if not version_id or version_id == source_version_id:
+            raise ValueError("restore requires a fresh version id")
+        _explicit, resolved_root, resolved_project = (
+            self._resolve_artifact_write_scope(
+                frame_id=frame_id,
+                root_frame_id=root_frame_id,
+                project_id=project_id,
+            )
+        )
+        now = self._clock_ms()
+        with self._lock:
+            try:
+                artifact = self._connection.execute(
+                    "SELECT * FROM artifacts WHERE artifact_id=?",
+                    (artifact_id,),
+                ).fetchone()
+                source = self._connection.execute(
+                    "SELECT * FROM artifact_versions WHERE version_id=? "
+                    "AND artifact_id=?",
+                    (source_version_id, artifact_id),
+                ).fetchone()
+                if artifact is None or source is None:
+                    raise KeyError("artifact restore source not found")
+                if artifact["latest_version_id"] != expected_latest_version_id:
+                    raise RuntimeError("artifact changed concurrently during restore")
+                if artifact["latest_version_id"] == source_version_id:
+                    raise ValueError("restore source is already the latest version")
+                if source["checksum"] != checksum or (
+                    source["size_bytes"] is not None
+                    and int(source["size_bytes"]) != int(size_bytes)
+                ):
+                    raise RuntimeError("restore bytes no longer match source metadata")
+                if (
+                    artifact["root_frame_id"] is not None
+                    and resolved_root != artifact["root_frame_id"]
+                ):
+                    raise ValueError("artifact belongs to a different root frame")
+                if artifact["project_id"] != resolved_project:
+                    raise ValueError("artifact belongs to a different project")
+
+                filename = source["filename"] or artifact["filename"]
+                content_type = source["content_type"] or artifact["content_type"]
+                self._connection.execute(
+                    "INSERT INTO artifact_versions(version_id,artifact_id,"
+                    "filename,content_type,size_bytes,checksum,path,"
+                    "snapshot_path,producing_cell_id,frame_id,created_at,"
+                    "env_snapshot_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        version_id,
+                        artifact_id,
+                        filename,
+                        content_type,
+                        int(size_bytes),
+                        checksum,
+                        path,
+                        snapshot_path,
+                        None,
+                        frame_id,
+                        now,
+                        source["env_snapshot_id"],
+                    ),
+                )
+                self._connection.execute(
+                    "UPDATE artifacts SET filename=?,content_type=COALESCE(?,"
+                    "content_type),latest_version_id=?,updated_at=? "
+                    "WHERE artifact_id=?",
+                    (filename, content_type, version_id, now, artifact_id),
+                )
+                self._connection.execute(
+                    "INSERT INTO lineage_edges(edge_id,input_version_id,"
+                    "output_version_id,producing_cell_id,frame_id,created_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (
+                        f"e-{uuid.uuid4().hex[:12]}",
+                        source_version_id,
+                        version_id,
+                        None,
+                        frame_id,
+                        now,
+                    ),
+                )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+        return {
+            "artifact_id": artifact_id,
+            "version_id": version_id,
+            "filename": filename,
+            "path": path,
+            "content_type": content_type,
+            "size_bytes": int(size_bytes),
+            "checksum": checksum,
+            "created_at": now,
+            "restored_from_version_id": source_version_id,
+        }
+
     def upsert_env_snapshot(self, snapshot: dict) -> str:
         packages = snapshot.get("packages") or []
         packages_json = json.dumps(packages, separators=(",", ":"))
@@ -570,6 +723,26 @@ class ArtifactRepository:
                 )
                 self._connection.commit()
         return snapshot_id
+
+    def delete_env_snapshots_if_unreferenced(self, snapshot_ids) -> int:
+        """Delete only named snapshots that no Artifact version still uses."""
+
+        identifiers = tuple(
+            dict.fromkeys(str(value) for value in snapshot_ids if value)
+        )
+        if not identifiers:
+            return 0
+        marks = "(" + ",".join("?" for _ in identifiers) + ")"
+        with self._lock:
+            cursor = self._connection.execute(
+                "DELETE FROM env_snapshots WHERE snapshot_id IN "
+                f"{marks} AND NOT EXISTS (SELECT 1 FROM artifact_versions "
+                "WHERE artifact_versions.env_snapshot_id="
+                "env_snapshots.snapshot_id)",
+                identifiers,
+            )
+            self._connection.commit()
+        return max(0, int(cursor.rowcount or 0))
 
     def get_env_snapshot(self, snapshot_id: str) -> dict | None:
         with self._lock:
