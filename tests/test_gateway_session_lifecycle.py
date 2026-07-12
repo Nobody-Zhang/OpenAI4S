@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+
+import pytest
 
 from openai4s.config import Config, LLMConfig
 from openai4s.execution import CellRequest
-from openai4s.server.gateway import SessionRunner
+from openai4s.server.gateway import GatewayError, SessionRunner
 from openai4s.store import get_store
 
 
@@ -224,4 +228,36 @@ def test_runner_startup_marks_stale_generation_and_attempt_abandoned(tmp_path):
     assert stale_attempt["terminal_state"] == "abandoned"
     assert runner.kernel_status(frame_id)["state"] == "ended"
     assert runner.kernel_status(frame_id)["ended_reason"] == "daemon_restart"
+    runner.close()
+
+
+def test_project_delete_blocks_new_session_and_runtime_admission(tmp_path):
+    runner = _runner(tmp_path)
+    runner.store.create_project(project_id="science", name="Science")
+    existing = runner.create_session("science")
+    entered = threading.Event()
+    release = threading.Event()
+    real_delete = runner.deletions.delete_project
+
+    def blocked_delete(project_id):
+        entered.set()
+        assert release.wait(2)
+        return real_delete(project_id)
+
+    runner.deletions.delete_project = blocked_delete
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        deletion = pool.submit(runner.delete_project, "science")
+        assert entered.wait(2)
+        with pytest.raises(GatewayError) as creating:
+            runner.create_session("science")
+        assert creating.value.code == 409
+        with pytest.raises(GatewayError) as starting:
+            runner._state(existing, "science")
+        assert starting.value.code == 409
+        release.set()
+        assert deletion.result(timeout=2)["ok"] is True
+
+    with pytest.raises(GatewayError) as gone:
+        runner.create_session("science")
+    assert gone.value.code == 404
     runner.close()

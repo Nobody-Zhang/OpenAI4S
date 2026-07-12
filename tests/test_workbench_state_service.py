@@ -42,10 +42,44 @@ def test_context_projects_components_without_message_content():
     assert {item["kind"] for item in result["layers"]} == {
         "text",
         "images",
+        "tool_schemas",
         "tool_calls",
+        "tool_results",
+        "artifact_refs",
         "wire_state",
     }
     assert "hello" not in repr(result)
+
+
+def test_context_projects_safe_persistent_compaction_history(tmp_path):
+    store = Store(tmp_path / "workbench-context.db")
+    root_frame_id = store.new_frame(project_id="science")
+    store.archive_compaction(
+        frame_id=root_frame_id,
+        project_id="science",
+        branch_id=root_frame_id,
+        ledger_cursor={"group_id": "ag-1", "ordinal": 3},
+        recovery_pointer={"checkpoint_id": "cp-1"},
+        generation_id="generation-1",
+        summary="sensitive summary",
+        handoff="sensitive handoff",
+        compacted=[{"role": "tool", "content": "secret raw output"}],
+        context_before={"total": 1200},
+        context_after={"total": 400},
+        artifact_refs=[{"artifact_id": "a-1", "version_id": "v-1"}],
+    )
+
+    context = _service(store=store).context(root_frame_id)
+
+    assert context["compaction_count"] == 1
+    history = context["compaction_history"][0]
+    assert history["tokens_before"] == 1200
+    assert history["tokens_after"] == 400
+    assert history["artifact_refs"] == [
+        {"artifact_id": "a-1", "version_id": "v-1", "sha256": ""}
+    ]
+    assert "secret raw output" not in repr(context)
+    assert "sensitive summary" not in repr(context)
 
 
 def test_security_never_claims_unstarted_sandbox(monkeypatch):

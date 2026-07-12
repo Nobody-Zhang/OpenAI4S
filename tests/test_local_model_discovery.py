@@ -118,12 +118,35 @@ def test_unreachable_invalid_and_oversized_probes_stay_inert():
     assert service.discover(force=True)["endpoints"] == []
 
 
+def test_default_discovery_opener_rejects_redirects():
+    service = LocalModelDiscoveryService(endpoints=(_candidates()[0],))
+    redirect_handler = next(
+        handler
+        for handler in service._opener.handlers
+        if type(handler).__name__ == "_RejectRedirects"
+    )
+
+    assert (
+        redirect_handler.redirect_request(
+            None,
+            None,
+            302,
+            "Found",
+            {},
+            "https://example.com/redirected",
+        )
+        is None
+    )
+
+
 @pytest.mark.parametrize(
     "url",
     [
         "http://192.168.1.10:8000/v1",
         "http://localhost:8000/v1",
         "https://example.com/v1",
+        "http://user:secret@127.0.0.1:8000/v1",
+        "http://127.0.0.1:8000/v1?target=other",
         "file:///tmp/models",
     ],
 )

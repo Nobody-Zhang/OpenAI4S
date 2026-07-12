@@ -362,7 +362,113 @@ def test_restore_backfills_legacy_latest_before_broadcast(tmp_path):
     result = harness.manager.restore(first["artifact_id"], first["version_id"])
 
     assert result["ok"] is True
-    assert checked_during_broadcast == [(b"ALPHA", b"BETA", first["version_id"])]
+    restored_version_id = result["version_id"]
+    assert restored_version_id not in {
+        first["version_id"],
+        legacy["version_id"],
+    }
+    assert result["restored_from_version_id"] == first["version_id"]
+    assert checked_during_broadcast == [
+        (b"ALPHA", b"BETA", restored_version_id)
+    ]
+    assert harness.store.lineage_edges_for(restored_version_id, "up") == [
+        first["version_id"]
+    ]
+
+
+def test_restore_rejects_corrupt_snapshot_and_workspace_drift(tmp_path):
+    harness = ArtifactHarness(tmp_path)
+    path = harness.workspace / "result.txt"
+    path.write_bytes(b"ALPHA")
+    first = harness.manager.register_file(
+        harness.session, path, "cell-1", lambda event: None
+    )
+    path.write_bytes(b"BETA")
+    second = harness.manager.register_file(
+        harness.session, path, "cell-2", lambda event: None
+    )
+
+    source = harness.store.version_meta(first["version_id"])
+    Path(source["snapshot_path"]).write_bytes(b"tampered")
+    result = harness.manager.restore(first["artifact_id"], first["version_id"])
+    assert "checksum verification failed" in result["error"]
+    assert path.read_bytes() == b"BETA"
+    assert harness.store.get_artifact(first["artifact_id"])[
+        "latest_version_id"
+    ] == second["version_id"]
+    assert len(harness.store.list_versions(first["artifact_id"])) == 2
+
+    outside = tmp_path / "outside-snapshot"
+    outside.write_bytes(b"ALPHA")
+    harness.store.set_version_snapshot(first["version_id"], str(outside))
+    result = harness.manager.restore(first["artifact_id"], first["version_id"])
+    assert "outside trusted storage" in result["error"]
+    assert path.read_bytes() == b"BETA"
+
+    Path(source["snapshot_path"]).write_bytes(b"ALPHA")
+    harness.store.set_version_snapshot(
+        first["version_id"], source["snapshot_path"]
+    )
+    path.write_bytes(b"external edit")
+    result = harness.manager.restore(first["artifact_id"], first["version_id"])
+    assert "unversioned changes" in result["error"]
+    assert path.read_bytes() == b"external edit"
+    assert len(harness.store.list_versions(first["artifact_id"])) == 2
+
+
+def test_restore_expected_latest_cas_rolls_back_live_and_new_snapshot(
+    tmp_path, monkeypatch
+):
+    harness = ArtifactHarness(tmp_path)
+    path = harness.workspace / "result.txt"
+    path.write_bytes(b"ALPHA")
+    first = harness.manager.register_file(
+        harness.session, path, "cell-1", lambda event: None
+    )
+    path.write_bytes(b"BETA")
+    second = harness.manager.register_file(
+        harness.session, path, "cell-2", lambda event: None
+    )
+    snapshots_before = set(harness.manager.versions_dir().iterdir())
+    original_record = harness.store.record_artifact_restore
+    raced = {}
+
+    def race_then_record(**fields):
+        race_path = harness.workspace / "race.txt"
+        race_path.write_bytes(b"GAMMA")
+        race_snapshot = harness.manager.versions_dir() / "race-gamma"
+        race_snapshot.write_bytes(b"GAMMA")
+        raced.update(
+            harness.store.save_artifact(
+                path=str(race_path),
+                filename="result.txt",
+                content_type="text/plain",
+                size_bytes=5,
+                checksum=hashlib.sha256(b"GAMMA").hexdigest(),
+                frame_id=harness.frame_id,
+                artifact_id=first["artifact_id"],
+                snapshot_path=str(race_snapshot),
+            )
+        )
+        return original_record(**fields)
+
+    monkeypatch.setattr(
+        harness.store, "record_artifact_restore", race_then_record
+    )
+    result = harness.manager.restore(first["artifact_id"], first["version_id"])
+
+    assert "changed concurrently" in result["error"]
+    assert path.read_bytes() == b"BETA"
+    assert harness.store.get_artifact(first["artifact_id"])[
+        "latest_version_id"
+    ] == raced["version_id"]
+    assert harness.store.version_meta(second["version_id"])["checksum"] == (
+        hashlib.sha256(b"BETA").hexdigest()
+    )
+    assert len(harness.store.list_versions(first["artifact_id"])) == 3
+    assert harness.store.lineage_edges_for(first["version_id"], "down") == []
+    added_snapshots = set(harness.manager.versions_dir().iterdir()) - snapshots_before
+    assert added_snapshots == {harness.manager.versions_dir() / "race-gamma"}
 
 
 def test_python_capture_uses_one_environment_and_orders_figure_first(tmp_path):

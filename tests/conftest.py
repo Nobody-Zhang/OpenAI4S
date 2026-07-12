@@ -1,8 +1,20 @@
 """Pytest fixtures + path setup for the openai4s test suite."""
+import os
 import sys
 from pathlib import Path
 
 import pytest
+
+# These must exist before any test module imports ``openai4s.config`` because
+# several dataclass defaults are resolved at module/class definition time.  The
+# repository's ignored .env belongs to the running app, never to offline tests.
+os.environ["OPENAI4S_LLM_PROVIDER"] = "deepseek"
+os.environ["OPENAI4S_DEEPSEEK_API_KEY"] = "test-key"
+os.environ["OPENAI4S_LLM_API_KEY"] = "test-key"
+os.environ["OPENAI4S_ARK_API_KEY"] = ""
+os.environ["OPENAI4S_UNATTENDED_APPROVAL"] = "deny"
+os.environ["OPENAI4S_NOTEBOOK_REPL"] = "0"
+os.environ["OPENAI4S_ALLOW_PRIVATE_FETCH"] = "0"
 
 _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
@@ -29,5 +41,10 @@ def isolated_openai4s_home(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI4S_LLM_PROVIDER", "deepseek")
     monkeypatch.setenv("OPENAI4S_DEEPSEEK_API_KEY", "test-key")
     monkeypatch.setenv("OPENAI4S_LLM_API_KEY", "test-key")
+    # A developer may intentionally run the local app fail-open via .env, but
+    # the offline suite must keep a deterministic deny-by-default baseline.
+    monkeypatch.setenv("OPENAI4S_UNATTENDED_APPROVAL", "deny")
+    monkeypatch.setenv("OPENAI4S_NOTEBOOK_REPL", "0")
+    monkeypatch.setenv("OPENAI4S_ALLOW_PRIVATE_FETCH", "0")
     yield
     reset_singletons()

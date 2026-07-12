@@ -65,6 +65,30 @@ def test_console_and_module_entrypoints_target_the_same_main():
             ["setup", "--only", "r", "--dry-run"],
             {"cmd": "setup", "only": "r", "dry_run": True},
         ),
+        (
+            ["jupyter", "describe", "--json"],
+            {"cmd": "jupyter", "jupyter_action": "describe", "json": True},
+        ),
+        (
+            ["jupyter", "export", "/tmp/specs", "--language", "r"],
+            {
+                "cmd": "jupyter",
+                "jupyter_action": "export",
+                "language": "r",
+                "output": Path("/tmp/specs"),
+                "replace": False,
+            },
+        ),
+        (
+            ["jupyter", "install", "--prefix", "/tmp/prefix", "--replace"],
+            {
+                "cmd": "jupyter",
+                "jupyter_action": "install",
+                "language": "all",
+                "prefix": Path("/tmp/prefix"),
+                "replace": True,
+            },
+        ),
     ],
 )
 def test_subcommands_and_arguments_parse_compatibly(argv, expected):
@@ -87,6 +111,9 @@ def test_setup_only_accepts_each_documented_environment(name):
         (["run", "--help"], "--verbose"),
         (["setup", "--help"], "--only"),
         (["setup", "--help"], "--dry-run"),
+        (["jupyter", "describe", "--help"], "--json"),
+        (["jupyter", "export", "--help"], "--language"),
+        (["jupyter", "install", "--help"], "--prefix"),
     ],
 )
 def test_subcommand_help_advertises_supported_options(argv, expected_fragment, capsys):
@@ -106,8 +133,8 @@ def test_root_help_lists_every_supported_subcommand_through_python_m():
         check=False,
     )
     assert proc.returncode == 0, proc.stderr
-    assert "{serve,status,stop,url,run,setup}" in proc.stdout
-    for command in ("serve", "status", "stop", "url", "run", "setup"):
+    assert "{serve,status,stop,url,run,setup,jupyter}" in proc.stdout
+    for command in ("serve", "status", "stop", "url", "run", "setup", "jupyter"):
         assert command in proc.stdout
 
 

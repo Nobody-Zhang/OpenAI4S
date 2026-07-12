@@ -8,7 +8,10 @@ import uuid
 import pytest
 
 from openai4s.kernel.recovery import BootstrapManifest, RecoveryRecipe
-from openai4s.server.session_domain import SessionDomainService
+from openai4s.server.session_domain import (
+    CursorCheckpointUnavailable,
+    SessionDomainService,
+)
 from openai4s.store import Store
 
 
@@ -101,7 +104,8 @@ def test_empty_branch_projection_keeps_checkpoint_enabled_without_mutating(tmp_p
     assert projection["branches"] == []
     assert projection["capabilities"]["checkpoint"]["enabled"] is True
     assert projection["capabilities"]["fork"]["enabled"] is False
-    assert projection["capabilities"]["fork"]["fork_from_cell"] is False
+    assert projection["capabilities"]["fork"]["fork_from_cell"] is True
+    assert projection["capabilities"]["fork"]["fork_from_message"] is True
     # GET/projection must not manufacture a branch row.
     assert store.list_session_branches(root) == []
     store.close()
@@ -138,6 +142,104 @@ def test_fork_materializes_an_isolated_workspace_from_checkpoint(tmp_path):
     assert (canonical / "analysis.txt").read_text(encoding="utf-8") == (
         "checkpoint bytes"
     )
+    store.close()
+
+
+def test_cursor_fork_restores_exact_cell_workspace_and_old_cells_fail_closed(
+    tmp_path,
+):
+    store = Store(tmp_path / "openai4s.db")
+    root = store.new_frame(project_id="default", kind="turn", status="ready")
+    canonical = tmp_path / "canonical"
+    canonical.mkdir()
+    branch_root = tmp_path / "branches"
+    service = SessionDomainService(
+        store,
+        data_dir=tmp_path,
+        workspace=lambda _root, branch: (
+            canonical if branch == root else branch_root / branch
+        ),
+    )
+    old_cell = store.log_cell(
+        frame_id=root,
+        root_frame_id=root,
+        code="old = True",
+        result={"stdout": "", "stderr": "", "error": None},
+        cell_index=1,
+    )
+    with pytest.raises(CursorCheckpointUnavailable, match="no exact"):
+        service.fork_branch(root, from_cell_id=old_cell)
+
+    (canonical / "state.txt").write_text("at-cell", encoding="utf-8")
+    exact_cell = store.log_cell(
+        frame_id=root,
+        root_frame_id=root,
+        code="state = 'at-cell'",
+        result={"stdout": "", "stderr": "", "error": None},
+        cell_index=2,
+    )
+    checkpoint = service.capture_cursor_checkpoint(
+        root,
+        source_kind="cell",
+        source_id=exact_cell,
+    )
+    assert checkpoint and checkpoint["internal"] is True
+    (canonical / "state.txt").write_text("after-cell", encoding="utf-8")
+
+    fork = service.fork_branch(
+        root,
+        from_cell_id=exact_cell,
+        branch_id="branch-cell",
+    )
+
+    assert fork["from_checkpoint_id"] == checkpoint["checkpoint_id"]
+    assert fork["source_kind"] == "cell"
+    assert fork["active"] is False and fork["view_only"] is True
+    assert (branch_root / "branch-cell" / "state.txt").read_text(
+        encoding="utf-8"
+    ) == "at-cell"
+    assert (canonical / "state.txt").read_text(encoding="utf-8") == "after-cell"
+    store.close()
+
+
+def test_cursor_checkpoint_failure_is_audited_without_fork_claim(tmp_path):
+    store = Store(tmp_path / "openai4s.db")
+    root = store.new_frame(project_id="default", kind="turn", status="ready")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    service = SessionDomainService(
+        store,
+        data_dir=tmp_path,
+        workspace=lambda _root, _branch: workspace,
+    )
+    original_capture = service.cas.capture
+
+    def fail_capture(*_args, **_kwargs):
+        raise OSError("/secret/path/api-key-should-not-enter-ledger")
+
+    service.cas.capture = fail_capture
+    try:
+        result = service.capture_cursor_checkpoint(
+            root,
+            source_kind="message",
+            source_id="message-1",
+        )
+    finally:
+        service.cas.capture = original_capture
+
+    assert result is None
+    assert store.get_session_checkpoint_for_source(
+        root,
+        source_kind="message",
+        source_id="message-1",
+    ) is None
+    groups = store.list_action_groups(root, include_events=True)
+    assert groups[-1]["kind"] == "checkpoint"
+    event = groups[-1]["events"][-1]
+    assert event["type"] == "failed"
+    assert event["canonical_arguments"]["source_kind"] == "message"
+    assert event["canonical_arguments"]["source_id"] == "message-1"
+    assert "/secret/path" not in repr(event)
     store.close()
 
 
@@ -199,10 +301,13 @@ def test_session_domain_composes_checkpoint_branch_timeline_export_and_renderer(
     )
 
     events: list[dict] = []
+    branch_root = tmp_path / "branch-workspaces"
     service = SessionDomainService(
         store,
         data_dir=tmp_path,
-        workspace=lambda _root, _branch: workspace,
+        workspace=lambda _root, branch: (
+            workspace if branch == root else branch_root / branch
+        ),
         event_sink=events.append,
     )
     first = service.create_checkpoint(root, reason="turn_complete")
@@ -227,8 +332,10 @@ def test_session_domain_composes_checkpoint_branch_timeline_export_and_renderer(
         step.get("payload", {}).get("version_id") == artifact["version_id"]
         for step in first["recovery_recipe"]["steps"]
     )
-    assert first["generation_refs"]["python"]["bootstrap"]["version"] == 1
-    assert first["recovery_recipe"]["namespace_coverage"] == "unverified"
+    assert first["generation_refs"]["python"]["bootstrap"]["version"] == 2
+    # A print-only Cell leaves no user namespace state to reconstruct.  The
+    # recipe stays empty rather than manufacturing a manual replay step.
+    assert first["recovery_recipe"]["namespace_coverage"] == "empty"
     active_restore = next(
         item for item in service.recovery_actions(root)["actions"]
         if item["id"] == "restore"

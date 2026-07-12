@@ -27,11 +27,20 @@ class WorkbenchStore(Protocol):
         branch_id: str | None = None,
     ) -> dict | None: ...
 
+    def active_session_branch(self, root_frame_id: str) -> str: ...
+
+    def list_compaction_archives(
+        self, frame_id: str, *, limit: int = 50
+    ) -> list[dict]: ...
+
+    def delegation_tree(self, root_frame_id: str) -> dict: ...
+
 
 StateProvider = Callable[[str], Any | None]
 HistoryProvider = Callable[[str], Sequence[Mapping[str, Any]]]
 LLMConfigProvider = Callable[[Any | None], Any]
 PendingProvider = Callable[[str], Iterable[Mapping[str, Any]]]
+ToolSchemaProvider = Callable[[Any | None], Iterable[Mapping[str, Any]]]
 
 
 class SessionWorkbenchStateService:
@@ -46,6 +55,7 @@ class SessionWorkbenchStateService:
         llm_config_for: LLMConfigProvider,
         pending_for: PendingProvider,
         context_window_fallback: int,
+        tool_schemas_for: ToolSchemaProvider | None = None,
     ) -> None:
         self.store = store
         self._state_for = state_for
@@ -53,6 +63,7 @@ class SessionWorkbenchStateService:
         self._llm_config_for = llm_config_for
         self._pending_for = pending_for
         self._context_window_fallback = max(1, int(context_window_fallback))
+        self._tool_schemas_for = tool_schemas_for or (lambda _state: ())
 
     def context(self, root_frame_id: str) -> dict[str, Any]:
         self._root_frame(root_frame_id)
@@ -60,7 +71,11 @@ class SessionWorkbenchStateService:
         messages = list(getattr(state, "messages", ()) or ())
         if not messages:
             messages = [dict(item) for item in self._history_for(root_frame_id)]
-        estimate = estimate_context(messages)
+        try:
+            tool_schemas = tuple(self._tool_schemas_for(state))
+        except Exception:  # noqa: BLE001 - projection remains available
+            tool_schemas = ()
+        estimate = estimate_context(messages, tool_schemas)
         llm = self._llm_config_for(state)
         token_limit = self._context_window_fallback
         output_reserve = 0
@@ -79,6 +94,15 @@ class SessionWorkbenchStateService:
         except Exception:  # noqa: BLE001 - projection keeps a truthful fallback
             pass
         components = estimate.as_dict()
+        component_names = (
+            "text",
+            "images",
+            "tool_schemas",
+            "tool_calls",
+            "tool_results",
+            "artifact_refs",
+            "wire_state",
+        )
         layers = [
             {
                 "name": name.replace("_", " ").title(),
@@ -87,9 +111,14 @@ class SessionWorkbenchStateService:
                 "status": "active" if components[name] else "empty",
                 "compressed": False,
             }
-            for name in ("text", "images", "tool_calls", "wire_state")
+            for name in component_names
         ]
         handoff = any(bool(message.get("compaction_handoff")) for message in messages)
+        try:
+            archives = self.store.list_compaction_archives(root_frame_id, limit=50)
+        except Exception:  # noqa: BLE001 - old/test stores remain compatible
+            archives = []
+        history = [self._compaction_history(item) for item in archives]
         return {
             "root_frame_id": root_frame_id,
             "token_count": estimate.total,
@@ -97,8 +126,40 @@ class SessionWorkbenchStateService:
             "output_reserve": output_reserve,
             "message_count": len(messages),
             "handoff": handoff,
-            "compressed": handoff,
+            "compressed": handoff or bool(history),
+            "compaction_count": len(history),
+            "compaction_history": history,
             "layers": layers,
+        }
+
+    @staticmethod
+    def _compaction_history(item: Mapping[str, Any]) -> dict[str, Any]:
+        before = item.get("context_before")
+        after = item.get("context_after")
+        refs = item.get("artifact_refs")
+        return {
+            "archive_id": str(item.get("archive_id") or "")[:120],
+            "created_at": int(item.get("created_at") or 0),
+            "branch_id": str(item.get("branch_id") or "")[:120],
+            "ledger_cursor": item.get("ledger_cursor"),
+            "recovery_pointer": item.get("recovery_pointer"),
+            "generation_id": str(item.get("generation_id") or "")[:120],
+            "message_count": int(item.get("n_messages") or 0),
+            "tokens_before": int(before.get("total") or 0)
+            if isinstance(before, Mapping)
+            else 0,
+            "tokens_after": int(after.get("total") or 0)
+            if isinstance(after, Mapping)
+            else 0,
+            "artifact_refs": [
+                {
+                    "artifact_id": str(ref.get("artifact_id") or "")[:120],
+                    "version_id": str(ref.get("version_id") or "")[:120],
+                    "sha256": str(ref.get("sha256") or "")[:64],
+                }
+                for ref in (refs if isinstance(refs, list) else [])[:100]
+                if isinstance(ref, Mapping)
+            ],
         }
 
     def security(self, root_frame_id: str) -> dict[str, Any]:
@@ -132,6 +193,28 @@ class SessionWorkbenchStateService:
                 )
             },
         }
+
+    def delegation(self, root_frame_id: str) -> dict[str, Any]:
+        """Return the durable delegation tree without reviving a child."""
+
+        self._root_frame(root_frame_id)
+        project = getattr(self.store, "delegation_tree", None)
+        if not callable(project):
+            return {
+                "root_frame_id": root_frame_id,
+                "initialized": False,
+                "budget": None,
+                "stats": {
+                    "total": 0,
+                    "pending": 0,
+                    "running": 0,
+                    "done": 0,
+                    "failed": 0,
+                    "stopped": 0,
+                },
+                "children": [],
+            }
+        return project(root_frame_id)
 
     def _root_frame(self, root_frame_id: str) -> dict:
         if not isinstance(root_frame_id, str) or not root_frame_id.strip():
@@ -190,7 +273,9 @@ class SessionWorkbenchStateService:
         if not callable(latest):
             return None
         try:
-            generation = latest(root_frame_id, language)
+            active = getattr(self.store, "active_session_branch", None)
+            branch_id = active(root_frame_id) if callable(active) else root_frame_id
+            generation = latest(root_frame_id, language, branch_id=branch_id)
         except Exception:  # noqa: BLE001 - persistence cannot invent a claim
             return None
         if not isinstance(generation, Mapping):

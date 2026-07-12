@@ -13,10 +13,21 @@ from openai4s.agent.actions import (
     NativeToolBatch,
     NativeToolCall,
 )
-from openai4s.agent.events import ActionRouted, ReplyReceived, TextDelta, TurnStarted
-from openai4s.agent.models import ModelReply, RunState
+from openai4s.agent.events import (
+    ActionRouted,
+    OutcomeProduced,
+    ReplyReceived,
+    TextDelta,
+    TurnStarted,
+)
+from openai4s.agent.models import ExecutionOutcome, ModelReply, RunState
 from openai4s.server import agent_run
-from openai4s.server.agent_run import ProseStreamer, WebActionExecutor, WebEventSink
+from openai4s.server.agent_run import (
+    CodeDraftStreamer,
+    ProseStreamer,
+    WebActionExecutor,
+    WebEventSink,
+)
 
 
 def _native_call(
@@ -119,7 +130,13 @@ def test_web_event_sink_streams_visible_prose_records_usage_and_visible_block():
     )
     sink.emit(ReplyReceived(reply, turn=0))
 
-    assert [event["chunk"] for event in sent] == ["Visible.\n"]
+    assert [event["chunk"] for event in sent if event["type"] == "text_chunk"] == [
+        "Visible.\n"
+    ]
+    drafts = [event for event in sent if event["type"] == "notebook_cell_draft"]
+    assert drafts[-1]["source"] == "print('hidden')\n"
+    assert drafts[-1]["complete"] is True
+    assert drafts[-1]["status"] == "ready"
     assert sink.current_prose == "Visible."
     assert len(visible) == 1
     assert visible[0]["text"] == "Visible."
@@ -140,7 +157,7 @@ def test_web_event_sink_falls_back_when_provider_emits_no_deltas():
     sink.emit(TurnStarted(turn=2))
     sink.emit(ReplyReceived(reply, turn=2))
 
-    assert sent == [
+    assert [event for event in sent if event["type"] == "text_chunk"] == [
         {
             "type": "text_chunk",
             "frame_id": "frame-1",
@@ -150,6 +167,100 @@ def test_web_event_sink_falls_back_when_provider_emits_no_deltas():
     ]
     assert [block["text"] for block in visible] == ["Blocking reply."]
     assert usage == [{"prompt_tokens": 3}]
+
+
+def test_code_draft_streamer_replaces_one_transient_block_and_can_clear_it():
+    sent = []
+    draft = CodeDraftStreamer(sent.append, "frame-1", 7)
+
+    draft.feed("Working.\n```python\nvalue =")
+    draft.feed(" 4")
+    draft.feed("2\n")
+    draft.feed("```\n")
+    draft.clear("executed")
+
+    updates = [event for event in sent if event["type"] == "notebook_cell_draft"]
+    assert {event["draft_id"] for event in updates} == {"draft:frame-1:7"}
+    assert [event["revision"] for event in updates] == sorted(
+        event["revision"] for event in updates
+    )
+    assert updates[-2]["source"] == "value = 42\n"
+    assert updates[-2]["status"] == "ready"
+    assert updates[-1]["status"] == "discarded"
+
+
+def test_code_draft_streamer_throttles_long_multiline_cells():
+    sent = []
+    draft = CodeDraftStreamer(sent.append, "frame-1", 8)
+
+    draft.feed("```python\n")
+    for index in range(400):
+        draft.feed(f"value_{index} = {index}\n")
+    draft.finalize(draft.acc + "```\n")
+
+    updates = [event for event in sent if event["type"] == "notebook_cell_draft"]
+    assert updates[-1]["complete"] is True
+    assert "value_399 = 399" in updates[-1]["source"]
+    # Updating once per streamed line would make total scan and payload volume
+    # quadratic.  The exact count is intentionally loose around the byte step.
+    assert len(updates) < 30
+
+
+def test_code_draft_skips_legacy_tool_fence_and_tracks_later_python_cell():
+    sent = []
+    draft = CodeDraftStreamer(sent.append, "frame-1", 9)
+    content = (
+        "```tool\n"
+        '{"name":"list_dir","arguments":{"path":"."}}\n'
+        "```\n"
+        "```python\nprint('real cell')\n```\n"
+    )
+
+    draft.finalize(content)
+
+    updates = [event for event in sent if event["type"] == "notebook_cell_draft"]
+    assert len(updates) == 1
+    assert updates[0]["language"] == "python"
+    assert updates[0]["source"] == "print('real cell')\n"
+    assert updates[0]["complete"] is True
+
+
+def test_unclosed_model_code_is_visible_only_as_a_discardable_draft():
+    sent = []
+    sink = _event_sink(send=sent)
+
+    sink.emit(TurnStarted(turn=3))
+    sink.emit(TextDelta("```python\nvalue = call(\n", turn=3))
+    reply = ModelReply(content="```python\nvalue = call(\n")
+    sink.emit(ReplyReceived(reply, turn=3))
+    sink.emit(ActionRouted(None, turn=3))
+
+    drafts = [event for event in sent if event["type"] == "notebook_cell_draft"]
+    assert any(event.get("status") == "drafting" for event in drafts)
+    assert drafts[-1]["status"] == "discarded"
+
+
+def test_completion_only_cell_draft_is_cleared_before_hidden_execution():
+    sent = []
+    sink = _event_sink(send=sent)
+    content = (
+        "```python\n"
+        "host.submit_output({'summary': 'done'}, ['Completed it'])\n"
+        "```"
+    )
+    action = CodeCell(
+        "python",
+        "host.submit_output({'summary': 'done'}, ['Completed it'])\n",
+    )
+
+    sink.emit(TurnStarted(turn=4))
+    sink.emit(ReplyReceived(ModelReply(content=content), turn=4))
+    sink.emit(ActionRouted(action, turn=4))
+
+    drafts = [event for event in sent if event["type"] == "notebook_cell_draft"]
+    assert drafts[0]["status"] == "ready"
+    assert drafts[-1]["status"] == "discarded"
+    assert drafts[-1]["reason"] == "not_executed"
 
 
 def test_web_event_sink_narrates_tool_only_action_without_leaking_arguments():
@@ -190,6 +301,30 @@ def test_web_event_sink_does_not_duplicate_real_prose_at_action_boundary():
 
     assert [event["chunk"] for event in sent] == ["I will compute it.\n"]
     assert [block["text"] for block in visible] == ["I will compute it."]
+
+
+def test_web_event_sink_adds_real_post_cell_status_after_intent_prose():
+    sent = []
+    visible = []
+    sink = _event_sink(send=sent, visible=visible)
+    action = CodeCell("python", "print(42)\n")
+    reply = ModelReply(content="I will compute it.\n```python\nprint(42)\n```")
+
+    sink.emit(TurnStarted(turn=0))
+    sink.emit(ReplyReceived(reply, turn=0))
+    sink.emit(ActionRouted(action, turn=0))
+    sink.emit(
+        OutcomeProduced(
+            ExecutionOutcome(observation="[Observation]\nstdout:\n42"), turn=0
+        )
+    )
+
+    assert [block["text"] for block in visible][0] == "I will compute it."
+    assert "1 stdout line(s)" in visible[-1]["text"]
+    assert [event["chunk"] for event in sent if event["type"] == "text_chunk"] == [
+        "I will compute it.\n",
+        "This cell completed successfully with 1 stdout line(s); the actual output is recorded in the Notebook.\n",
+    ]
 
 
 def test_native_batch_returns_canonical_tool_history_and_never_completes(
@@ -315,6 +450,30 @@ def test_code_action_executes_one_cell_and_warns_about_later_cells():
     )
 
 
+def test_code_action_warns_when_a_complete_cell_has_an_incomplete_tail():
+    executed = []
+    executor = _executor(
+        SimpleNamespace(last_output=None),
+        execute_cell=lambda action: (
+            executed.append(action.code)
+            or {"stdout": "first\n", "stderr": "", "error": None, "usage": {}}
+        ),
+    )
+    reply = ModelReply(
+        content=(
+            "```python\nprint('first')\n```\n"
+            "```python\nresult = unfinished(\n"
+        )
+    )
+
+    outcome = executor.execute(
+        CodeCell("python", "print('first')\n"), reply, RunState([])
+    )
+
+    assert executed == ["print('first')\n"]
+    assert MULTI_CELL_NOTE in outcome.observation
+
+
 def test_legacy_fenced_tool_still_executes_and_returns_user_observation(monkeypatch):
     dispatcher = SimpleNamespace(last_output=None)
     applied = []
@@ -376,6 +535,21 @@ def test_empty_reply_uses_no_code_nudge():
     )
 
     assert outcome.observation == NO_CODE_NUDGE
+
+
+def test_web_incomplete_cell_requests_full_replacement_without_execution():
+    executed = []
+    outcome = _executor(
+        SimpleNamespace(last_output=None),
+        execute_cell=lambda action: executed.append(action),
+    ).execute(
+        None,
+        ModelReply(content="```python\nresult = call(\n"),
+        RunState([]),
+    )
+
+    assert outcome.observation == agent_run.INCOMPLETE_CELL_NUDGE
+    assert executed == []
 
 
 def test_plan_mode_refuses_native_calls_without_executing_and_closes_history(

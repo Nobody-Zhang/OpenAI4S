@@ -17,6 +17,7 @@ def _service(tmp_path):
     )
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    branch_root = tmp_path / "branches"
     state = {
         "action_cursor": 0,
         "message_cursor": 0,
@@ -32,7 +33,9 @@ def _service(tmp_path):
     service = SessionBranchingService(
         repository,
         WorkspaceCAS(tmp_path / "cas"),
-        workspace=lambda _root, _branch: workspace,
+        workspace=lambda _root, branch: (
+            workspace if branch == "root" else branch_root / branch
+        ),
         read_state=lambda _root, _branch: state,
         event_sink=events.append,
     )

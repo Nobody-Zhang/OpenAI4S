@@ -17,12 +17,22 @@ from typing import Any, Callable, Protocol
 from openai4s.server.action_timeline import ActionTimelineService
 from openai4s.server.notebook_export import NotebookExportService
 from openai4s.server.recovery_control import RecoveryControlService
+from openai4s.server.recovery_recipe import build_recovery_recipe
 from openai4s.server.renderers import RendererRegistry
 from openai4s.server.session_branching import SessionBranchingService
+from openai4s.server.session_package import (
+    SessionPackageService,
+    session_import_quarantine_key,
+)
+from openai4s.storage.branch_projection import project_branch_records
 from openai4s.storage.snapshots import WorkspaceCAS
 
 WorkspaceResolver = Callable[[str, str], str | Path]
 DomainEventSink = Callable[[dict[str, Any]], None]
+
+
+class CursorCheckpointUnavailable(RuntimeError):
+    """The requested historical boundary has no exact immutable snapshot."""
 
 
 class SessionDomainStore(Protocol):
@@ -35,11 +45,21 @@ class SessionDomainStore(Protocol):
 
     def get_session_checkpoint(self, checkpoint_id: str) -> dict | None: ...
 
+    def get_session_checkpoint_for_source(
+        self, root_frame_id: str, *, source_kind: str, source_id: str
+    ) -> dict | None: ...
+
     def list_session_checkpoints(self, root_frame_id: str, **filters: Any) -> list[dict]: ...
 
     def get_session_branch(self, branch_id: str) -> dict | None: ...
 
     def list_session_branches(self, root_frame_id: str) -> list[dict]: ...
+
+    def ensure_active_session_branch(self, root_frame_id: str) -> str: ...
+
+    def active_session_branch(self, root_frame_id: str) -> str: ...
+
+    def activate_session_branch_checkpoint(self, **fields: Any) -> dict: ...
 
     def record_snapshot_operation(self, **fields: Any) -> dict: ...
 
@@ -56,7 +76,9 @@ class SessionDomainStore(Protocol):
 
     def cell_count(self, root_frame_id: str) -> int: ...
 
-    def list_cells(self, root_frame_id: str) -> list[dict]: ...
+    def list_cells(
+        self, root_frame_id: str, *, branch_id: str | None = None
+    ) -> list[dict]: ...
 
     def list_action_groups(self, root_frame_id: str, **filters: Any) -> list[dict]: ...
 
@@ -86,6 +108,8 @@ class SessionDomainStore(Protocol):
 
     def list_memories(self, project_id: str | None = None, block: str | None = None) -> list[dict]: ...
 
+    def get_setting(self, key: str, default: str | None = None) -> str | None: ...
+
 
 class _SnapshotFacade:
     """Translate Store's explicit facade names to SessionBranching ports."""
@@ -101,6 +125,15 @@ class _SnapshotFacade:
 
     def get_checkpoint(self, checkpoint_id: str) -> dict | None:
         return self.store.get_session_checkpoint(checkpoint_id)
+
+    def get_checkpoint_for_source(
+        self, root_frame_id: str, *, source_kind: str, source_id: str
+    ) -> dict | None:
+        return self.store.get_session_checkpoint_for_source(
+            root_frame_id,
+            source_kind=source_kind,
+            source_id=source_id,
+        )
 
     def list_checkpoints(self, root_frame_id: str, **filters: Any) -> list[dict]:
         return self.store.list_session_checkpoints(root_frame_id, **filters)
@@ -145,6 +178,12 @@ class SessionDomainService:
         )
         self.timeline = ActionTimelineService(store)
         self.notebooks = NotebookExportService(store)
+        self.packages = SessionPackageService(
+            store,
+            data_dir=data_dir,
+            workspace=workspace,
+            cas=self.cas,
+        )
         self.renderers = renderer_registry or RendererRegistry()
 
     # Checkpoints and branches -------------------------------------------------
@@ -155,7 +194,7 @@ class SessionDomainService:
         branch_id: str | None = None,
         limit: int = 100,
     ) -> dict[str, Any]:
-        branch_id = branch_id or root_frame_id
+        branch_id = branch_id or self.store.active_session_branch(root_frame_id)
         return {
             "root_frame_id": root_frame_id,
             "branch_id": branch_id,
@@ -177,11 +216,67 @@ class SessionDomainService:
     ) -> dict:
         return self.branching.create_checkpoint(
             root_frame_id,
-            branch_id=branch_id,
+            branch_id=(
+                branch_id or self.store.active_session_branch(root_frame_id)
+            ),
             reason=reason,
             expected_head=expected_head,
             metadata=metadata,
         )
+
+    def capture_cursor_checkpoint(
+        self,
+        root_frame_id: str,
+        *,
+        source_kind: str,
+        source_id: str,
+        branch_id: str | None = None,
+    ) -> dict | None:
+        """Best-effort snapshot for one exact durable Cell/message boundary.
+
+        A failure is deliberately not promoted to a Cell or message failure.
+        The warning is recorded separately and the missing source mapping keeps
+        every later fork path fail-closed.
+        """
+
+        branch_id = branch_id or self.store.active_session_branch(root_frame_id)
+        current_branch = self.store.active_session_branch(root_frame_id)
+        if branch_id != current_branch:
+            raise ValueError("cursor checkpoints require the current active branch")
+        if source_kind not in {"cell", "message"}:
+            raise ValueError("source_kind must be cell or message")
+        if not isinstance(source_id, str) or not source_id:
+            raise ValueError("source_id must be a non-empty string")
+        try:
+            existing = self.store.get_session_checkpoint_for_source(
+                root_frame_id,
+                source_kind=source_kind,
+                source_id=source_id,
+            )
+            if existing is not None:
+                return existing
+            return self.branching.create_checkpoint(
+                root_frame_id,
+                branch_id=branch_id,
+                reason=f"cursor_{source_kind}",
+                metadata={
+                    "cursor_checkpoint": True,
+                    "source_kind": source_kind,
+                    "source_id": source_id,
+                },
+                source_kind=source_kind,
+                source_id=source_id,
+                internal=True,
+            )
+        except Exception as error:  # noqa: BLE001 - source success is authoritative
+            self._record_cursor_checkpoint_warning(
+                root_frame_id,
+                branch_id=branch_id,
+                source_kind=source_kind,
+                source_id=source_id,
+                error=error,
+            )
+            return None
 
     def branches(self, root_frame_id: str) -> dict[str, Any]:
         # Pure projection: do not create the root branch from a GET. The first
@@ -192,8 +287,14 @@ class SessionDomainService:
             raise KeyError(f"unknown session {root_frame_id!r}")
         if (frame.get("root_frame_id") or root_frame_id) != root_frame_id:
             raise ValueError("branch operations require a root frame")
+        current_branch_id = self.store.active_session_branch(root_frame_id)
         projection = self.branching.projection(root_frame_id)
         branches = projection.get("branches") or []
+        for branch in branches:
+            active = branch.get("branch_id") == current_branch_id
+            branch["active"] = active
+            branch["view_only"] = not active
+            branch["activatable"] = bool(branch.get("head_checkpoint_id"))
         checkpoints = [
             checkpoint
             for branch in branches
@@ -202,7 +303,7 @@ class SessionDomainService:
         has_checkpoint = bool(checkpoints)
         projection.update(
             {
-                "current_branch_id": root_frame_id,
+                "current_branch_id": current_branch_id,
                 "capabilities": {
                     "checkpoint": {"enabled": True, "reason": None},
                     "fork": {
@@ -213,11 +314,10 @@ class SessionDomainService:
                             else "create a checkpoint before forking"
                         ),
                         "source": "checkpoint",
-                        "fork_from_cell": False,
-                        "fork_from_cell_reason": (
-                            "fork-from-cell is not yet supported; create a "
-                            "checkpoint at the desired boundary"
-                        ),
+                        "fork_from_cell": True,
+                        "fork_from_cell_reason": None,
+                        "fork_from_message": True,
+                        "fork_from_message_reason": None,
                     },
                     "revert_preview": {
                         "enabled": has_checkpoint,
@@ -235,6 +335,19 @@ class SessionDomainService:
                             else "create a checkpoint before reverting"
                         ),
                     },
+                    "activate": {
+                        "enabled": any(
+                            branch.get("head_checkpoint_id") for branch in branches
+                        ),
+                        "reason": (
+                            None
+                            if any(
+                                branch.get("head_checkpoint_id")
+                                for branch in branches
+                            )
+                            else "create a checkpoint before activating a branch"
+                        ),
+                    },
                 },
             }
         )
@@ -244,16 +357,137 @@ class SessionDomainService:
         self,
         root_frame_id: str,
         *,
-        from_checkpoint_id: str,
+        from_checkpoint_id: str | None = None,
+        from_cell_id: str | None = None,
+        from_message_id: str | None = None,
         branch_id: str | None = None,
         name: str | None = None,
     ) -> dict:
-        return self.branching.fork(
+        sources = [
+            ("checkpoint", from_checkpoint_id),
+            ("cell", from_cell_id),
+            ("message", from_message_id),
+        ]
+        provided = [(kind, value) for kind, value in sources if value]
+        if len(provided) != 1:
+            raise ValueError(
+                "provide exactly one of from_checkpoint_id, from_cell_id, or "
+                "from_message_id"
+            )
+        source_kind, source_id = provided[0]
+        checkpoint_id = str(source_id)
+        if source_kind != "checkpoint":
+            checkpoint = self.store.get_session_checkpoint_for_source(
+                root_frame_id,
+                source_kind=source_kind,
+                source_id=checkpoint_id,
+            )
+            if checkpoint is None:
+                raise CursorCheckpointUnavailable(
+                    f"{source_kind} has no exact cursor checkpoint"
+                )
+            checkpoint_id = str(checkpoint["checkpoint_id"])
+        result = self.branching.fork(
             root_frame_id,
-            from_checkpoint_id=from_checkpoint_id,
+            from_checkpoint_id=checkpoint_id,
             branch_id=branch_id,
             name=name,
+            source_kind=source_kind,
+            source_id=str(source_id),
         )
+        return {
+            **result,
+            "from_checkpoint_id": checkpoint_id,
+            "source_kind": source_kind,
+            "source_id": str(source_id),
+            "active": False,
+            "view_only": True,
+            "activatable": True,
+        }
+
+    def prepare_activation(
+        self,
+        root_frame_id: str,
+        *,
+        branch_id: str,
+    ) -> dict[str, Any]:
+        """Validate and materialize the exact branch head before publication."""
+
+        branch = self.store.get_session_branch(branch_id)
+        if branch is None or branch.get("root_frame_id") != root_frame_id:
+            raise KeyError(f"unknown branch {branch_id!r} for this session")
+        checkpoint_id = branch.get("head_checkpoint_id")
+        checkpoint = (
+            self.store.get_session_checkpoint(str(checkpoint_id))
+            if checkpoint_id
+            else None
+        )
+        if checkpoint is None or checkpoint.get("branch_id") not in {
+            branch_id,
+            branch.get("parent_branch_id"),
+        }:
+            # A newly forked branch initially points at its parent's immutable
+            # checkpoint. Later heads belong to the branch itself.
+            raise ValueError("branch has no valid head checkpoint")
+        tree_id = checkpoint.get("workspace_tree_id")
+        if not tree_id:
+            raise ValueError("branch head has no workspace snapshot")
+        workspace = Path(self._workspace(root_frame_id, branch_id)).resolve()
+        workspace.mkdir(parents=True, exist_ok=True)
+        preview = self.cas.preview_restore(
+            str(tree_id),
+            workspace,
+            baseline_tree_id=str(tree_id),
+        )
+        if preview.get("conflicts"):
+            raise RuntimeError("branch workspace changed after its head checkpoint")
+        restored = self.cas.restore(
+            str(tree_id),
+            workspace,
+            baseline_tree_id=str(tree_id),
+        )
+        if not restored.get("applied"):
+            raise RuntimeError("branch workspace could not be materialized")
+        return {
+            "root_frame_id": root_frame_id,
+            "branch_id": branch_id,
+            "checkpoint_id": str(checkpoint_id),
+            "checkpoint": checkpoint,
+            "workspace": workspace,
+            "materialized": True,
+            "workspace_preview": {
+                "writes_count": len(preview.get("writes") or ()),
+                "deletes_count": len(preview.get("deletes") or ()),
+                "preserved_untracked_count": len(
+                    preview.get("preserved_untracked") or ()
+                ),
+            },
+        }
+
+    def publish_activation(
+        self,
+        root_frame_id: str,
+        *,
+        branch_id: str,
+        checkpoint_id: str,
+        expected_current_branch_id: str,
+    ) -> dict[str, Any]:
+        result = self.store.activate_session_branch_checkpoint(
+            root_frame_id=root_frame_id,
+            branch_id=branch_id,
+            checkpoint_id=checkpoint_id,
+            expected_current_branch_id=expected_current_branch_id,
+        )
+        self._record_domain_event(
+            {
+                "type": "branch_activated",
+                "root_frame_id": root_frame_id,
+                "branch_id": branch_id,
+                "checkpoint_id": checkpoint_id,
+                "ok": True,
+            }
+        )
+        return result
 
     def revert_preview(
         self,
@@ -264,7 +498,9 @@ class SessionDomainService:
     ) -> dict[str, Any]:
         return self.branching.preview_revert(
             root_frame_id,
-            branch_id=branch_id,
+            branch_id=(
+                branch_id or self.store.active_session_branch(root_frame_id)
+            ),
             target_checkpoint_id=target_checkpoint_id,
         )
 
@@ -275,11 +511,15 @@ class SessionDomainService:
         target_checkpoint_id: str,
         branch_id: str | None = None,
     ) -> dict[str, Any]:
-        return self.branching.revert_and_continue(
+        selected = branch_id or self.store.active_session_branch(root_frame_id)
+        if selected != self.store.active_session_branch(root_frame_id):
+            raise ValueError("revert requires the current active branch")
+        result = self.branching.revert_and_continue(
             root_frame_id,
-            branch_id=branch_id,
+            branch_id=selected,
             target_checkpoint_id=target_checkpoint_id,
         )
+        return self._publish_revert_projection(root_frame_id, selected, result)
 
     def revert_undo(
         self,
@@ -288,11 +528,41 @@ class SessionDomainService:
         revert_checkpoint_id: str,
         branch_id: str | None = None,
     ) -> dict[str, Any]:
-        return self.branching.undo_revert(
+        selected = branch_id or self.store.active_session_branch(root_frame_id)
+        if selected != self.store.active_session_branch(root_frame_id):
+            raise ValueError("undo requires the current active branch")
+        result = self.branching.undo_revert(
             root_frame_id,
-            branch_id=branch_id,
+            branch_id=selected,
             revert_checkpoint_id=revert_checkpoint_id,
         )
+        return self._publish_revert_projection(root_frame_id, selected, result)
+
+    def _publish_revert_projection(
+        self,
+        root_frame_id: str,
+        branch_id: str,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Apply the new revert head's data/policy projection atomically."""
+
+        if not result.get("ok"):
+            return result
+        checkpoint = result.get("checkpoint")
+        checkpoint_id = (
+            str(checkpoint.get("checkpoint_id"))
+            if isinstance(checkpoint, Mapping) and checkpoint.get("checkpoint_id")
+            else ""
+        )
+        if not checkpoint_id:
+            raise RuntimeError("successful revert has no checkpoint identity")
+        projection = self.store.activate_session_branch_checkpoint(
+            root_frame_id=root_frame_id,
+            branch_id=branch_id,
+            checkpoint_id=checkpoint_id,
+            expected_current_branch_id=branch_id,
+        )
+        return {**result, "projection": projection}
 
     def revert_operations(
         self,
@@ -303,25 +573,64 @@ class SessionDomainService:
     ) -> list[dict]:
         return self.store.list_snapshot_operations(
             root_frame_id,
-            branch_id=branch_id,
+            branch_id=(
+                branch_id or self.store.active_session_branch(root_frame_id)
+            ),
             kind="revert",
             limit=limit,
         )
 
     # Read projections ---------------------------------------------------------
     def recovery_status(self, root_frame_id: str, **filters: Any) -> dict[str, Any]:
-        return self.recovery.status(root_frame_id, **filters)
+        if not filters.get("branch_id"):
+            filters["branch_id"] = self.store.active_session_branch(root_frame_id)
+        projection = self.recovery.status(root_frame_id, **filters)
+        if self.store.get_setting(session_import_quarantine_key(root_frame_id)):
+            projection["view_only"] = True
+            projection["trust_state"] = "quarantined"
+            projection["explicit_recovery_required"] = True
+        return projection
 
     def recovery_actions(self, root_frame_id: str, **filters: Any) -> dict[str, Any]:
-        return self.recovery.actions(root_frame_id, **filters)
+        if not filters.get("branch_id"):
+            filters["branch_id"] = self.store.active_session_branch(root_frame_id)
+        projection = self.recovery.actions(root_frame_id, **filters)
+        if self.store.get_setting(session_import_quarantine_key(root_frame_id)):
+            for action in projection.get("actions") or []:
+                if action.get("id") in {"restore", "retry"}:
+                    action["enabled"] = False
+                    action["reason"] = (
+                        "untrusted Session package code cannot be replayed; "
+                        "use an explicitly confirmed fresh restart"
+                    )
+            projection["view_only"] = True
+            projection["trust_state"] = "quarantined"
+            projection["explicit_recovery_required"] = True
+        return projection
 
     def action_timeline(self, root_frame_id: str, **filters: Any) -> dict[str, Any]:
+        if not filters.get("branch_id"):
+            filters["branch_id"] = self.store.active_session_branch(root_frame_id)
         return self.timeline.get(root_frame_id, **filters)
 
     def notebook_export(
         self, root_frame_id: str, *, language: str | None = None
     ) -> dict[str, Any]:
-        return self.notebooks.export(root_frame_id, language=language)
+        return self.notebooks.export(
+            root_frame_id,
+            language=language,
+            branch_id=self.store.active_session_branch(root_frame_id),
+        )
+
+    def session_export(self, root_frame_id: str) -> dict[str, Any]:
+        """Return one deterministic, versioned Session package."""
+
+        return self.packages.export(root_frame_id)
+
+    def session_import(self, data: bytes) -> dict[str, Any]:
+        """Validate an untrusted package and create a new view-only Session."""
+
+        return self.packages.import_bytes(data)
 
     def artifact_renderer(
         self,
@@ -371,7 +680,15 @@ class SessionDomainService:
             include_events=False,
         )
         artifacts = self.store.list_artifacts({"root_frame_id": root_frame_id})
-        cell_cursor = self.store.cell_count(root_frame_id)
+        cells = self._branch_cells(root_frame_id, branch_id)
+        local_cells = self.store.list_cells(root_frame_id, branch_id=branch_id)
+        cell_cursor = max(
+            (
+                int(cell.get("state_revision") or cell.get("cell_index") or 0)
+                for cell in local_cells
+            ),
+            default=0,
+        )
         workspace = Path(self._workspace(root_frame_id, branch_id)).resolve()
         generations = self.store.list_kernel_generations(
             root_frame_id,
@@ -459,6 +776,9 @@ class SessionDomainService:
                 ),
                 default=None,
             ),
+            # This is a physical append boundary, not a visible-row count.
+            # Branch projection interprets it together with branch_id and the
+            # checkpoint graph, so abandoned/reverted messages stay excluded.
             "message_cursor": self.store.message_count(root_frame_id),
             "cell_cursor": cell_cursor,
             "artifact_versions": artifact_versions,
@@ -475,22 +795,11 @@ class SessionDomainService:
             "generation_refs": generation_refs,
             "capability_state": capability_state,
             "permission_state": permission_state,
-            # No Cell is silently promoted to replay-safe here. Runtime code may
-            # add explicitly classified steps before this checkpoint is captured.
-            "recovery_recipe": {
-                "version": 1,
-                "steps": [],
-                "required_symbols": {},
-                "artifact_hashes": artifact_hashes,
-                "environment_requirements": {},
-                # A non-empty Notebook does not prove its in-memory objects can
-                # be reconstructed. Runtime code may replace this with
-                # ``verified`` only after adding explicit safe replay/symbol
-                # validation coverage.
-                "namespace_coverage": (
-                    "unverified" if cell_cursor > 0 else "empty"
-                ),
-            },
+            "recovery_recipe": build_recovery_recipe(
+                cells,
+                generation_refs=generation_refs,
+                artifact_hashes=artifact_hashes,
+            ),
             "metadata": {
                 "project_id": project_id,
                 "plans": plans,
@@ -498,6 +807,22 @@ class SessionDomainService:
                 "state_source": "canonical_store_projection",
             },
         }
+
+    def _branch_cells(self, root_frame_id: str, branch_id: str) -> list[dict]:
+        """Return inherited Cell prefix plus branch-local Cells."""
+        return project_branch_records(
+            self.store,
+            root_frame_id,
+            branch_id,
+            list_local=lambda selected: self.store.list_cells(
+                root_frame_id,
+                branch_id=selected,
+            ),
+            record_position=lambda cell: int(
+                cell.get("state_revision") or cell.get("cell_index") or 0
+            ),
+            cursor_key="cell_cursor",
+        )
 
     def _workspace_tree_exists(self, tree_id: str) -> bool:
         try:
@@ -525,6 +850,33 @@ class SessionDomainService:
             ],
         }
 
+    def _record_cursor_checkpoint_warning(
+        self,
+        root_frame_id: str,
+        *,
+        branch_id: str,
+        source_kind: str,
+        source_id: str,
+        error: Exception,
+    ) -> None:
+        # Exception messages may contain filesystem paths or provider material.
+        # Persist only the exception class; the important audit fact is that no
+        # source mapping was created and therefore no fork is advertised.
+        try:
+            self._record_domain_event(
+                {
+                    "type": "cursor_checkpoint_failed",
+                    "root_frame_id": root_frame_id,
+                    "branch_id": branch_id,
+                    "source_kind": source_kind,
+                    "source_id": source_id,
+                    "reason": f"snapshot capture failed ({type(error).__name__})",
+                    "ok": False,
+                }
+            )
+        except Exception:  # noqa: BLE001 - warning persistence is best-effort too
+            pass
+
     def _record_domain_event(self, event: dict[str, Any]) -> None:
         event_type = str(event.get("type") or "session_event")
         public = {
@@ -535,6 +887,8 @@ class SessionDomainService:
                 "branch_id",
                 "checkpoint_id",
                 "from_checkpoint_id",
+                "source_kind",
+                "source_id",
                 "target_checkpoint_id",
                 "operation_id",
                 "reason",
@@ -562,7 +916,11 @@ class SessionDomainService:
         )
         self.store.append_action_event(
             group_id=group["group_id"],
-            type=("failed" if "conflict" in event_type else "completed"),
+            type=(
+                "failed"
+                if any(token in event_type for token in ("conflict", "failed"))
+                else "completed"
+            ),
             canonical_arguments=public,
             result={"recorded": True, "event": event_type},
             side_effect_class=(
@@ -585,4 +943,8 @@ def _event_kind(event_type: str) -> str:
     return "system"
 
 
-__all__ = ["SessionDomainService", "SessionDomainStore"]
+__all__ = [
+    "CursorCheckpointUnavailable",
+    "SessionDomainService",
+    "SessionDomainStore",
+]

@@ -34,12 +34,15 @@ import time
 import traceback
 import uuid
 import zipfile
+from collections.abc import Mapping
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
+from openai4s.agent.actions import NO_NATIVE_COMPLETION_NUDGE
 from openai4s.agent.engine import AgentEngine
 from openai4s.agent.finalize import with_finalize_response
 from openai4s.agent.ledger import (
@@ -59,11 +62,12 @@ from openai4s.execution import (
 )
 from openai4s.host_dispatch import build_dispatcher
 from openai4s.kernel import Kernel, KernelLease, KernelSupervisor
-from openai4s.llm import ARK_PLAN_MODELS, PROVIDERS, chat
+from openai4s.llm import ARK_PLAN_MODELS, PROVIDERS, chat, get_model_capabilities
 from openai4s.review import review_evidence
 from openai4s.server.agent_run import EventCancellation
 from openai4s.server.agent_run import ProseStreamer as _ProseStreamer
 from openai4s.server.agent_run import WebActionExecutor, WebEventSink
+from openai4s.server.action_timeline import ActionTimelineService
 from openai4s.server.artifacts import ArtifactManager, ArtifactOperationError
 from openai4s.server.cell_run import CellExecutionPorts, CellExecutionService
 from openai4s.server.completions import completion_message, response_language
@@ -72,6 +76,7 @@ from openai4s.server.execution_coordinator import (
     WebExecutionCoordinator,
 )
 from openai4s.server.execution_views import ExecutionViewService
+from openai4s.server.global_views import GlobalResearchViewService
 from openai4s.server.model_discovery import LocalModelDiscoveryService
 
 # Keep the former gateway helper names as compatibility aliases; plan behavior
@@ -91,11 +96,22 @@ from openai4s.server.recovery_runtime import (
     python_runtime_spec,
 )
 from openai4s.server.reviews import ReviewPorts, ReviewService
-from openai4s.server.session_domain import SessionDomainService
+from openai4s.server.session_deletion import SessionDeletionService
+from openai4s.server.session_domain import (
+    CursorCheckpointUnavailable,
+    SessionDomainService,
+)
+from openai4s.server.session_package import (
+    MAX_ARCHIVE_BYTES,
+    SessionPackageError,
+    session_import_quarantine_key,
+)
 from openai4s.server.session_recovery import PROCESS_INSTANCE_ID, SessionRecoveryService
 from openai4s.server.session_runtime import SessionRuntime
+from openai4s.server.skill_sidecars import GenerationSidecarRecorder
 from openai4s.server.skills import SkillCustomizationService
 from openai4s.server.titles import SessionTitleService
+from openai4s.server.variable_inspector import VariableInspectorService
 from openai4s.server.workbench_state import SessionWorkbenchStateService
 from openai4s.skills_loader import SkillLoader
 from openai4s.store import Store, get_store
@@ -106,6 +122,7 @@ os.environ.setdefault("MPLBACKEND", "Agg")  # headless matplotlib for figure cap
 WEBUI_DIR = Path(__file__).resolve().parent / "webui"
 _WATCHDOG_INTERRUPT_GRACE_S = 10.0
 _WATCHDOG_KILL_GRACE_S = 10.0
+_MAX_JSON_BODY_BYTES = MAX_ARCHIVE_BYTES
 
 
 # --------------------------------------------------------------------------- #
@@ -206,6 +223,13 @@ def _ws_read_frame(rfile) -> tuple[int, bytes] | None:
         return None
 
 
+_WS_RESUME_BUFFER_CAP = 4000
+_WS_RESUME_BUFFER_BYTE_CAP = 8 * 1024 * 1024
+_WS_REPLAY_ENVELOPE_EVENTS = 2  # replay_begin + replay_end
+_WS_REPLAY_QUEUE_HEADROOM = 128
+_WS_REPLAY_QUEUE_BYTE_HEADROOM = 2 * 1024 * 1024
+
+
 class WSConnection:
     """A WS client. Sends are DECOUPLED from producers: `send_json`/`send_raw`
     only enqueue (never block), and a dedicated writer thread drains the queue to
@@ -214,22 +238,46 @@ class WSConnection:
     that would hang the whole turn ("runs but never returns"). Here the turn
     thread never blocks: if a slow client's backlog overflows we simply drop it."""
 
-    _QUEUE_CAP = 3000  # per-client outbound backlog (one turn's stream fits easily)
+    # A reconnect enqueues one complete resume snapshot atomically.  Keep the
+    # outbound queue strictly larger than that snapshot plus its begin/end
+    # envelope, with a little room for the execution/approval projections that
+    # immediately follow subscription.
+    _QUEUE_CAP = (
+        _WS_RESUME_BUFFER_CAP
+        + _WS_REPLAY_ENVELOPE_EVENTS
+        + _WS_REPLAY_QUEUE_HEADROOM
+    )
+    _QUEUE_BYTE_CAP = (
+        _WS_RESUME_BUFFER_BYTE_CAP + _WS_REPLAY_QUEUE_BYTE_HEADROOM
+    )
 
     def __init__(self, wfile) -> None:
         self.wfile = wfile
         self.subs: set[str] = set()
         self.alive = True
         self._q: "queue.Queue" = queue.Queue(maxsize=self._QUEUE_CAP)
+        self._q_budget_lock = threading.Lock()
+        self._queued_bytes = 0
         self._writer = threading.Thread(target=self._drain, daemon=True)
         self._writer.start()
 
     def _enqueue(self, frame: bytes) -> None:
-        if not self.alive:
-            return
-        try:
-            self._q.put_nowait(frame)
-        except queue.Full:
+        size = len(frame)
+        overflow = False
+        with self._q_budget_lock:
+            if not self.alive:
+                return
+            if size > self._QUEUE_BYTE_CAP or (
+                self._queued_bytes + size > self._QUEUE_BYTE_CAP
+            ):
+                overflow = True
+            else:
+                try:
+                    self._q.put_nowait(frame)
+                    self._queued_bytes += size
+                except queue.Full:
+                    overflow = True
+        if overflow:
             self._drop()  # slow client — never block the producer (turn thread)
 
     def send_json(self, obj: dict) -> None:
@@ -239,16 +287,20 @@ class WSConnection:
         self._enqueue(_ws_encode(payload, opcode))
 
     def _drop(self) -> None:
-        """Mark dead + wake the writer to exit (best-effort make room for None)."""
-        self.alive = False
-        try:
-            self._q.get_nowait()
-        except queue.Empty:
-            pass
-        try:
-            self._q.put_nowait(None)
-        except queue.Full:
-            pass
+        """Mark dead, discard its backlog, and wake the writer exactly once."""
+
+        with self._q_budget_lock:
+            self.alive = False
+            while True:
+                try:
+                    self._q.get_nowait()
+                except queue.Empty:
+                    break
+            self._queued_bytes = 0
+            try:
+                self._q.put_nowait(None)
+            except queue.Full:  # pragma: no cover - queue was drained above
+                pass
 
     def close(self) -> None:
         self._drop()
@@ -262,8 +314,12 @@ class WSConnection:
                 self.wfile.write(frame)
                 self.wfile.flush()
             except (OSError, ValueError):
-                self.alive = False
+                self._drop()
                 break
+            with self._q_budget_lock:
+                # Count the frame until socket write+flush succeeds: a writer
+                # blocked in the OS is still outbound backlog, not free budget.
+                self._queued_bytes = max(0, self._queued_bytes - len(frame))
 
 
 class WSHub:
@@ -273,7 +329,10 @@ class WSHub:
     after every client disconnects (fire-and-forget MessageJob), and the buffer
     lets a reconnecting client resume the live view."""
 
-    _BUFFER_CAP = 4000  # max events retained per frame (one turn's worth)
+    _BUFFER_CAP = _WS_RESUME_BUFFER_CAP  # max events retained per live frame
+    _BUFFER_BYTE_CAP = _WS_RESUME_BUFFER_BYTE_CAP
+    _MAX_MERGED_CHUNK_CHARS = 1_000_000
+    _MAX_RESUME_FIELD_CHARS = 1_000_000
 
     def __init__(self) -> None:
         self._conns: set[WSConnection] = set()
@@ -289,22 +348,184 @@ class WSHub:
         with self._lock:
             self._conns.discard(c)
 
+    def subscribe(self, root_frame_id: str, conn: "WSConnection") -> None:
+        """Subscribe and enqueue any live replay as one ordered transaction.
+
+        ``broadcast`` uses the same lock while enqueueing.  A newly arriving
+        chunk therefore lands either wholly before this subscription (and is
+        included in the snapshot) or wholly after ``replay_end``; it can never
+        be interleaved into the replay stream.
+        """
+
+        with self._lock:
+            conn.subs.add(root_frame_id)
+            buf = self._live.get(root_frame_id)
+            if buf and buf.get("running") and buf.get("events"):
+                self._enqueue_replay_locked(root_frame_id, conn, buf["events"])
+
+    def unsubscribe(self, root_frame_id: str, conn: "WSConnection") -> None:
+        with self._lock:
+            conn.subs.discard(root_frame_id)
+
     _MAX_LIVE_FRAMES = 64  # bound the resume-buffer dict (memory leak otherwise)
 
     def _evict_live(self) -> None:
-        # drop oldest NON-running frame buffers once we exceed the cap
-        while len(self._live) > self._MAX_LIVE_FRAMES:
+        """Enforce a hard frame count, preferring completed buffers first."""
+
+        cap = max(0, int(self._MAX_LIVE_FRAMES))
+        while len(self._live) > cap:
             victim = next(
                 (k for k, v in self._live.items() if not v.get("running")), None
             )
             if victim is None:
-                break  # everything is running — leave them
+                # A resume window is a cache, not execution ownership.  Under a
+                # true all-running flood, discard the oldest window rather than
+                # letting the daemon grow without bound; the turn itself keeps
+                # running and durable state remains available after completion.
+                victim = next(iter(self._live), None)
+            if victim is None:
+                break
             self._live.pop(victim, None)
+
+    def _install_live_buffer(self, rid: str, buf: dict) -> dict:
+        # Replacing an older turn for the same frame makes it newest for hard
+        # eviction order; assigning an existing dict key alone would not.
+        self._live.pop(rid, None)
+        self._live[rid] = buf
+        self._evict_live()
+        return buf
 
     def drop_frame(self, rid: str) -> None:
         """Forget a frame's resume buffer (called when a frame/project is deleted)."""
         with self._lock:
             self._live.pop(rid, None)
+
+    @staticmethod
+    def _event_wire_size(obj: dict) -> int:
+        """Exact unmasked server-frame bytes for this event's JSON encoding."""
+
+        payload_size = len(
+            json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        )
+        if payload_size < 126:
+            header_size = 2
+        elif payload_size <= 0xFFFF:
+            header_size = 4
+        else:
+            header_size = 10
+        return header_size + payload_size
+
+    def _prepare_live_event(self, obj: dict) -> tuple[dict, int]:
+        """Bound large public string fields, then measure the event once."""
+
+        prepared = obj
+        for key in ("chunk", "source", "stdout", "stderr", "error"):
+            value = prepared.get(key)
+            if (
+                not isinstance(value, str)
+                or len(value) <= self._MAX_RESUME_FIELD_CHARS
+            ):
+                continue
+            if prepared is obj:
+                prepared = dict(obj)
+            prepared[key] = (
+                value[: self._MAX_RESUME_FIELD_CHARS]
+                + "\n...(resume field truncated)"
+            )
+
+        size = self._event_wire_size(prepared)
+        if size <= self._BUFFER_BYTE_CAP:
+            return prepared, size
+
+        # Nested step/plan payloads can still exceed the frame budget after
+        # direct strings are bounded.  Preserve only routing/protocol identity;
+        # durable REST projections remain the source for their full payload.
+        identity_keys = (
+            "type",
+            "frame_id",
+            "root_frame_id",
+            "producing_cell_id",
+            "cell_id",
+            "draft_id",
+            "revision",
+            "cell_index",
+            "stream",
+            "block_type",
+            "status",
+            "language",
+            "origin",
+        )
+        prepared = {
+            key: prepared[key] for key in identity_keys if key in prepared
+        }
+        prepared["resume_truncated"] = True
+        size = self._event_wire_size(prepared)
+        return prepared, size
+
+    def _new_live_buffer(
+        self,
+        events: list[dict],
+        *,
+        scope: str,
+    ) -> dict:
+        prepared: list[dict] = []
+        sizes: list[int] = []
+        for event in events:
+            bounded, size = self._prepare_live_event(event)
+            prepared.append(bounded)
+            sizes.append(size)
+        return {
+            "events": prepared,
+            "event_sizes": sizes,
+            "event_bytes": sum(sizes),
+            "running": True,
+            "active_cells": {},
+            "active_cell_sizes": {},
+            "scope": scope,
+        }
+
+    def _ensure_live_accounting(self, buf: dict) -> None:
+        events = buf.setdefault("events", [])
+        sizes = buf.get("event_sizes")
+        if not isinstance(sizes, list) or len(sizes) != len(events):
+            sizes = [self._event_wire_size(event) for event in events]
+            buf["event_sizes"] = sizes
+            buf["event_bytes"] = sum(sizes)
+        elif not isinstance(buf.get("event_bytes"), int):
+            buf["event_bytes"] = sum(sizes)
+        buf.setdefault("active_cell_sizes", {})
+
+    def _append_live_event(self, buf: dict, obj: dict) -> tuple[dict, int]:
+        self._ensure_live_accounting(buf)
+        event, size = self._prepare_live_event(obj)
+        buf["events"].append(event)
+        buf["event_sizes"].append(size)
+        buf["event_bytes"] += size
+        return event, size
+
+    def _replace_live_event(self, buf: dict, index: int, obj: dict) -> tuple[dict, int]:
+        self._ensure_live_accounting(buf)
+        if index < 0:
+            index += len(buf["events"])
+        event, size = self._prepare_live_event(obj)
+        previous_size = buf["event_sizes"][index]
+        buf["events"][index] = event
+        buf["event_sizes"][index] = size
+        buf["event_bytes"] += size - previous_size
+        return event, size
+
+    def _remove_live_events(self, buf: dict, predicate) -> None:
+        self._ensure_live_accounting(buf)
+        kept_events: list[dict] = []
+        kept_sizes: list[int] = []
+        for event, size in zip(buf["events"], buf["event_sizes"]):
+            if predicate(event):
+                continue
+            kept_events.append(event)
+            kept_sizes.append(size)
+        buf["events"] = kept_events
+        buf["event_sizes"] = kept_sizes
+        buf["event_bytes"] = sum(kept_sizes)
 
     def _record(self, rid: str, obj: dict) -> None:
         t = obj.get("type")
@@ -316,8 +537,10 @@ class WSHub:
         buf = self._live.get(rid)
         if t == "text_reset":
             # a new turn begins — start a fresh buffer
-            self._live[rid] = {"events": [obj], "running": True}
-            self._evict_live()
+            self._install_live_buffer(
+                rid,
+                self._new_live_buffer([obj], scope="turn"),
+            )
             return
         if (
             t == "frame_update"
@@ -327,15 +550,146 @@ class WSHub:
             # A manual Reviewer (or another activity without a text stream)
             # starts after the prior turn's buffer has ended. Give it a fresh
             # resume window so reconnecting clients can replay its step events.
-            self._live[rid] = {"events": [obj], "running": True}
-            self._evict_live()
+            self._install_live_buffer(
+                rid,
+                self._new_live_buffer([obj], scope="turn"),
+            )
             return
-        if buf is None:
-            # a turn already in flight before we saw its reset (or a stray
-            # event) — start buffering from here so late joiners still resume
-            buf = self._live[rid] = {"events": [], "running": True}
+        if t == "notebook_cell_start" and (
+            buf is None or not buf.get("running")
+        ):
+            # User-REPL/lifecycle execution has no Agent text_reset.  Its
+            # structured Cell start is nevertheless an explicit live boundary,
+            # and the matching finish closes this cell-scoped resume window.
+            buf = self._install_live_buffer(
+                rid,
+                self._new_live_buffer([], scope="cell"),
+            )
+        elif buf is None:
+            # Idle kernel status, metadata PATCHes and terminal frame updates
+            # are broadcast-only state deltas.  Treating an arbitrary stray
+            # event as a live turn creates a phantom running session that can
+            # never receive a matching terminal marker.
+            return
+
+        # CellExecutionService emits each stdout write twice: once as the
+        # structured Notebook chunk, then immediately as a legacy tool-text
+        # echo for the chat activity card.  A replay needs both projections,
+        # but not thousands of tiny duplicate events.  Coalesce the adjacent
+        # pair into one bounded Notebook chunk and one bounded activity chunk.
+        # The one-shot signature makes this fail safe: any intervening event
+        # clears it, so unrelated text is never merged merely because its bytes
+        # happen to match.
+        pending_echo = buf.pop("pending_cell_tool_echo", None)
+        coalescible_pair = buf.pop("coalescible_cell_pair", None)
+        if (
+            t == "text_chunk"
+            and obj.get("block_type") == "tool"
+            and pending_echo is not None
+            and (pending_echo[0], pending_echo[2])
+            == (self._cell_event_id(obj), obj.get("chunk"))
+        ):
+            previous = buf["events"][-1] if buf["events"] else None
+            if self._is_cell_tool_echo(previous, pending_echo[0]):
+                self._replace_live_event(
+                    buf,
+                    -1,
+                    {
+                        **previous,
+                        "chunk": self._merge_resume_chunk(
+                            previous.get("chunk", ""), obj.get("chunk", "")
+                        ),
+                    },
+                )
+            else:
+                self._append_live_event(buf, obj)
+            buf["coalescible_cell_pair"] = (pending_echo[0], pending_echo[1])
+            self._trim_live_events(buf)
+            return
+
+        if t == "notebook_cell_draft":
+            # A draft is replace-in-place UI state, not an append-only Cell.
+            # Keep only its newest revision so reconnect replay cannot render a
+            # ladder of partial model tokens.
+            draft_id = obj.get("draft_id")
+            self._remove_live_events(
+                buf,
+                lambda event: (
+                    event.get("type") == "notebook_cell_draft"
+                    and event.get("draft_id") == draft_id
+                ),
+            )
+            self._append_live_event(buf, obj)
+            self._trim_live_events(buf)
+            return
+        if t == "notebook_cell_chunk":
+            cell_id = self._cell_event_id(obj)
+            chunk = obj.get("chunk")
+            if cell_id and isinstance(chunk, str):
+                buf["pending_cell_tool_echo"] = (
+                    cell_id,
+                    obj.get("stream", "stdout"),
+                    chunk,
+                )
+            previous = buf["events"][-1] if buf["events"] else None
+            pair_chunk_index = None
+            if (
+                coalescible_pair == (cell_id, obj.get("stream", "stdout"))
+                and self._is_cell_tool_echo(previous, cell_id)
+                and len(buf["events"]) >= 2
+            ):
+                candidate = buf["events"][-2]
+                if (
+                    candidate.get("type") == "notebook_cell_chunk"
+                    and self._cell_event_id(candidate) == cell_id
+                    and candidate.get("stream", "stdout")
+                    == obj.get("stream", "stdout")
+                ):
+                    pair_chunk_index = len(buf["events"]) - 2
+            if (
+                previous
+                and previous.get("type") == "notebook_cell_chunk"
+                and self._cell_event_id(previous) == cell_id
+                and previous.get("stream", "stdout")
+                == obj.get("stream", "stdout")
+                and isinstance(previous.get("chunk"), str)
+                and isinstance(chunk, str)
+            ):
+                self._replace_live_event(
+                    buf,
+                    -1,
+                    {
+                        **previous,
+                        "chunk": self._merge_resume_chunk(
+                            previous["chunk"], chunk
+                        ),
+                    },
+                )
+            elif pair_chunk_index is not None and isinstance(chunk, str):
+                paired = buf["events"][pair_chunk_index]
+                self._replace_live_event(
+                    buf,
+                    pair_chunk_index,
+                    {
+                        **paired,
+                        "chunk": self._merge_resume_chunk(
+                            paired.get("chunk", ""), chunk
+                        ),
+                    },
+                )
+            else:
+                self._append_live_event(buf, obj)
+            self._trim_live_events(buf)
+            return
+
+        cell_id = self._cell_event_id(obj)
+        if t == "notebook_cell_finished" and cell_id:
+            buf.setdefault("active_cells", {}).pop(cell_id, None)
+            buf.setdefault("active_cell_sizes", {}).pop(cell_id, None)
         if t in (
             "text_chunk",
+            "notebook_cell_start",
+            "notebook_cell_finished",
             "kernel_status",
             "artifact_created",
             "step",
@@ -346,13 +700,33 @@ class WSHub:
             "execution_queue",
             "execution_owner",
         ):
-            buf["events"].append(obj)
-            if len(buf["events"]) > self._BUFFER_CAP:
-                # keep the reset marker (index 0) + the newest tail
-                head = buf["events"][:1]
-                buf["events"] = head + buf["events"][-(self._BUFFER_CAP - 1) :]
+            event, size = self._append_live_event(buf, obj)
+            if t == "notebook_cell_start" and cell_id:
+                buf.setdefault("active_cells", {})[cell_id] = event
+                buf.setdefault("active_cell_sizes", {})[cell_id] = size
+            self._trim_live_events(buf)
+            if (
+                t == "notebook_cell_finished"
+                and buf.get("scope") == "cell"
+                and not buf.get("active_cells")
+            ):
+                buf["running"] = False
+            elif buf.get("scope") == "cell" and (
+                (
+                    t == "execution_state"
+                    and obj.get("status") in {"completed", "failed", "cancelled"}
+                )
+                or (t == "execution_owner" and not obj.get("owner"))
+            ):
+                # A preparation/projection failure can occur after Cell start
+                # but before notebook_cell_finished.  The execution coordinator
+                # is the authoritative fallback terminal boundary.
+                buf.setdefault("active_cells", {}).clear()
+                buf.setdefault("active_cell_sizes", {}).clear()
+                buf["running"] = False
         elif t == "frame_update":
-            buf["events"].append(obj)
+            self._append_live_event(buf, obj)
+            self._trim_live_events(buf)
             if obj.get("status") in (
                 "completed",
                 "done",
@@ -363,14 +737,120 @@ class WSHub:
             ):
                 buf["running"] = False
 
+    @staticmethod
+    def _cell_event_id(obj: dict) -> str | None:
+        value = obj.get("producing_cell_id") or obj.get("cell_id")
+        return str(value) if value not in (None, "") else None
+
+    @classmethod
+    def _is_cell_tool_echo(cls, obj: dict | None, cell_id: str | None) -> bool:
+        return bool(
+            obj
+            and cell_id
+            and obj.get("type") == "text_chunk"
+            and obj.get("block_type") == "tool"
+            and cls._cell_event_id(obj) == cell_id
+            and isinstance(obj.get("chunk"), str)
+        )
+
+    @classmethod
+    def _merge_resume_chunk(cls, previous: str, chunk: str) -> str:
+        merged = str(previous or "") + str(chunk or "")
+        if len(merged) <= cls._MAX_MERGED_CHUNK_CHARS:
+            return merged
+        return (
+            merged[: cls._MAX_MERGED_CHUNK_CHARS]
+            + "\n...(resume output truncated)"
+        )
+
+    def _trim_live_events(self, buf: dict) -> None:
+        """Bound event count and wire bytes while retaining replay anchors."""
+
+        self._ensure_live_accounting(buf)
+        events = buf["events"]
+        sizes = buf["event_sizes"]
+        count_cap = max(1, int(self._BUFFER_CAP))
+        byte_cap = max(1, int(self._BUFFER_BYTE_CAP))
+        if len(events) <= count_cap and buf["event_bytes"] <= byte_cap:
+            return
+
+        head_events = events[:1] if events and events[0].get("type") == "text_reset" else []
+        head_sizes = sizes[:1] if head_events else []
+        count_room = count_cap - len(head_events)
+        byte_room = byte_cap - sum(head_sizes)
+        active = list((buf.get("active_cells") or {}).items())
+        active_sizes = buf.get("active_cell_sizes") or {}
+
+        # Keep the newest active starts that fit.  In normal operation there is
+        # one FIFO execution owner, but this remains bounded under malformed or
+        # future multi-runtime producers.
+        selected_active_reversed: list[tuple[str, dict, int]] = []
+        if count_room > 0 and byte_room > 0:
+            for cell_id, event in reversed(active):
+                size = int(active_sizes.get(cell_id) or self._event_wire_size(event))
+                if len(selected_active_reversed) >= count_room:
+                    break
+                if size > byte_room:
+                    continue
+                selected_active_reversed.append((cell_id, event, size))
+                byte_room -= size
+        selected_active = list(reversed(selected_active_reversed))
+        active_ids = {cell_id for cell_id, _event, _size in selected_active}
+        unselected_active_ids = {
+            cell_id for cell_id, _event in active if cell_id not in active_ids
+        }
+        start_events = [event for _cell_id, event, _size in selected_active]
+        start_sizes = [size for _cell_id, _event, size in selected_active]
+        count_room -= len(start_events)
+
+        # Once a Cell is active, older completed activity is less useful than a
+        # valid start-before-chunk protocol for that Cell.  Tail selection is
+        # therefore anchored after the earliest retained active start.
+        start_positions = [
+            index
+            for index, event in enumerate(events)
+            if event.get("type") == "notebook_cell_start"
+            and self._cell_event_id(event) in active_ids
+        ]
+        tail_offset = (
+            min(start_positions) + 1
+            if start_positions
+            else len(head_events)
+        )
+        tail_source = [
+            (event, size)
+            for event, size in zip(events[tail_offset:], sizes[tail_offset:])
+            if not (
+                (
+                    event.get("type") == "notebook_cell_start"
+                    and self._cell_event_id(event) in active_ids
+                )
+                or self._cell_event_id(event) in unselected_active_ids
+            )
+        ]
+        tail_reversed: list[tuple[dict, int]] = []
+        if count_room > 0 and byte_room > 0:
+            for event, size in reversed(tail_source):
+                if len(tail_reversed) >= count_room or size > byte_room:
+                    break
+                tail_reversed.append((event, size))
+                byte_room -= size
+        tail = list(reversed(tail_reversed))
+
+        buf["events"] = head_events + start_events + [event for event, _ in tail]
+        buf["event_sizes"] = head_sizes + start_sizes + [size for _, size in tail]
+        buf["event_bytes"] = sum(buf["event_sizes"])
+
     def broadcast(self, root_frame_id: str | None, obj: dict) -> None:
         with self._lock:
             if root_frame_id:
                 self._record(root_frame_id, obj)
-            conns = list(self._conns)
-        for c in conns:
-            if c.alive and (root_frame_id is None or root_frame_id in c.subs):
-                c.send_json(obj)
+            # ``send_json`` only performs JSON encoding + a non-blocking queue
+            # put.  Keeping enqueue under the hub lock makes its order atomic
+            # with subscribe/replay without coupling producers to socket I/O.
+            for c in tuple(self._conns):
+                if c.alive and (root_frame_id is None or root_frame_id in c.subs):
+                    c.send_json(obj)
 
     def is_running(self, root_frame_id: str) -> bool:
         with self._lock:
@@ -389,11 +869,16 @@ class WSHub:
         with self._lock:
             buf = self._live.get(root_frame_id)
             events = list(buf["events"]) if buf else []
-        if not events:
-            return
+            if events:
+                self._enqueue_replay_locked(root_frame_id, conn, events)
+
+    @staticmethod
+    def _enqueue_replay_locked(
+        root_frame_id: str, conn: "WSConnection", events: list[dict]
+    ) -> None:
         conn.send_json({"type": "replay_begin", "root_frame_id": root_frame_id})
-        for e in events:
-            conn.send_json(e)
+        for event in events:
+            conn.send_json(event)
         conn.send_json({"type": "replay_end", "root_frame_id": root_frame_id})
 
     def emitter(self, root_frame_id: str):
@@ -414,18 +899,21 @@ class SessionState:
         project_id: str,
         workspace: Path,
         *,
+        branch_id: str | None = None,
         kernel_generations=None,
         owner_instance_id: str | None = None,
         clock_ms=None,
     ):
         self.root_frame_id = root_frame_id
         self.project_id = project_id
+        self.branch_id = branch_id or root_frame_id
         self.workspace = workspace
         # One owner for both persistent execution channels.  ``Kernel`` keeps
         # sole ownership of protocol I/O; the supervisor only coordinates
         # lifecycle and exact-worker identity across cancellation/watchdogs.
         self.kernels = KernelSupervisor(
             root_frame_id=root_frame_id,
+            branch_id=self.branch_id,
             generations=kernel_generations,
             owner_instance_id=owner_instance_id,
             clock_ms=clock_ms,
@@ -901,10 +1389,30 @@ _EXPLORE_NUDGE = (
 )
 
 _SUBMIT_NUDGE = (
-    "[system] Prose is not a completion signal. Continue with the next "
-    "```python step, or, if the task is complete, run one final ```python "
-    "cell that calls host.submit_output(...)."
+    "[system] Prose is not a completion signal. If this conversational or "
+    "tool-only task is complete, call finalize_response as the ONLY native "
+    "tool call on the next turn; do NOT start a Python/R kernel merely to "
+    "finish. If scientific runtime work is still required, continue with one "
+    "complete ```python or ```r cell, and finish that scientific work with "
+    "host.submit_output(...)."
 )
+
+def _submit_nudge_for(llm_cfg) -> str:
+    """Choose a completion route the configured endpoint can actually emit."""
+
+    try:
+        capabilities = get_model_capabilities(
+            getattr(llm_cfg, "provider", ""),
+            getattr(llm_cfg, "model", ""),
+            base_url=getattr(llm_cfg, "base_url", ""),
+        )
+    except Exception:  # noqa: BLE001 - preserve compatible provider behavior
+        return _SUBMIT_NUDGE
+    return (
+        _SUBMIT_NUDGE
+        if capabilities.tool_calling
+        else NO_NATIVE_COMPLETION_NUDGE
+    )
 
 
 class SessionRunner:
@@ -926,6 +1434,7 @@ class SessionRunner:
         self._jobs: dict[str, MessageJob] = {}
         self._lock = threading.Lock()
         self._closed = False
+        self._deleting_projects: set[str] = set()
         self.executions = WebExecutionCoordinator(
             lambda root_frame_id, event: self.hub.emitter(root_frame_id)(event),
             clock=self._clock,
@@ -968,7 +1477,7 @@ class SessionRunner:
         self.artifacts = ArtifactManager(
             data_dir=cfg.data_dir,
             store=self.store,
-            workspace_for=self.workspace_for,
+            workspace_for=self.active_workspace_for,
             broadcast=getattr(
                 self.hub,
                 "broadcast",
@@ -986,15 +1495,34 @@ class SessionRunner:
                 event
             ),
         )
+        self.deletions = SessionDeletionService(
+            self.store,
+            data_dir=self.cfg.data_dir,
+            cas=self.session_domain.cas,
+            drop_runtime=lambda root_frame_id, reason: self.drop_session(
+                root_frame_id, reason=reason
+            ),
+            drop_resume_window=getattr(
+                self.hub, "drop_frame", lambda _root_frame_id: None
+            ),
+        )
+        self.sidecar_manifests = GenerationSidecarRecorder(self.store)
         self.workbench = SessionWorkbenchStateService(
             self.store,
             state_for=self._existing_state,
             history_for=lambda root_frame_id: restore_action_history(
-                self.store, root_frame_id
+                self.store,
+                root_frame_id,
+                branch_id=self.store.active_session_branch(root_frame_id),
             ),
             llm_config_for=lambda state: self._llm_cfg(state),
             pending_for=self._pending_permissions,
             context_window_fallback=self.cfg.context_window_tokens,
+            tool_schemas_for=lambda state: (
+                state.dispatcher.tool_catalog().specs_for(state.messages)
+                if state is not None and state.dispatcher is not None
+                else ()
+            ),
         )
         self.plans = PlanService(
             store=self.store,
@@ -1033,11 +1561,12 @@ class SessionRunner:
                         language=request.language,
                         lease=lease,
                         cell_id=cell_id,
+                        action_group_id=request.action_group_id,
                     )
                 ),
                 capture=self._capture_artifacts,
                 emit_artifact_step=self._emit_artifact_step,
-                record_cell=self.store.log_cell,
+                record_cell=self._record_cell_with_cursor_checkpoint,
                 allocate_attempt=self._allocate_cell_attempt,
                 bind_attempt_generation=self._bind_cell_attempt_generation,
                 mark_attempt_started=lambda attempt_id: (
@@ -1070,6 +1599,14 @@ class SessionRunner:
             clock=self._clock,
         )
         self.recovery.reconcile_startup()
+        self.variables = VariableInspectorService(
+            state_for=self._existing_state,
+            execution_snapshot=self.executions.snapshot,
+            recovering=self.recovery.is_recovering,
+            latest_generation=self.store.latest_kernel_generation,
+            latest_state_revision=self.store.latest_state_revision,
+            active_branch=self.store.active_session_branch,
+        )
         if start_idle_sweeper:
             self.recovery.start()
 
@@ -1088,6 +1625,15 @@ class SessionRunner:
         workspace = self._ws_root / ".branches" / root_key / branch_key
         workspace.mkdir(parents=True, exist_ok=True)
         return workspace
+
+    def active_workspace_for(self, root_frame_id: str) -> Path:
+        """Resolve the live workspace without guessing the canonical branch."""
+
+        state = self._existing_state(root_frame_id)
+        if state is not None:
+            return state.workspace
+        branch_id = self.store.active_session_branch(root_frame_id)
+        return self.workspace_for_branch(root_frame_id, branch_id)
 
     def _existing_state(self, root_frame_id: str) -> SessionState | None:
         with self._lock:
@@ -1206,7 +1752,7 @@ class SessionRunner:
                 st.root_frame_id,
                 owner="recovery",
                 owner_id=f"idle-{uuid.uuid4().hex[:12]}",
-                branch_id=st.root_frame_id,
+                branch_id=st.branch_id,
                 resource_keys=("workspace", "kernel:python", "kernel:r"),
                 metadata={"reason": reason},
             )
@@ -1291,6 +1837,37 @@ class SessionRunner:
             pass
         return True
 
+    def delete_session(self, root_frame_id: str) -> dict[str, Any]:
+        return self.deletions.delete_session(root_frame_id)
+
+    def create_session(
+        self, project_id: str, *, model: str | None = None
+    ) -> str:
+        """Create a root frame atomically with project-deletion admission."""
+
+        with self._lock:
+            if project_id in self._deleting_projects:
+                raise GatewayError(409, "project deletion is in progress")
+            if self.store.get_project(project_id) is None:
+                raise GatewayError(404, "project not found")
+            return self.store.new_frame(
+                kind="turn",
+                project_id=project_id,
+                model=model,
+                status="ready",
+            )
+
+    def delete_project(self, project_id: str) -> dict[str, Any]:
+        with self._lock:
+            if project_id in self._deleting_projects:
+                raise GatewayError(409, "project deletion is already in progress")
+            self._deleting_projects.add(project_id)
+        try:
+            return self.deletions.delete_project(project_id)
+        finally:
+            with self._lock:
+                self._deleting_projects.discard(project_id)
+
     def close(self) -> None:
         """Stop the sweeper, turns, background workers, and all session slots."""
 
@@ -1368,7 +1945,32 @@ class SessionRunner:
                 st.kernels.stop(
                     "r", manual=False, reason="branch_revert_requires_recovery"
                 )
-                self.hub.emitter(root_frame_id)(
+                # Revert/Undo publishes the same checkpoint-backed Artifact,
+                # environment, capability, and permission projection as branch
+                # activation.  Discard in-memory provider/control-plane caches
+                # so the next turn is rebuilt from that durable head instead of
+                # retaining messages or policy from the abandoned interval.
+                if st.delegation_runner is not None:
+                    st.delegation_runner.close(cancel=True)
+                    st.delegation_runner = None
+                st.runtime = SessionRuntime()
+                st.messages = []
+                st.env_name = None
+                st.pending_env = None
+                checkpoint = result.get("checkpoint") or {}
+                pins = (
+                    checkpoint.get("environment_pins")
+                    if isinstance(checkpoint, Mapping)
+                    else {}
+                )
+                pins = pins if isinstance(pins, Mapping) else {}
+                st.desired_env = (
+                    str(pins["python"]) if pins.get("python") else None
+                )
+                st.r_env_name = str(pins["r"]) if pins.get("r") else None
+                self._seed_messages(st)
+                emit = self.hub.emitter(root_frame_id)
+                emit(
                     {
                         "type": "kernel_status",
                         "frame_id": root_frame_id,
@@ -1378,10 +1980,225 @@ class SessionRunner:
                         "requires_kernel_recovery": True,
                     }
                 )
+                emit(
+                    {
+                        "type": "branch_projection_restored",
+                        "frame_id": root_frame_id,
+                        "branch_id": st.branch_id,
+                        "checkpoint_id": (
+                            checkpoint.get("checkpoint_id")
+                            if isinstance(checkpoint, Mapping)
+                            else None
+                        ),
+                    }
+                )
             self.executions.mark_finalizing(
                 execution, reason=f"persisting {operation.replace('_', ' ')}"
             )
             return result
+
+    def activate_session_branch(
+        self,
+        root_frame_id: str,
+        project_id: str,
+        branch_id: str,
+    ) -> dict[str, Any]:
+        """Switch the live scientific runtime to an immutable branch head.
+
+        Validation/materialization happens while the old branch still owns the
+        FIFO writer ticket.  Only then are its workers stopped and the target
+        checkpoint projection published atomically.  Namespace recovery is
+        attempted on the new branch and reported truthfully; a partial/failed
+        recovery never masquerades as a restored kernel.
+        """
+
+        old = self._state(root_frame_id, project_id)
+        branch_id = str(branch_id or "").strip()
+        if not branch_id:
+            raise GatewayError(400, "branch_id is required")
+        if branch_id == old.branch_id:
+            return {
+                "ok": True,
+                "status": "active",
+                "activation_state": "Active",
+                "root_frame_id": root_frame_id,
+                "previous_branch_id": old.branch_id,
+                "current_branch_id": old.branch_id,
+                "already_active": True,
+            }
+
+        emit = self.hub.emitter(root_frame_id)
+        owner_id = f"activate-{uuid.uuid4().hex[:12]}"
+        with self._session_execution(
+            old,
+            owner="lifecycle",
+            owner_id=owner_id,
+            reason=f"activate branch {branch_id}",
+        ) as execution:
+            prepared = self.session_domain.prepare_activation(
+                root_frame_id,
+                branch_id=branch_id,
+            )
+            checkpoint = dict(prepared["checkpoint"])
+            candidate = SessionState(
+                root_frame_id,
+                old.project_id,
+                Path(prepared["workspace"]),
+                branch_id=branch_id,
+                kernel_generations=self.store,
+                owner_instance_id=self._owner_instance_id,
+                clock_ms=lambda: int(self._clock() * 1000),
+            )
+            candidate.model = old.model
+            candidate.plan = old.plan
+            candidate.explore = old.explore
+            candidate.cell_index = self.store.latest_state_revision(root_frame_id)
+            pins = checkpoint.get("environment_pins") or {}
+            if isinstance(pins, Mapping):
+                candidate.desired_env = (
+                    str(pins["python"]) if pins.get("python") else None
+                )
+                candidate.r_env_name = (
+                    str(pins["r"]) if pins.get("r") else None
+                )
+
+            # The admitted lifecycle ticket guarantees there is no protocol
+            # reader left in either old slot before detachment.
+            self._interrupt_background(old)
+            if old.delegation_runner is not None:
+                old.delegation_runner.close(cancel=True)
+                old.delegation_runner = None
+            old.kernels.stop("python", manual=False, reason="branch_activated")
+            old.kernels.stop("r", manual=False, reason="branch_activated")
+
+            projection = self.session_domain.publish_activation(
+                root_frame_id,
+                branch_id=branch_id,
+                checkpoint_id=str(prepared["checkpoint_id"]),
+                expected_current_branch_id=old.branch_id,
+            )
+            with self._lock:
+                if self._sessions.get(root_frame_id) is not old:
+                    raise RuntimeError("session runtime changed during branch activation")
+                self._sessions[root_frame_id] = candidate
+
+            # Provider history is rebuilt only from the inherited branch prefix
+            # plus branch-local groups; this does not start a kernel.
+            self._seed_messages(candidate)
+            recovery_result: dict[str, Any] | None = None
+            generation_refs = checkpoint.get("generation_refs") or {}
+            if generation_refs:
+                try:
+                    plan = self.session_domain.recovery.prepare_action(
+                        root_frame_id,
+                        "restore",
+                        branch_id=branch_id,
+                    )
+                    # A fork's frozen manifests name its source workspace.  The
+                    # bytes/env/sidecars remain immutable, while execution must
+                    # be rebound to the isolated target workspace.
+                    import dataclasses
+
+                    rebound = tuple(
+                        dataclasses.replace(
+                            manifest,
+                            working_directory=str(candidate.workspace.resolve()),
+                        )
+                        for manifest in plan.manifests
+                    )
+                    plan = dataclasses.replace(plan, manifests=rebound)
+                    runtime = self._recovery_runtime(candidate, emit)
+                    with self.recovery.recovery_scope(candidate):
+                        recovery_result = runtime.run(plan)
+                except Exception as error:  # noqa: BLE001 - branch remains selected
+                    recovery_result = {
+                        "ok": False,
+                        "status": "failed",
+                        "issues": [
+                            f"branch head namespace recovery failed ({type(error).__name__})"
+                        ],
+                    }
+
+            status = (
+                str((recovery_result or {}).get("status") or "active").lower()
+            )
+            if status not in {"active", "partial", "failed", "cancelled"}:
+                status = "failed"
+            metadata = checkpoint.get("metadata") or {}
+            plans = metadata.get("plans") if isinstance(metadata, Mapping) else None
+            memories = (
+                metadata.get("memories") if isinstance(metadata, Mapping) else None
+            )
+            dimensions = {
+                "workspace": {
+                    "applied": True,
+                    **prepared.get("workspace_preview", {}),
+                },
+                "environment": projection["environment"],
+                "artifacts": projection["artifacts"],
+                "capabilities": projection["capabilities"],
+                "permissions": projection["permissions"],
+                "provider_history": {"applied": True},
+                "plans": {
+                    "applied": not bool(plans),
+                    "reason": (
+                        "checkpoint stores plan identities only; plan bodies are not versioned"
+                        if plans
+                        else None
+                    ),
+                },
+                "memories": {
+                    "applied": not bool(memories),
+                    "reason": (
+                        "checkpoint stores memory hashes only; memory bodies are project-scoped"
+                        if memories
+                        else None
+                    ),
+                },
+                "namespace": {
+                    "applied": status == "active",
+                    "status": status,
+                    "issues": list(
+                        (recovery_result or {}).get("issues")
+                        or [
+                            issue
+                            for item in (recovery_result or {}).get("results", ())
+                            for issue in (item.get("issues") or ())
+                        ]
+                    ),
+                },
+            }
+            if status == "active" and (
+                not dimensions["plans"]["applied"]
+                or not dimensions["memories"]["applied"]
+            ):
+                status = "partial"
+            self.executions.mark_finalizing(
+                execution, reason="publishing active branch runtime"
+            )
+            event = {
+                "type": "branch_activation_state",
+                "frame_id": root_frame_id,
+                "root_frame_id": root_frame_id,
+                "branch_id": branch_id,
+                "checkpoint_id": prepared["checkpoint_id"],
+                "status": status,
+                "state": status,
+            }
+            emit(event)
+            return {
+                "ok": status == "active",
+                "status": status,
+                "activation_state": status.title(),
+                "root_frame_id": root_frame_id,
+                "previous_branch_id": old.branch_id,
+                "current_branch_id": branch_id,
+                "checkpoint_id": prepared["checkpoint_id"],
+                "execution_id": execution.execution_id,
+                "owner": execution.owner.as_dict(),
+                "dimensions": dimensions,
+                "recovery": recovery_result,
+            }
 
     def execute_recovery_action(
         self,
@@ -1394,14 +2211,17 @@ class SessionRunner:
     ) -> dict:
         """Run one enabled recovery mutation under an exact FIFO ticket."""
 
-        st = self._state(root_frame_id, project_id)
-        branch_id = branch_id or root_frame_id
-        if branch_id != root_frame_id:
-            # Branch workspaces exist, but the live SessionState/Supervisor is
-            # still rooted at the canonical branch.  Publishing a candidate
-            # against that other workspace would falsely claim a branch switch.
+        quarantine = self.import_quarantine(root_frame_id)
+        if quarantine and (action_id != "restart_fresh" or not confirmed):
             raise RecoveryActionError(
-                "live recovery for a non-current branch is unavailable"
+                "imported Session is quarantined; only an explicitly confirmed "
+                "restart_fresh can establish a trusted runtime"
+            )
+        st = self._state(root_frame_id, project_id, allow_quarantined=True)
+        branch_id = branch_id or st.branch_id
+        if branch_id != st.branch_id:
+            raise RecoveryActionError(
+                "live recovery requires the current active branch"
             )
         owner_id = f"{action_id}-{uuid.uuid4().hex[:12]}"
         emit = self.hub.emitter(root_frame_id)
@@ -1432,6 +2252,34 @@ class SessionRunner:
                     execution, reason="publishing recovery state"
                 )
                 emit(runtime.kernel_status_event(result, plan.recovery_id))
+            if (
+                quarantine
+                and action_id == "restart_fresh"
+                and str(result.get("status") or "").lower() == "active"
+            ):
+                self.store.delete_setting(session_import_quarantine_key(root_frame_id))
+                trust_group = self.store.append_action_group(
+                    root_frame_id=root_frame_id,
+                    branch_id=branch_id,
+                    turn_id=f"import-trust-{uuid.uuid4().hex[:16]}",
+                    kind="session_import_trust",
+                    assistant_content=(
+                        "Imported Session runtime established by fresh restart"
+                    ),
+                )
+                self.store.append_action_event(
+                    group_id=trust_group["group_id"],
+                    type="session_import_trusted",
+                    result={
+                        "trust_state": "trusted",
+                        "method": "confirmed_restart_fresh",
+                        "replayed_package_code": False,
+                    },
+                    side_effect_class="runtime_mutation",
+                    resource_keys=[f"session:{root_frame_id}"],
+                )
+                result["quarantine_cleared"] = True
+                result["trust_state"] = "trusted"
             result.update(
                 {
                     "execution_id": execution.execution_id,
@@ -1484,21 +2332,64 @@ class SessionRunner:
             )
         )
 
-    def _state(self, root_frame_id: str, project_id: str) -> SessionState:
+    def import_quarantine(self, root_frame_id: str) -> dict[str, Any] | None:
+        raw = self.store.get_setting(session_import_quarantine_key(root_frame_id))
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            return {"state": "quarantined", "reason": "invalid_quarantine_record"}
+        return (
+            dict(value)
+            if isinstance(value, Mapping)
+            else {"state": "quarantined", "reason": "invalid_quarantine_record"}
+        )
+
+    def require_session_writable(self, root_frame_id: str, operation: str) -> None:
+        if self.import_quarantine(root_frame_id):
+            raise GatewayError(
+                423,
+                "imported Session is quarantined and view-only; use the "
+                "confirmed restart_fresh recovery action before " + operation,
+            )
+
+    def _state(
+        self,
+        root_frame_id: str,
+        project_id: str,
+        *,
+        allow_quarantined: bool = False,
+    ) -> SessionState:
         scope = self.store.resolve_frame_scope(
             root_frame_id,
             fallback_project=project_id,
         )
         if scope["root_frame_id"] != root_frame_id:
             raise ValueError("Web session operations require a root frame id")
+        if not allow_quarantined:
+            self.require_session_writable(root_frame_id, "starting a live runtime")
         project_id = scope["project_id"]
         with self._lock:
+            if project_id in self._deleting_projects:
+                raise GatewayError(409, "project deletion is in progress")
             st = self._sessions.get(root_frame_id)
             if st is None:
+                # A handful of in-process/compatibility callers intentionally
+                # exercise an ephemeral SessionState without first persisting a
+                # frame. Durable Web sessions always have a frame and therefore
+                # publish an atomic branch selection; an ephemeral test/runtime
+                # state stays root-bound instead of creating dangling rows.
+                branch_id = (
+                    self.store.ensure_active_session_branch(root_frame_id)
+                    if self.store.get_frame(root_frame_id) is not None
+                    else root_frame_id
+                )
                 st = SessionState(
                     root_frame_id,
                     project_id,
-                    self.workspace_for(root_frame_id),
+                    self.workspace_for_branch(root_frame_id, branch_id),
+                    branch_id=branch_id,
                     kernel_generations=self.store,
                     owner_instance_id=self._owner_instance_id,
                     clock_ms=lambda: int(self._clock() * 1000),
@@ -1533,7 +2424,7 @@ class SessionRunner:
                     owner=owner,
                     owner_id=owner_id,
                     execution_id=execution_id,
-                    branch_id=st.root_frame_id,
+                    branch_id=st.branch_id,
                     language=language,
                     resource_keys=("workspace", f"kernel:{language or 'control'}"),
                     metadata={"reason": reason},
@@ -1713,7 +2604,11 @@ class SessionRunner:
         # after the freshly composed system prompt on every daemon resume.
         st.messages = [
             {"role": "system", "content": ctx},
-            *restore_action_history(self.store, st.root_frame_id),
+            *restore_action_history(
+                self.store,
+                st.root_frame_id,
+                branch_id=st.branch_id,
+            ),
         ]
         # Re-seed from the durable transaction cursor, not row count.  Failed
         # attempts can reserve a revision before an execution-log row exists,
@@ -1752,6 +2647,9 @@ class SessionRunner:
                 frame_id=st.root_frame_id,
                 workspace=st.workspace,
             )
+            bind_session_domain = getattr(disp, "set_session_domain", None)
+            if callable(bind_session_domain):
+                bind_session_domain(self.session_domain)
             # Project every visible host.* call into persisted UI activity.
             disp.on_step = self._make_step_sink(st)
             disp.on_plan = self._make_plan_sink(st)
@@ -1893,6 +2791,7 @@ class SessionRunner:
                     depth=0,
                     parent_frame_id=st.root_frame_id,
                     store=self.store,
+                    owner_instance_id=self._owner_instance_id,
                 )
                 st.delegation_runner = runner
             else:
@@ -2177,19 +3076,28 @@ class SessionRunner:
     ) -> dict:
         """Interrupt only the frozen lease owned by an exact execution ticket."""
 
-        if not execution_id:
+        owner_kind = owner.get("kind") if isinstance(owner, dict) else owner
+        owner_id = (
+            (owner.get("id") if isinstance(owner, dict) else owner_id) or owner_id
+        )
+        if not execution_id or not owner_kind or not owner_id:
             return {
                 "ok": False,
                 "frame_id": root_frame_id,
-                "reason": "execution_id is required for kernel interrupt",
+                "execution_id": execution_id,
+                "reason": (
+                    "exact kernel interrupt requires execution_id, owner.kind, "
+                    "and owner.id"
+                ),
             }
-        return self.cancel(
+        result = self.executions.interrupt(
             root_frame_id,
-            execution_id,
-            owner=owner,
-            owner_id=owner_id,
+            execution_id=str(execution_id),
+            owner=str(owner_kind),
+            owner_id=str(owner_id),
             reason="kernel interrupt requested by user",
         )
+        return self._after_execution_cancel(root_frame_id, result)
 
     def _run_bootstrap(self, st: SessionState, kernel: Kernel | None = None) -> dict:
         """Run and persist the bootstrap facts observed for one generation."""
@@ -2333,15 +3241,25 @@ class SessionRunner:
         persisted = (
             None
             if supervisor_status is not None
-            else self.store.latest_kernel_generation(root_frame_id, "python")
+            else self.store.latest_kernel_generation(
+                root_frame_id,
+                "python",
+                branch_id=self.store.active_session_branch(root_frame_id),
+            )
         )
         alive = bool(supervisor_status and supervisor_status["alive"])
         if st is None:
             state = "ended" if persisted is not None else "none"
         else:
             state = supervisor_status["state"]
+        quarantine = self.import_quarantine(root_frame_id)
         return {
             "frame_id": root_frame_id,
+            "branch_id": (
+                st.branch_id
+                if st is not None
+                else self.store.active_session_branch(root_frame_id)
+            ),
             "state": state,  # none | running | stopped | ended
             "alive": alive,
             "generation": supervisor_status["generation"] if supervisor_status else 0,
@@ -2370,6 +3288,13 @@ class SessionRunner:
             "manual_stop": bool(supervisor_status and supervisor_status["manual_stop"]),
             "env": self._env_summary(st),
             "repl_enabled": bool(self.cfg.notebook_repl),
+            "view_only": bool(quarantine),
+            "trust_state": "quarantined" if quarantine else "trusted",
+            "quarantine_reason": (
+                str(quarantine.get("reason") or "untrusted_session_package")
+                if quarantine
+                else None
+            ),
         }
 
     def _env_summary(self, st: SessionState | None) -> dict:
@@ -2472,7 +3397,7 @@ class SessionRunner:
                         root_frame_id,
                         owner="lifecycle",
                         owner_id=f"stop-{uuid.uuid4().hex[:12]}",
-                        branch_id=root_frame_id,
+                        branch_id=st.branch_id,
                         resource_keys=("workspace", "kernel:python", "kernel:r"),
                         metadata={"reason": "manual kernel stop"},
                     )
@@ -2859,6 +3784,30 @@ class SessionRunner:
         model's native/legacy JSON control-tool boundary, where no Cell
         snapshot exists.
         """
+        ledger = getattr(st, "active_action_ledger", None)
+        group_id = getattr(ledger, "current_group_id", None)
+        call_id = (
+            call.get("id")
+            if isinstance(call, dict)
+            else getattr(call, "id", None)
+        )
+        binder = getattr(st.dispatcher, "bind_action_context", None)
+        if callable(binder):
+            with binder(
+                {
+                    "action_group_id": group_id,
+                    "action_id": call_id,
+                    "tool_call_id": call_id,
+                }
+            ):
+                return self._invoke_control_with_artifacts_bound(
+                    st, call, emit, invoke
+                )
+        return self._invoke_control_with_artifacts_bound(st, call, emit, invoke)
+
+    def _invoke_control_with_artifacts_bound(self, st, call, emit, invoke):
+        """Run one already-attributed native action and capture its files."""
+
         self.recovery.touch(st)
         name = call.get("name") if isinstance(call, dict) else getattr(call, "name", "")
         tool = get_tool(name)
@@ -3145,11 +4094,22 @@ class SessionRunner:
                 self._spawn_title_summary(
                     root_frame_id, user_text, self._llm_cfg(st), placeholder
                 )
-            self.store.add_message(
+            stored_user_message = self.store.add_message(
                 root_frame_id=root_frame_id,
+                branch_id=st.branch_id,
                 role="user",
                 content=user_text,
                 frame_id=root_frame_id,
+            )
+            # This is the exact branch point for an alternative answer: the
+            # user message is durable, while no later model action or Cell has
+            # touched the workspace yet. Snapshot failure is separately audited
+            # and never changes the successful message write above.
+            self._capture_cursor_checkpoint_best_effort(
+                root_frame_id,
+                source_kind="message",
+                source_id=stored_user_message["message_id"],
+                branch_id=st.branch_id,
             )
             # resolve @filename references → inject the artifact content (M4)
             resolved = self._resolve_mentions(st, user_text)
@@ -3182,6 +4142,7 @@ class SessionRunner:
                 new_turn_id(),
                 provider=getattr(llm_cfg, "provider", None),
                 model=getattr(llm_cfg, "model", None),
+                branch_id=st.branch_id,
                 tool_resolver=(tool_resolver if callable(tool_resolver) else None),
             )
             user_message = {"role": "user", "content": content}
@@ -3222,6 +4183,12 @@ class SessionRunner:
                     err_text = (
                         "Agent reached its configured turn limit without calling "
                         "host.submit_output(...)."
+                        if st.explore
+                        else (
+                            "Agent reached its configured turn limit without a "
+                            "structured completion signal (finalize_response or "
+                            "host.submit_output(...))."
+                        )
                     )
                     emit(
                         {
@@ -3302,6 +4269,7 @@ class SessionRunner:
                 had_prose = True
                 self.store.add_message(
                     root_frame_id=root_frame_id,
+                    branch_id=st.branch_id,
                     role="assistant",
                     content=blk["text"],
                     frame_id=root_frame_id,
@@ -3325,6 +4293,7 @@ class SessionRunner:
             if tail:
                 self.store.add_message(
                     root_frame_id=root_frame_id,
+                    branch_id=st.branch_id,
                     role="assistant",
                     content=tail,
                     frame_id=root_frame_id,
@@ -3398,6 +4367,164 @@ class SessionRunner:
         if not blocks:
             return text
         return text + "\n\n---\n(附:被引用的文件内容)\n\n" + "\n\n".join(blocks)
+
+    def _context_archive_metadata(
+        self, st: SessionState, action_ledger: RuntimeActionLedger | None
+    ) -> dict[str, Any]:
+        """Project durable Web runtime identity into Context Policy V2."""
+
+        group_id = getattr(action_ledger, "current_group_id", None)
+        group = self.store.get_action_group(group_id, include_events=False) if group_id else None
+        if group is None:
+            groups = self.store.list_action_groups(
+                st.root_frame_id,
+                branch_id=st.branch_id,
+                include_events=False,
+            )
+            group = groups[-1] if groups else None
+        checkpoints = self.store.list_session_checkpoints(
+            st.root_frame_id,
+            branch_id=st.branch_id,
+            limit=1,
+        )
+        checkpoint = checkpoints[0] if checkpoints else None
+        statuses = st.kernels.status()
+        generations = {
+            language: status.get("generation_id")
+            for language, status in statuses.items()
+            if status.get("generation_id")
+        }
+        restarted = any(
+            int(status.get("generation_ordinal") or 0) > 0
+            for status in statuses.values()
+        )
+        return {
+            "branch_id": st.branch_id,
+            "ledger_cursor": (
+                {
+                    "group_id": group.get("group_id"),
+                    "ordinal": group.get("ordinal"),
+                    "turn_id": group.get("turn_id"),
+                }
+                if group
+                else None
+            ),
+            "recovery_pointer": (
+                {
+                    "checkpoint_id": checkpoint.get("checkpoint_id"),
+                    "state_revision": checkpoint.get("state_revision"),
+                }
+                if checkpoint
+                else None
+            ),
+            "active_kernel_generation": generations or None,
+            "kernel_restarted": restarted,
+        }
+
+    def _archive_context_output(
+        self,
+        st: SessionState,
+        content: Any,
+        message: dict[str, Any],
+        archive: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Store one large context result as a real immutable Artifact version."""
+
+        del message
+        digest = str(archive.get("sha256") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("context Artifact requires a SHA-256 digest")
+        filename = f"context-output-{digest[:16]}.json"
+        existing = self.store.artifact_by_filename(
+            filename, st.root_frame_id, strict=True
+        )
+        if existing and existing.get("latest_version_id"):
+            return {
+                "artifact_id": existing["artifact_id"],
+                "version_id": existing["latest_version_id"],
+                "sha256": digest,
+            }
+        directory = (st.workspace / ".openai4s-context").resolve()
+        workspace = st.workspace.resolve()
+        if workspace not in directory.parents:
+            raise ValueError("context Artifact directory escaped the workspace")
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{digest}.json"
+        payload = json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "context_output",
+                "sha256": digest,
+                "content": content,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=repr,
+        ).encode("utf-8")
+        try:
+            with path.open("xb") as handle:
+                handle.write(payload)
+        except FileExistsError:
+            if path.read_bytes() != payload:
+                raise RuntimeError("context Artifact digest collision")
+        checksum = hashlib.sha256(payload).hexdigest()
+        record = self.store.save_artifact(
+            path=str(path),
+            filename=filename,
+            content_type="application/json",
+            size_bytes=len(payload),
+            checksum=checksum,
+            frame_id=st.root_frame_id,
+            root_frame_id=st.root_frame_id,
+            project_id=st.project_id,
+        )
+        self.hub.broadcast(
+            st.root_frame_id,
+            {
+                "type": "artifact_created",
+                "root_frame_id": st.root_frame_id,
+                "artifact": {
+                    "id": record["artifact_id"],
+                    **record,
+                },
+            },
+        )
+        return record
+
+    def _archive_compaction_record(
+        self, st: SessionState, payload: dict[str, Any]
+    ) -> str:
+        metadata = payload.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        compacted = payload.get("compacted_messages")
+        compacted = compacted if isinstance(compacted, list) else []
+        artifact_refs = [
+            ref
+            for message in compacted
+            if isinstance(message, dict)
+            for ref in (
+                message.get("artifact_refs")
+                if isinstance(message.get("artifact_refs"), list)
+                else []
+            )
+            if isinstance(ref, dict)
+        ]
+        return self.store.archive_compaction(
+            frame_id=st.root_frame_id,
+            project_id=st.project_id,
+            branch_id=metadata.get("branch"),
+            ledger_cursor=metadata.get("ledger_cursor"),
+            recovery_pointer=metadata.get("recovery_pointer"),
+            generation_id=metadata.get("active_kernel_generation"),
+            metadata=metadata,
+            summary=str(payload.get("summary") or ""),
+            handoff=str(payload.get("handoff") or ""),
+            compacted=compacted,
+            context_before=(payload.get("context_estimate_before") or {}),
+            context_after=(payload.get("context_estimate_after") or {}),
+            artifact_refs=artifact_refs,
+        )
 
     def _loop(
         self,
@@ -3496,7 +4623,7 @@ class SessionRunner:
                 apply_pending=apply_pending,
                 execute_cell=execute_cell,
                 events=events,
-                prose_nudge=_SUBMIT_NUDGE,
+                prose_nudge=_submit_nudge_for(llm_cfg),
                 explore_nudge=_EXPLORE_NUDGE,
                 native_wrapper=lambda call, invoke: (
                     self._invoke_control_with_artifacts(
@@ -3509,7 +4636,30 @@ class SessionRunner:
                 cancelled=st.cancel.is_set,
                 tool_catalog=tool_catalog,
             ),
-            context_policy=CompactionPolicy(self.cfg),
+            context_policy=CompactionPolicy(
+                self.cfg,
+                metadata_provider=lambda _state: self._context_archive_metadata(
+                    st, action_ledger
+                ),
+                tool_schema_provider=lambda state: (
+                    model_tools(state.messages)
+                    if callable(model_tools)
+                    else model_tools
+                ),
+                context_budget_provider=lambda _state: (
+                    get_model_capabilities(
+                        llm_cfg.provider,
+                        llm_cfg.model,
+                        base_url=llm_cfg.base_url,
+                    ).usable_context_tokens
+                ),
+                artifact_archiver=lambda content, message, archive: (
+                    self._archive_context_output(st, content, dict(message), archive)
+                ),
+                archive_sink=lambda payload: self._archive_compaction_record(
+                    st, dict(payload)
+                ),
+            ),
             event_sink=events,
             cancellation=EventCancellation(st.cancel),
             completion=CompletionSignal(
@@ -3532,6 +4682,7 @@ class SessionRunner:
         language: str = "python",
         lease: KernelLease | None = None,
         cell_id: str | None = None,
+        action_group_id: str | None = None,
     ) -> dict:
         """Web adapter for the protocol-neutral exact-lease cell watchdog."""
         lease = lease or st.kernels.lease(language)
@@ -3561,22 +4712,47 @@ class SessionRunner:
         )
         self.recovery.touch(st, language, state="busy")
         self.executions.bind_lease(lease, st.kernels.interrupt_if_current)
+        action_context = (
+            {
+                "action_group_id": action_group_id,
+                "action_id": f"{action_group_id}:action",
+                "tool_call_id": None,
+            }
+            if action_group_id
+            else None
+        )
+
+        def run_cell(kernel):
+            binder = getattr(kernel, "bind_action_context", None)
+            if callable(binder):
+                with binder(action_context):
+                    return kernel.execute(
+                        code,
+                        origin=origin,
+                        on_chunk=on_chunk,
+                        cell_id=cell_id,
+                    )
+            return kernel.execute(
+                code,
+                origin=origin,
+                on_chunk=on_chunk,
+                cell_id=cell_id,
+            )
+
         try:
-            return execute_with_watchdog(
+            result = execute_with_watchdog(
                 st.kernels,
                 lease,
-                lambda kernel: kernel.execute(
-                    code,
-                    origin=origin,
-                    on_chunk=on_chunk,
-                    cell_id=cell_id,
-                ),
+                run_cell,
                 policy=policy,
                 cancelled=st.cancel.is_set,
                 paused=permission_pending,
                 after_restart=after_restart,
                 thread_name=f"os-cell-{st.root_frame_id}",
             )
+            if language == "python":
+                self.sidecar_manifests.record_result(st.kernels, lease, result)
+            return result
         finally:
             self.executions.unbind_lease(lease)
             # A watchdog may have replaced the captured lease. Touch whichever
@@ -3604,6 +4780,45 @@ class SessionRunner:
             return None
         return verdict.as_observation()
 
+    def _capture_cursor_checkpoint_best_effort(
+        self,
+        root_frame_id: str,
+        *,
+        source_kind: str,
+        source_id: str,
+        branch_id: str | None = None,
+    ) -> dict | None:
+        """Never turn snapshot infrastructure failure into source failure."""
+
+        try:
+            return self.session_domain.capture_cursor_checkpoint(
+                root_frame_id,
+                source_kind=source_kind,
+                source_id=source_id,
+                branch_id=(
+                    branch_id or self.store.active_session_branch(root_frame_id)
+                ),
+            )
+        except Exception:  # noqa: BLE001 - Cell/message persistence already won
+            return None
+
+    def _record_cell_with_cursor_checkpoint(self, **record: Any) -> str:
+        cell_id = self.store.log_cell(**record)
+        root_frame_id = record.get("root_frame_id")
+        if root_frame_id and record.get("origin") in {"agent", "user"}:
+            state = self._existing_state(str(root_frame_id))
+            self._capture_cursor_checkpoint_best_effort(
+                str(root_frame_id),
+                source_kind="cell",
+                source_id=cell_id,
+                branch_id=(
+                    state.branch_id
+                    if state is not None
+                    else self.store.active_session_branch(str(root_frame_id))
+                ),
+            )
+        return cell_id
+
     def _allocate_cell_attempt(
         self,
         st: SessionState,
@@ -3620,6 +4835,7 @@ class SessionRunner:
             # history on resume.
             group = self.store.append_action_group(
                 root_frame_id=st.root_frame_id,
+                branch_id=st.branch_id,
                 turn_id=f"cell-{cell_id}",
                 kind="execution",
             )
@@ -3673,6 +4889,9 @@ class SessionRunner:
             origin=origin,
             language=language,
             stream=stream,
+            action_group_id=(
+                action_group_id or getattr(st, "active_action_group_id", None)
+            ),
         )
         executed = self.cells.execute(
             st,
@@ -3887,6 +5106,23 @@ class SessionRunner:
                 language=language,
             )
             r = info["result"]
+            # ``_execute_and_log`` predates the typed Cell result.  Its legacy
+            # compatibility shape exposed ``idx`` but not the newer durable
+            # revision/generation fields.  Keep direct callers and test
+            # adapters working while preserving the exact values supplied by
+            # CellExecutionService on the normal path.  The execution lease is
+            # still held here, so reading the current slot cannot race a
+            # lifecycle writer.
+            state_revision = (
+                info["state_revision"]
+                if "state_revision" in info
+                else info["idx"]
+            )
+            generation_id = (
+                info["generation_id"]
+                if "generation_id" in info
+                else st.kernels.status(language).get("generation_id")
+            )
             self.executions.mark_finalizing(execution, reason="persisting notebook cell")
             emit(
                 {"type": "frame_update", "frame_id": root_frame_id, "status": "success"}
@@ -3897,8 +5133,8 @@ class SessionRunner:
                 "owner": execution.owner.as_dict(),
                 "cell": {
                     "cell_index": info["idx"],
-                    "state_revision": info["state_revision"],
-                    "generation_id": info["generation_id"],
+                    "state_revision": state_revision,
+                    "generation_id": generation_id,
                     "kernel_id": (
                         self._r_kernel_id(st)
                         if language == "r"
@@ -3919,6 +5155,79 @@ class SessionRunner:
                     "files_read": [],
                 }
             }
+
+    def submit_repl(
+        self,
+        root_frame_id: str,
+        project_id: str,
+        code: str,
+        *,
+        language: str = "python",
+        execution_id: str | None = None,
+    ) -> MessageJob:
+        """Queue one Notebook Cell and return its durable execution identity."""
+
+        st = self._state(root_frame_id, project_id)
+        execution_id = str(execution_id or f"repl-{uuid.uuid4().hex}")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", execution_id):
+            raise ValueError("execution_id must be a portable identifier")
+        job = MessageJob(f"job-{uuid.uuid4().hex[:12]}", root_frame_id)
+        ticket = self._queue_execution(
+            st,
+            owner="user_repl",
+            owner_id=execution_id,
+            execution_id=execution_id,
+            language=language,
+            reason="user notebook cell",
+        )
+        job.execution_id = ticket.execution_id
+        job.execution_owner = ticket.owner.as_dict()
+        with self._lock:
+            expired = [
+                job_id
+                for job_id, previous in self._jobs.items()
+                if previous.done.is_set()
+                and (time.time() - (previous.finished_at or 0)) > 300
+            ]
+            for job_id in expired:
+                self._jobs.pop(job_id, None)
+            self._jobs[job.job_id] = job
+
+        def target() -> None:
+            try:
+                with self.executions.admitted(ticket, cancel_event=st.cancel):
+                    result = self.run_repl(
+                        root_frame_id,
+                        project_id,
+                        code,
+                        language=language,
+                        execution_id=execution_id,
+                    )
+                result.setdefault("job_id", job.job_id)
+                job.finish(result=result)
+            except ExecutionCancelled as error:
+                job.finish(
+                    result={
+                        "status": "cancelled",
+                        "frame_id": root_frame_id,
+                        "job_id": job.job_id,
+                        "execution_id": ticket.execution_id,
+                        "owner": ticket.owner.as_dict(),
+                        "reason": str(error),
+                    }
+                )
+            except Exception as error:  # noqa: BLE001 - job owns its failure
+                traceback.print_exc()
+                job.finish(error=str(error))
+
+        thread = threading.Thread(
+            target=target,
+            name=f"openai4s-repl-{root_frame_id}",
+            daemon=True,
+        )
+        job.thread = thread
+        thread.start()
+        return job
 
 
 # --------------------------------------------------------------------------- #
@@ -4283,10 +5592,47 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
         store=store,
         format_timestamp=lambda value: _iso(value),
     )
+    runner_domain = getattr(runner, "session_domain", None)
+    timeline = getattr(runner_domain, "timeline", None) or ActionTimelineService(store)
+    global_views = GlobalResearchViewService(store, timeline)
     skill_customization = SkillCustomizationService(SkillLoader(cfg=cfg))
     _disabled_skills = skill_customization.disabled_names
-    _disabled_agents: set[str] = set()
     _default_model = {"id": cfg.llm.model or "default"}
+
+    def _project_skill_customization(project_id: str) -> SkillCustomizationService:
+        project_id = str(project_id or "").strip()
+        if not project_id or store.get_project(project_id) is None:
+            raise GatewayError(404, "project not found")
+        return SkillCustomizationService(
+            SkillLoader(cfg=cfg, project_id=project_id),
+            scope="project",
+            project_id=project_id,
+        )
+
+    def _skill_history_payload(
+        service: SkillCustomizationService,
+        name: str,
+        *,
+        limit: int,
+    ) -> dict:
+        history = service.history(name, limit=max(1, min(int(limit), 200)))
+        if history.get("error"):
+            return history
+        return {**history, "status": service.status(name)}
+
+    def _require_session_writable(root_frame_id: str, operation: str) -> None:
+        """Keep old lightweight test adapters compatible without weakening quarantine."""
+
+        guard = getattr(runner, "require_session_writable", None)
+        if callable(guard):
+            guard(root_frame_id, operation)
+            return
+        if store.get_setting(session_import_quarantine_key(root_frame_id)):
+            raise GatewayError(
+                423,
+                "imported Session is quarantined and view-only; use the "
+                "confirmed restart_fresh recovery action before " + operation,
+            )
 
     def _effective_model_id(provider, model):
         """The model id actually used for a (provider, model) pair: the explicit
@@ -4351,14 +5697,110 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 "application/json; charset=utf-8",
             )
 
-        def _body(self) -> dict:
-            length = int(self.headers.get("Content-Length", "0") or "0")
-            if not length:
-                return {}
+        def _content_length(self) -> int:
+            transfer_encoding = str(
+                self.headers.get("Transfer-Encoding", "") or ""
+            ).strip()
+            if transfer_encoding:
+                self.close_connection = True
+                raise GatewayError(400, "Transfer-Encoding is not supported")
+            get_all = getattr(self.headers, "get_all", None)
+            values = get_all("Content-Length") if callable(get_all) else None
+            if values and len(values) > 1:
+                self.close_connection = True
+                raise GatewayError(400, "ambiguous Content-Length")
+            raw = self.headers.get("Content-Length", "0") or "0"
             try:
-                return json.loads(self.rfile.read(length) or b"{}")
+                length = int(raw)
+            except (TypeError, ValueError) as error:
+                self.close_connection = True
+                raise GatewayError(400, "invalid Content-Length") from error
+            if length < 0:
+                self.close_connection = True
+                raise GatewayError(400, "invalid Content-Length")
+            return length
+
+        def _read_request_body(
+            self,
+            *,
+            limit: int,
+            required: bool = False,
+            required_message: str = "request body is required",
+            too_large_message: str = "request body is too large",
+        ) -> bytes:
+            tracking = getattr(self, "_request_body_tracking_active", False)
+            if tracking and getattr(self, "_request_body_ready", False):
+                payload = self._request_body_payload
+                if len(payload) > limit:
+                    self.close_connection = True
+                    raise GatewayError(413, too_large_message)
+                if required and not payload:
+                    raise GatewayError(400, required_message)
+                return payload
+
+            length = self._content_length()
+            if length > limit:
+                self.close_connection = True
+                raise GatewayError(413, too_large_message)
+            try:
+                payload = self.rfile.read(length) if length else b""
+            except OSError as error:
+                self.close_connection = True
+                raise GatewayError(400, "incomplete request body") from error
+            if len(payload) != length:
+                self.close_connection = True
+                raise GatewayError(400, "incomplete request body")
+            if tracking:
+                self._request_body_payload = payload
+                self._request_body_ready = True
+            if required and not payload:
+                raise GatewayError(400, required_message)
+            return payload
+
+        def _prepare_request_body(self, path: str, method: str) -> None:
+            is_session_import = path == "/api/sessions/import" and method == "POST"
+            self._read_request_body(
+                limit=MAX_ARCHIVE_BYTES if is_session_import else _MAX_JSON_BODY_BYTES,
+                too_large_message=(
+                    "session package is too large"
+                    if is_session_import
+                    else "request body is too large"
+                ),
+            )
+
+        def _body(self) -> dict:
+            try:
+                payload = self._read_request_body(limit=_MAX_JSON_BODY_BYTES)
+                return json.loads(payload or b"{}")
             except (ValueError, TypeError):
                 return {}
+
+        def _body_bytes(self, *, limit: int) -> bytes:
+            return self._read_request_body(
+                limit=limit,
+                required=True,
+                required_message="session package body is required",
+                too_large_message="session package is too large",
+            )
+
+        def _close_on_unread_request_body(self) -> None:
+            """Never parse leftover bytes as a second HTTP/1.1 request.
+
+            Accepted requests are read once, before dispatch, and cached for
+            ``_body`` / ``_body_bytes``. Rejected requests are not drained after
+            a response (which could block on a lying client); their connection
+            is simply made non-reusable.
+            """
+
+            if getattr(self, "_request_is_websocket", False):
+                self.close_connection = True
+                return
+            if getattr(self, "_request_body_ready", False):
+                return
+            if self.headers.get("Transfer-Encoding") or self.headers.get(
+                "Content-Length"
+            ):
+                self.close_connection = True
 
         def _query(self) -> dict:
             return parse_qs(urlparse(self.path).query)
@@ -4380,6 +5822,10 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
             self._route("DELETE")
 
         def _route(self, method: str) -> None:
+            self._request_body_tracking_active = True
+            self._request_body_ready = False
+            self._request_body_payload = b""
+            self._request_is_websocket = False
             parsed = urlparse(self.path)
             path = parsed.path
             try:
@@ -4398,6 +5844,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                         onl = urlparse(origin).netloc
                         host = self.headers.get("Host", "")
                         if onl and host and onl != host:
+                            self.close_connection = True
                             self._json({"error": "cross-origin request refused"}, 403)
                             return
                 # M2: token gate (only active when bound non-loopback / opt-in).
@@ -4428,14 +5875,25 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                         # non-GET carrying ?token= → authenticate and proceed (the
                         # request must not be lost to a redirect)
                     else:
+                        self.close_connection = True
                         self._json(
                             {"error": "unauthorized — append ?token=… to the URL"}, 401
                         )
                         return
                 # websocket upgrade
                 if path == "/api/ws":
+                    if method != "GET":
+                        self.close_connection = True
+                        raise GatewayError(405, "websocket upgrade requires GET")
+                    if self._content_length() != 0:
+                        self.close_connection = True
+                        raise GatewayError(400, "websocket upgrade cannot carry a body")
+                    self._request_body_ready = True
+                    self._request_is_websocket = True
+                    self.close_connection = True
                     self._handle_ws()
                     return
+                self._prepare_request_body(path, method)
                 if path == "/health" and method == "GET":
                     self._json(
                         {
@@ -4466,15 +5924,26 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                     return
                 self._json({"error": "not found"}, 404)
             except GatewayError as ge:
-                self._json({"error": ge.message}, ge.code)
-            except BrokenPipeError:
-                pass
+                try:
+                    self._json({"error": ge.message}, ge.code)
+                except (BrokenPipeError, ConnectionResetError):
+                    self.close_connection = True
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
             except Exception as e:  # noqa: BLE001
                 traceback.print_exc()
                 try:
                     self._json({"error": str(e)}, 500)
-                except Exception:
-                    pass
+                except (BrokenPipeError, ConnectionResetError):
+                    self.close_connection = True
+            finally:
+                self._close_on_unread_request_body()
+                # A keep-alive Handler can outlive this request for minutes.
+                # Release a potentially large Session package/upload buffer as
+                # soon as synchronous dispatch has finished.
+                self._request_body_payload = b""
+                self._request_body_ready = False
+                self._request_body_tracking_active = False
 
         # ---- static -----------------------------------------------------
         def _serve_index(self) -> None:
@@ -4608,6 +6077,38 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
         # ---- REST API ---------------------------------------------------
         def _api(self, method: str, sub: str) -> None:
             q = self._query()
+            if sub == "/sessions/import" and method == "POST":
+                payload = self._body_bytes(limit=MAX_ARCHIVE_BYTES)
+                try:
+                    imported = runner.session_domain.session_import(payload)
+                except SessionPackageError as error:
+                    raise GatewayError(400, str(error)) from error
+                self._json(imported, 201)
+                return
+            frame_mutation = re.fullmatch(r"/frames/([^/]+)(?:/.*)?", sub)
+            if frame_mutation and method != "GET":
+                delete_session = method == "DELETE" and sub == (
+                    f"/frames/{frame_mutation.group(1)}"
+                )
+                confirmed_fresh_restart = bool(
+                    re.fullmatch(
+                        r"/frames/[^/]+/recovery/actions/restart_fresh", sub
+                    )
+                    and method == "POST"
+                )
+                read_only_preview = bool(
+                    method == "POST"
+                    and re.fullmatch(
+                        r"/frames/[^/]+/(?:revert/preview|branches/revert-preview)",
+                        sub,
+                    )
+                )
+                if not (
+                    delete_session or confirmed_fresh_restart or read_only_preview
+                ):
+                    _require_session_writable(
+                        frame_mutation.group(1), "mutating the Session"
+                    )
             # ---- identity / meta (no-auth local mode) ----
             if sub == "/me":
                 self._json(
@@ -4849,32 +6350,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
             if m:
                 pid = m.group(1)
                 if method == "DELETE":
-                    res = store.delete_project(pid)
-                    import shutil as _shutil
-
-                    for p in res.get("stale_paths", []):
-                        try:
-                            Path(p).unlink()
-                        except OSError:
-                            pass
-                    # remove each session's workspace tree (holds non-artifact
-                    # scratch + the live copies of edited artifacts) + resume buffer
-                    for fid in res.get("frame_ids", []):
-                        runner.drop_session(fid, reason="project_deleted")
-                        try:
-                            _shutil.rmtree(
-                                runner.workspace_for(fid), ignore_errors=True
-                            )
-                        except Exception:  # noqa: BLE001
-                            pass
-                        hub.drop_frame(fid)
-                    self._json(
-                        {
-                            "ok": True,
-                            "freed_files": len(res.get("stale_paths", [])),
-                            "freed_sessions": len(res.get("frame_ids", [])),
-                        }
-                    )
+                    self._json(runner.delete_project(pid))
                     return
                 if method in ("PUT", "PATCH"):
                     store.update_project(
@@ -4926,6 +6402,16 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                         )
                     )
                     return
+            m = re.fullmatch(r"/projects/([^/]+)/action-timeline", sub)
+            if m and method == "GET":
+                limit = int((q.get("limit") or ["500"])[0])
+                self._json(global_views.timeline_view(unquote(m.group(1)), limit=limit))
+                return
+            m = re.fullmatch(r"/projects/([^/]+)/lineage", sub)
+            if m and method == "GET":
+                limit = int((q.get("limit") or ["2000"])[0])
+                self._json(global_views.lineage_view(unquote(m.group(1)), limit=limit))
+                return
             m = re.fullmatch(r"/folders/([^/]+)", sub)
             if m:
                 folder_id = m.group(1)
@@ -4975,12 +6461,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 if method == "POST":
                     b = self._body()
                     pid = b.get("project_id") or "default"
-                    fid = store.new_frame(
-                        kind="turn",
-                        project_id=pid,
-                        model=b.get("model"),
-                        status="ready",
-                    )
+                    fid = runner.create_session(pid, model=b.get("model"))
                     self._json(_frame_json(store.get_frame(fid), store))
                     return
             m = re.fullmatch(r"/frames/([^/]+)", sub)
@@ -5006,8 +6487,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                     self._json(_frame_json(store.get_frame(fid), store))
                     return
                 if method == "DELETE":
-                    runner.drop_session(fid, reason="frame_deleted")
-                    store.delete_frame(fid)
+                    runner.delete_session(fid)
                     self._json({"ok": True})
                     return
             m = re.fullmatch(r"/frames/([^/]+)/messages", sub)
@@ -5015,14 +6495,24 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 fid = m.group(1)
                 start = int((q.get("from") or ["0"])[0])
                 limit = int((q.get("limit") or ["300"])[0])
-                msgs = store.list_messages(fid, start=start, limit=limit)
+                branch_id = (q.get("branch_id") or [None])[0]
+                msgs = store.list_branch_message_boundaries(
+                    fid,
+                    branch_id=(branch_id or store.active_session_branch(fid)),
+                    start=start,
+                    limit=limit,
+                )
                 self._json(
                     {
                         "messages": [
                             {
+                                "message_id": mm.get("message_id"),
                                 "role": mm["role"],
                                 "content": mm["content"],
                                 "created_at": _iso(mm["created_at"]),
+                                "fork_checkpoint_id": mm.get(
+                                    "fork_checkpoint_id"
+                                ),
                             }
                             for mm in msgs
                         ]
@@ -5261,6 +6751,10 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                         "project": fr.get("project_id") or "default",
                         "global": "",
                     }.get(scope, "")
+                if scope == "conversation" and scope_id:
+                    _require_session_writable(
+                        str(scope_id), "changing Session permissions"
+                    )
                 rid = store.set_permission_rule(
                     scope=scope,
                     scope_id=scope_id or "",
@@ -5283,6 +6777,12 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 return
             m = re.fullmatch(r"/permissions/([^/]+)", sub)
             if m and method == "DELETE":
+                rule = store.get_permission_rule(m.group(1))
+                if rule and rule.get("scope") == "conversation":
+                    _require_session_writable(
+                        str(rule.get("scope_id") or ""),
+                        "deleting Session permissions",
+                    )
                 store.delete_permission_rule(m.group(1))
                 self._json({"ok": True})
                 return
@@ -5356,6 +6856,12 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 return
             m = re.fullmatch(r"/annotations/([^/]+)", sub)
             if m and method in ("PATCH", "POST", "PUT"):
+                current_annotation = store.get_annotation(m.group(1))
+                if current_annotation and current_annotation.get("root_frame_id"):
+                    _require_session_writable(
+                        str(current_annotation["root_frame_id"]),
+                        "editing Session annotations",
+                    )
                 b = self._body()
                 anno = store.update_annotation(
                     m.group(1), body=b.get("body"), status=b.get("status")
@@ -5366,6 +6872,12 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 )
                 return
             if m and method == "DELETE":
+                current_annotation = store.get_annotation(m.group(1))
+                if current_annotation and current_annotation.get("root_frame_id"):
+                    _require_session_writable(
+                        str(current_annotation["root_frame_id"]),
+                        "deleting Session annotations",
+                    )
                 store.delete_annotation(m.group(1))
                 self._json({"ok": True})
                 return
@@ -5412,10 +6924,11 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
             workbench = re.fullmatch(
                 r"/frames/([^/]+)/(?:"
                 r"action-timeline|execution-queue|context|security|"
+                r"delegations|"
                 r"recovery(?:/actions(?:/(?:restore|retry|restart_fresh))?)?|"
-                r"branches(?:/(?:checkpoints|fork|revert-preview|revert))?|"
+                r"branches(?:/(?:checkpoints|fork|revert-preview|revert|[^/]+/activate))?|"
                 r"checkpoints|revert/(?:preview|apply|undo|operations)|"
-                r"notebook/export|execution)",
+                r"notebook/export|session/export|kernel/variables|execution)",
                 sub,
             )
             if workbench and store.get_frame(workbench.group(1)) is None:
@@ -5485,6 +6998,10 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
             if m and method == "GET":
                 self._json(runner.workbench.security(m.group(1)))
                 return
+            m = re.fullmatch(r"/frames/([^/]+)/delegations", sub)
+            if m and method == "GET":
+                self._json(runner.workbench.delegation(m.group(1)))
+                return
             m = re.fullmatch(r"/frames/([^/]+)/recovery", sub)
             if m and method == "GET":
                 self._json(
@@ -5531,6 +7048,19 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 self._json(runner.session_domain.branches(m.group(1)))
                 return
             m = re.fullmatch(
+                r"/frames/([^/]+)/branches/([^/]+)/activate", sub
+            )
+            if m and method == "POST":
+                frame_id = m.group(1)
+                frame = store.get_frame(frame_id) or {}
+                result = runner.activate_session_branch(
+                    frame_id,
+                    str(frame.get("project_id") or "default"),
+                    unquote(m.group(2)),
+                )
+                self._json(result)
+                return
+            m = re.fullmatch(
                 r"/frames/([^/]+)/(?:checkpoints|branches/checkpoints)", sub
             )
             if m and method == "GET":
@@ -5568,27 +7098,36 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 if frame is None:
                     raise GatewayError(404, "session not found")
                 body = self._body()
-                if body.get("from_cell_id") and not body.get("from_checkpoint_id"):
+                source_fields = (
+                    "from_checkpoint_id",
+                    "from_cell_id",
+                    "from_message_id",
+                )
+                if sum(bool(body.get(field)) for field in source_fields) != 1:
                     raise GatewayError(
-                        409,
-                        "fork-from-cell is unavailable; create a checkpoint first",
+                        400,
+                        "provide exactly one fork source",
                     )
-                source = body.get("from_checkpoint_id")
-                if not source:
-                    raise GatewayError(400, "from_checkpoint_id is required")
-                self._json(
-                    runner.mutate_session_domain(
+                try:
+                    result = runner.mutate_session_domain(
                         fid,
                         frame.get("project_id") or "default",
                         operation="fork_branch",
                         mutate=lambda: runner.session_domain.fork_branch(
                             fid,
-                            from_checkpoint_id=source,
+                            from_checkpoint_id=body.get("from_checkpoint_id"),
+                            from_cell_id=body.get("from_cell_id"),
+                            from_message_id=body.get("from_message_id"),
                             branch_id=body.get("branch_id"),
                             name=body.get("name"),
                         ),
                     )
-                )
+                except CursorCheckpointUnavailable as error:
+                    raise GatewayError(
+                        409,
+                        "historical source has no exact cursor checkpoint",
+                    ) from error
+                self._json(result)
                 return
             m = re.fullmatch(
                 r"/frames/([^/]+)/(?:revert/preview|branches/revert-preview)", sub
@@ -5695,6 +7234,24 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                     },
                 )
                 return
+            m = re.fullmatch(r"/frames/([^/]+)/session/export", sub)
+            if m and method == "GET":
+                exported = runner.session_domain.session_export(m.group(1))
+                self._send(
+                    200,
+                    exported["data"],
+                    exported["content_type"],
+                    {
+                        "Content-Disposition": (
+                            f'attachment; filename="{exported["filename"]}"'
+                        ),
+                        "X-Content-SHA256": exported["sha256"],
+                        "X-OpenAI4S-Session-Schema": str(
+                            exported["schema_version"]
+                        ),
+                    },
+                )
+                return
             m = re.fullmatch(r"/frames/([^/]+)/execution", sub)
             if m and method == "GET":
                 self._json(runner.executions.snapshot(m.group(1)))
@@ -5725,20 +7282,43 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 ):
                     self._json({"error": "invalid execution_id"}, 400)
                     return
-                try:
-                    kwargs = {}
-                    if "language" in body:
-                        kwargs["language"] = language
-                    if requested_execution_id:
-                        kwargs["execution_id"] = str(requested_execution_id)
-                    result = runner.run_repl(fid, pid, code, **kwargs)
-                except ExecutionCancelled as error:
-                    result = {
-                        "status": "cancelled",
+                job = runner.submit_repl(
+                    fid,
+                    pid,
+                    code,
+                    language=language,
+                    execution_id=(
+                        str(requested_execution_id)
+                        if requested_execution_id
+                        else None
+                    ),
+                )
+                if body.get("wait") is True:
+                    self._json(job.wait_result())
+                    return
+                snapshot = runner.executions.snapshot(fid)
+                queued = next(
+                    (
+                        item
+                        for item in snapshot.get("queue", [])
+                        if item.get("execution_id") == job.execution_id
+                    ),
+                    snapshot.get("owner")
+                    if (snapshot.get("owner") or {}).get("execution_id")
+                    == job.execution_id
+                    else None,
+                )
+                self._json(
+                    {
+                        "status": "accepted",
                         "frame_id": fid,
-                        "reason": str(error),
-                    }
-                self._json(result)
+                        "job_id": job.job_id,
+                        "execution_id": job.execution_id,
+                        "owner": job.execution_owner,
+                        "queue_position": (queued or {}).get("queue_position"),
+                    },
+                    202,
+                )
                 return
             m = re.fullmatch(r"/frames/([^/]+)/kernel/restart", sub)
             if m and method == "POST":
@@ -5822,6 +7402,23 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 fid = m.group(1)
                 f = store.get_frame(fid) or {}
                 self._json(runner.start_kernel(fid, f.get("project_id") or "default"))
+                return
+            m = re.fullmatch(r"/frames/([^/]+)/kernel/variables", sub)
+            if m and method == "GET":
+                fid = m.group(1)
+                frame = store.get_frame(fid)
+                if frame is None:
+                    raise GatewayError(404, "session not found")
+                if (frame.get("root_frame_id") or fid) != fid:
+                    raise GatewayError(
+                        409,
+                        "variable inspection requires the current root session",
+                    )
+                language = str((q.get("language") or ["python"])[0]).lower()
+                if language not in {"python", "r"}:
+                    self._json({"error": "language must be python or r"}, 400)
+                    return
+                self._json(runner.variables.inspect(fid, language))
                 return
             m = re.fullmatch(r"/frames/([^/]+)/kernel", sub)
             if m and method == "GET":
@@ -5914,6 +7511,12 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 return
             m = re.fullmatch(r"/artifacts/([^/]+)/priority", sub)
             if m and method in ("POST", "PUT", "PATCH"):
+                artifact = store.get_artifact(m.group(1))
+                if artifact and artifact.get("root_frame_id"):
+                    _require_session_writable(
+                        str(artifact["root_frame_id"]),
+                        "changing Artifact priority",
+                    )
                 rec = store.set_priority(
                     m.group(1), int(self._body().get("priority", 0))
                 )
@@ -5975,6 +7578,19 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
             if sub == "/skills/catalog" and method == "GET":
                 self._json({"skills": self._skills_catalog(_disabled_skills)})
                 return
+            m = re.fullmatch(r"/projects/([^/]+)/skills/catalog", sub)
+            if m and method == "GET":
+                project_service = _project_skill_customization(unquote(m.group(1)))
+                self._json(
+                    {
+                        "skills": [
+                            item
+                            for item in project_service.catalog()
+                            if item.get("scope") == "project"
+                        ]
+                    }
+                )
+                return
             m = re.fullmatch(r"/skills/catalog/([^/]+)/enabled", sub)
             if m and method in ("PUT", "PATCH"):
                 name = unquote(m.group(1))
@@ -6007,6 +7623,56 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                     )
                 )
                 return
+            m = re.fullmatch(r"/skills/([^/]+)/versions", sub)
+            if m and method == "GET":
+                try:
+                    limit = int((q.get("limit") or [50])[0])
+                except (TypeError, ValueError):
+                    raise GatewayError(400, "invalid Skill history limit")
+                payload = _skill_history_payload(
+                    skill_customization,
+                    unquote(m.group(1)),
+                    limit=limit,
+                )
+                self._json(payload, 404 if payload.get("error") else 200)
+                return
+            m = re.fullmatch(r"/skills/([^/]+)/rollback", sub)
+            if m and method == "POST":
+                version_id = str(self._body().get("version_id") or "").strip()
+                if not version_id:
+                    raise GatewayError(400, "version_id is required")
+                payload = skill_customization.rollback(
+                    unquote(m.group(1)),
+                    version_id,
+                )
+                self._json(payload, 409 if payload.get("error") else 200)
+                return
+            m = re.fullmatch(r"/projects/([^/]+)/skills/([^/]+)/versions", sub)
+            if m and method == "GET":
+                try:
+                    limit = int((q.get("limit") or [50])[0])
+                except (TypeError, ValueError):
+                    raise GatewayError(400, "invalid Skill history limit")
+                project_service = _project_skill_customization(unquote(m.group(1)))
+                payload = _skill_history_payload(
+                    project_service,
+                    unquote(m.group(2)),
+                    limit=limit,
+                )
+                self._json(payload, 404 if payload.get("error") else 200)
+                return
+            m = re.fullmatch(r"/projects/([^/]+)/skills/([^/]+)/rollback", sub)
+            if m and method == "POST":
+                version_id = str(self._body().get("version_id") or "").strip()
+                if not version_id:
+                    raise GatewayError(400, "version_id is required")
+                project_service = _project_skill_customization(unquote(m.group(1)))
+                payload = project_service.rollback(
+                    unquote(m.group(2)),
+                    version_id,
+                )
+                self._json(payload, 409 if payload.get("error") else 200)
+                return
             m = re.fullmatch(r"/skills/([^/]+)", sub)
             if m and sub not in ("/skills/catalog", "/skills/import"):
                 name = unquote(m.group(1))
@@ -6034,11 +7700,22 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
             m = re.fullmatch(r"/agents/([^/]+)/enabled", sub)
             if m and method in ("PUT", "PATCH"):
                 name = unquote(m.group(1))
-                if self._body().get("enabled", True):
-                    _disabled_agents.discard(name)
-                else:
-                    _disabled_agents.add(name)
-                self._json({"ok": True})
+                enabled = bool(self._body().get("enabled", True))
+                state = store.set_capability_enabled(
+                    "specialist",
+                    name,
+                    enabled,
+                    scope="global",
+                    metadata={"source": "web"},
+                )
+                self._json(
+                    {
+                        "ok": True,
+                        "name": name,
+                        "enabled": state["enabled"],
+                        "scope": state["scope"],
+                    }
+                )
                 return
             m = re.fullmatch(r"/agents/([^/]+)", sub)
             if m and method == "GET":
@@ -6053,7 +7730,12 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
             # ---- specialists (user-defined agents) ----
             if sub == "/specialists" and method == "GET":
                 self._json(
-                    {"builtin": _BUILTIN_AGENTS, "specialists": store.list_agents()}
+                    {
+                        "builtin": store.specialist_profiles().filter_profiles(
+                            _BUILTIN_AGENTS, include_disabled=True
+                        ),
+                        "specialists": store.list_agents(include_disabled=True),
+                    }
                 )
                 return
             if sub == "/specialists" and method == "POST":
@@ -6510,11 +8192,14 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
 
         def _agents_payload(self) -> list[dict]:
             out = []
+            capability_state = store.capability_state()
             for a in _BUILTIN_AGENTS:
                 out.append(
                     {
                         **a,
-                        "enabled": a["name"] not in _disabled_agents,
+                        "enabled": capability_state.is_enabled(
+                            "specialist", a["name"]
+                        ),
                         "parameters": {},
                         "systemPrompt": None,
                         "userHidden": False,
@@ -6523,7 +8208,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 )
             # merge any user-defined agents persisted in the store
             try:
-                for r in store.list_agents():
+                for r in store.list_agents(include_disabled=True):
                     if r.get("name") in {x["name"] for x in out}:
                         continue
                     out.append(
@@ -6535,7 +8220,9 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                             "source": "custom",
                             "supportsPlanMode": False,
                             "unrestricted": bool(r.get("unrestricted", 1)),
-                            "enabled": r["name"] not in _disabled_agents,
+                            "enabled": capability_state.is_enabled(
+                                "specialist", r["name"]
+                            ),
                             "parameters": {},
                             "systemPrompt": None,
                         }
@@ -6596,13 +8283,21 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
             }
 
         def _exec_log(self, root_frame_id: str) -> dict:
-            return execution_views.execution_log(root_frame_id)
+            return execution_views.execution_log(
+                root_frame_id,
+                branch_id=runner.store.active_session_branch(root_frame_id),
+            )
 
         def _lineage(self, artifact_id: str) -> dict:
             return execution_views.artifact_lineage(artifact_id)
 
         def _edit_artifact(self, artifact_id: str, content: str) -> dict:
             try:
+                artifact = store.get_artifact(artifact_id)
+                if artifact and artifact.get("root_frame_id"):
+                    _require_session_writable(
+                        str(artifact["root_frame_id"]), "editing an Artifact"
+                    )
                 return runner.artifacts.edit(
                     artifact_id,
                     content,
@@ -6614,10 +8309,20 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 raise GatewayError(error.code, error.message) from error
 
         def _restore_version(self, artifact_id: str, version_id: str) -> dict:
+            artifact = store.get_artifact(artifact_id)
+            if artifact and artifact.get("root_frame_id"):
+                _require_session_writable(
+                    str(artifact["root_frame_id"]), "restoring an Artifact"
+                )
             return runner.restore_version(artifact_id, version_id)
 
         def _rename_artifact(self, artifact_id: str, filename: str | None) -> dict:
             try:
+                artifact = store.get_artifact(artifact_id)
+                if artifact and artifact.get("root_frame_id"):
+                    _require_session_writable(
+                        str(artifact["root_frame_id"]), "renaming an Artifact"
+                    )
                 return runner.artifacts.rename(
                     artifact_id,
                     filename,
@@ -6630,6 +8335,13 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
 
         def _upload(self, b: dict) -> dict:
             try:
+                frame_id = b.get("frame_id")
+                if frame_id:
+                    frame = store.get_frame(str(frame_id)) or {}
+                    _require_session_writable(
+                        str(frame.get("root_frame_id") or frame_id),
+                        "uploading a Session Artifact",
+                    )
                 return runner.artifacts.upload(
                     b,
                     broadcast=lambda root_frame_id, event: hub.broadcast(
@@ -6641,6 +8353,11 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
 
         def _delete_artifact(self, artifact_id: str) -> dict:
             try:
+                artifact = store.get_artifact(artifact_id)
+                if artifact and artifact.get("root_frame_id"):
+                    _require_session_writable(
+                        str(artifact["root_frame_id"]), "deleting an Artifact"
+                    )
                 return runner.artifacts.delete(
                     artifact_id,
                     broadcast=lambda root_frame_id, event: hub.broadcast(
@@ -6690,11 +8407,10 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                     elif t == "view_session":
                         rid = msg.get("root_frame_id") or msg.get("frame_id")
                         if rid:
-                            conn.subs.add(rid)
-                            # resume: replay the in-flight turn's buffered stream
-                            # so a client reopening a session mid-run catches up.
-                            if hub.is_running(rid):
-                                hub.replay(rid, conn)
+                            # Subscription and replay share the hub's enqueue
+                            # order with live broadcasts, so a new Cell event
+                            # can never interleave into an older snapshot.
+                            hub.subscribe(rid, conn)
                             # re-surface any tool-call approval prompt that is
                             # still pending, so a mid-pause reconnect can answer.
                             try:
@@ -6737,7 +8453,8 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                         )
                     elif t == "unview_session":
                         rid = msg.get("root_frame_id") or msg.get("frame_id")
-                        conn.subs.discard(rid)
+                        if rid:
+                            hub.unsubscribe(rid, conn)
             finally:
                 conn.close()  # stop the writer thread + mark dead
                 hub.remove(conn)
@@ -6972,14 +8689,24 @@ def build_app_server(cfg: Config | None = None) -> ThreadingHTTPServer:
         pass
     _seed_example_project(cfg)
     _seed_example_connector(cfg)
-    try:
-        _seed_demo_session(cfg, runner)
-    except Exception:  # noqa: BLE001 - seeding must never block startup
-        traceback.print_exc()
+    if _demo_seed_enabled():
+        try:
+            _seed_demo_session(cfg, runner)
+        except Exception:  # noqa: BLE001 - seeding must never block startup
+            traceback.print_exc()
     handler = make_handler(cfg, hub, runner)
     httpd = _GatewayHTTPServer((cfg.host, cfg.port), handler, runner=runner)
     httpd.daemon_threads = True
     return httpd
+
+
+def _demo_seed_enabled() -> bool:
+    return os.environ.get("OPENAI4S_SEED_DEMO", "1").strip().casefold() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
 
 
 def serve_app(cfg: Config | None = None, *, block: bool = True) -> ThreadingHTTPServer:
@@ -7305,20 +9032,10 @@ _DEMO_SESSION_NAME = "NIF3/DUF34 family (real UniProt + biochemistry + RCSB PDB)
 _LEGACY_DEMO_NAMES = ("NIF3/DUF34 phylogeny (live UniProt + RCSB PDB + MCP)",)
 
 
-def _retire_demo_frame(store: Store, frame_id: str) -> None:
-    """Delete a superseded demo session and the artifacts it produced. Best
-    effort: a failure here must never block seeding the new session."""
+def _retire_demo_frame(runner: "SessionRunner", frame_id: str) -> None:
+    """Delete a superseded demo through the complete session lifecycle."""
     try:
-        for art in store.list_artifacts({"root_frame_id": frame_id}):
-            try:
-                for _p in store.delete_artifact(art["artifact_id"]):
-                    try:
-                        os.remove(_p)
-                    except OSError:
-                        pass
-            except Exception:  # noqa: BLE001
-                pass
-        store.delete_frame(frame_id)
+        runner.delete_session(frame_id)
     except Exception:  # noqa: BLE001
         traceback.print_exc()
 
@@ -7336,7 +9053,7 @@ def _seed_demo_session(cfg: Config, runner: "SessionRunner") -> None:
     # example replaces the old one rather than coexisting with it.
     for r in roots:
         if (r.get("name") or "") in _LEGACY_DEMO_NAMES:
-            _retire_demo_frame(store, r.get("frame_id") or r.get("id"))
+            _retire_demo_frame(runner, r.get("frame_id") or r.get("id"))
     if any((r.get("name") or "") == _DEMO_SESSION_NAME for r in roots):
         return  # current demo already present
     fid = store.new_frame(
@@ -7351,7 +9068,7 @@ def _seed_demo_session(cfg: Config, runner: "SessionRunner") -> None:
         "profile, fetch a representative structure from the RCSB PDB "
         "API, and write a reproducible report — every value real.",
     )
-    store.add_message(
+    demo_user_message = store.add_message(
         root_frame_id=fid,
         role="user",
         frame_id=fid,
@@ -7361,6 +9078,11 @@ def _seed_demo_session(cfg: Config, runner: "SessionRunner") -> None:
         "identity, plot a Kyte-Doolittle hydropathy profile, fetch a "
         "representative 3D structure from the RCSB PDB API, and write a "
         "short reproducible report.",
+    )
+    runner._capture_cursor_checkpoint_best_effort(  # noqa: SLF001
+        fid,
+        source_kind="message",
+        source_id=demo_user_message["message_id"],
     )
     for code in (_DEMO_UNIPROT, _DEMO_MCP, _DEMO_PLOT, _DEMO_CSV, _DEMO_PDB, _DEMO_MD):
         try:

@@ -6,12 +6,14 @@ import base64
 import binascii
 import hashlib
 import json
+import os
 import re
 import shutil
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
+from openai4s.artifact_restore import ArtifactRestoreService
 from openai4s.execution import CaptureResult
 
 _JUNK_DIR_SEGMENTS = frozenset(
@@ -113,7 +115,36 @@ class ArtifactManager:
 
     def live_path(self, artifact: dict) -> Path:
         root_frame_id = artifact.get("root_frame_id") or "default"
-        return self.workspace_for(root_frame_id) / artifact["filename"]
+        workspace = self.workspace_for(root_frame_id).expanduser().resolve()
+        filename = artifact.get("filename")
+        if not isinstance(filename, str) or not filename or "\x00" in filename:
+            raise ArtifactOperationError(400, "artifact filename is invalid")
+        candidate = Path(filename)
+        if candidate.is_absolute():
+            raise ArtifactOperationError(400, "artifact path must be relative")
+        target = (workspace / candidate).expanduser().resolve()
+        try:
+            target.relative_to(workspace)
+        except ValueError as error:
+            raise ArtifactOperationError(
+                400, "artifact live path escapes its workspace"
+            ) from error
+        return target
+
+    def restore_live_path(self, artifact: dict, current: dict) -> Path:
+        """Resolve the exact live file while rejecting workspace escapes."""
+        root_frame_id = artifact.get("root_frame_id") or "default"
+        workspace = self.workspace_for(root_frame_id).expanduser().resolve()
+        raw_path = current.get("path") or artifact.get("filename") or ""
+        candidate = Path(raw_path)
+        target = (
+            candidate if candidate.is_absolute() else workspace / candidate
+        ).expanduser().resolve()
+        try:
+            target.relative_to(workspace)
+        except ValueError as error:
+            raise PermissionError("artifact live path escapes its workspace") from error
+        return target
 
     def write_version_snapshot(
         self,
@@ -170,45 +201,50 @@ class ArtifactManager:
                 continue
 
     def restore(self, artifact_id: str, version_id: str) -> dict:
-        """Make a historical version current and restore its workspace bytes."""
+        """Restore a historical snapshot as a fresh immutable version."""
         artifact = self.store.get_artifact(artifact_id)
         version = self.store.version_meta(version_id)
         if not artifact or not version or version.get("artifact_id") != artifact_id:
             return {"error": "version not found"}
-        source = version.get("snapshot_path") or version.get("path")
-        if not source:
-            return {"error": "version has no stored bytes"}
         try:
-            data = Path(source).read_bytes()
-            live = self.live_path(artifact)
-            current_id = artifact.get("latest_version_id")
-            current = self.store.version_meta(current_id) if current_id else None
-            if (
-                current
-                and not current.get("snapshot_path")
-                and current.get("path")
-                and Path(current["path"]).resolve() == live.resolve()
-                and live.exists()
-            ):
-                self.write_version_snapshot(
-                    current_id, artifact["filename"], data=live.read_bytes()
-                )
-            live.parent.mkdir(parents=True, exist_ok=True)
-            live.write_bytes(data)
-        except OSError as error:
+            restored = ArtifactRestoreService(
+                store=self.store,
+                primary_snapshot_dir=self.versions_dir(),
+                trusted_snapshot_dirs=(self.data_dir / "artifacts",),
+                resolve_live_path=self.restore_live_path,
+            ).restore(
+                artifact=artifact,
+                source_version_id=version_id,
+                frame_id=artifact.get("root_frame_id"),
+            )
+        except (KeyError, OSError, PermissionError, RuntimeError, ValueError) as error:
             return {"error": f"restore failed: {error}"}
-        self.store.set_latest_version(artifact_id, version_id)
-        if artifact.get("root_frame_id"):
+
+        current_artifact = self.store.get_artifact(artifact_id)
+        root_frame_id = artifact.get("root_frame_id")
+        if root_frame_id:
             self.broadcast(
-                artifact["root_frame_id"],
+                root_frame_id,
                 {
                     "type": "artifact_created",
-                    "root_frame_id": artifact["root_frame_id"],
+                    "root_frame_id": root_frame_id,
+                    "artifact": {
+                        "id": artifact_id,
+                        "artifact_id": artifact_id,
+                        "filename": restored.get("filename"),
+                        "content_type": restored.get("content_type"),
+                        "version_id": restored["version_id"],
+                        "root_frame_id": root_frame_id,
+                        "restored_from_version_id": version_id,
+                    },
                 },
             )
         return {
             "ok": True,
-            "artifact": self.store.get_artifact(artifact_id),
+            "artifact": current_artifact,
+            "version_id": restored["version_id"],
+            "restored_from_version_id": version_id,
+            "snapshot_verified": True,
         }
 
     def edit(
@@ -304,6 +340,7 @@ class ArtifactManager:
         artifact = self.store.get_artifact(artifact_id)
         if not artifact:
             raise ArtifactOperationError(404, "artifact not found")
+        self.live_path({**artifact, "filename": filename})
         self.store.rename_artifact(artifact_id, filename)
         root_frame_id = artifact.get("root_frame_id")
         self._notify(
@@ -389,12 +426,36 @@ class ArtifactManager:
         """Delete an artifact, reclaim unreferenced files, and notify its frame."""
         artifact = self.store.get_artifact(artifact_id)
         stale_paths = self.store.delete_artifact(artifact_id)
+        root_frame_id = artifact.get("root_frame_id") if artifact else None
+        trusted_roots = [self.versions_dir()]
+        if root_frame_id:
+            trusted_roots.append(self.workspace_for(root_frame_id))
+        else:
+            trusted_roots.append(self.data_dir / "uploads")
         for path in stale_paths:
             try:
-                Path(path).unlink()
+                candidate = Path(os.path.abspath(Path(path).expanduser()))
+                if candidate.is_symlink():
+                    continue
+                resolved = candidate.resolve(strict=False)
+                allowed = False
+                for root in trusted_roots:
+                    lexical_root = Path(os.path.abspath(root))
+                    resolved_root = root.resolve()
+                    if (
+                        (candidate == lexical_root or lexical_root in candidate.parents)
+                        and (
+                            resolved == resolved_root
+                            or resolved_root in resolved.parents
+                        )
+                    ):
+                        allowed = True
+                        break
+                if not allowed:
+                    continue
+                candidate.unlink()
             except OSError:
                 pass
-        root_frame_id = artifact.get("root_frame_id") if artifact else None
         self._notify(
             root_frame_id,
             {

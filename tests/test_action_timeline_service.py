@@ -25,6 +25,8 @@ def test_timeline_projects_groups_events_and_attempt_milestones(tmp_path):
         model="science-model",
         wire_state={"response_id": "must-not-leak"},
         assistant_content="I will compute this.",
+        usage={"input_tokens": 120, "output_tokens": 30, "total_tokens": 150},
+        cost_usd=0.000321,
         created_at=2,
     )
     store.append_action_event(
@@ -62,12 +64,56 @@ def test_timeline_projects_groups_events_and_attempt_milestones(tmp_path):
     code = timeline["groups"][1]
     assert code["title"] == "Score candidate sequences"
     assert code["status"] == "completed"
+    assert code["owner"] == "agent"
+    assert code["language"] == "python"
+    assert code["replay_policy"] == "requires_review"
+    assert code["usage"] == {
+        "input_tokens": 120,
+        "output_tokens": 30,
+        "total_tokens": 150,
+    }
+    assert code["cost"] == 0.000321
     assert code["events"][0]["resource_keys"] == ["kernel:python"]
     assert code["attempts"][0]["generation_id"] == "generation-1"
     assert code["attempts"][0]["capture_at"] == 7
     assert "wire_state" not in code
     assert "raw_arguments" not in code["events"][0]
     assert "must-not-leak" not in repr(timeline)
+    store.close()
+
+
+def test_timeline_projects_permission_resolution_without_payload(tmp_path):
+    store = Store(tmp_path / "openai4s.db")
+    group = store.append_action_group(
+        root_frame_id="root", turn_id="turn", kind="native_tools"
+    )
+    store.append_action_event(
+        group_id=group["group_id"],
+        type="permission_pending",
+        result={"decision_id": "perm-1", "state": "pending", "secret": "hidden"},
+        side_effect_class="external_side_effect",
+    )
+    store.append_action_event(
+        group_id=group["group_id"],
+        type="permission_resolved",
+        result={
+            "decision_id": "perm-1",
+            "state": "allowed",
+            "scope": "once",
+            "secret": "hidden",
+        },
+        side_effect_class="external_side_effect",
+    )
+
+    public = ActionTimelineService(store).get("root")["groups"][0]
+
+    assert public["permission"] == {
+        "decision_id": "perm-1",
+        "state": "allowed",
+        "scope": "once",
+    }
+    assert public["replay_policy"] == "never"
+    assert "hidden" not in repr(public)
     store.close()
 
 

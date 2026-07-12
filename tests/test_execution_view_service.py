@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 
 from openai4s.server.execution_views import ExecutionViewService
@@ -14,9 +16,13 @@ class _Store:
         self.versions = {}
         self.inputs = {}
         self.cell_details = {}
+        self.cursor_checkpoints = {}
 
     def list_cells(self, root_frame_id):
         return self.cells.get(root_frame_id, [])
+
+    def session_checkpoint_source_map(self, root_frame_id, *, source_kind):
+        return self.cursor_checkpoints.get((root_frame_id, source_kind), {})
 
     def get_artifact(self, artifact_id):
         return self.artifacts.get(artifact_id)
@@ -85,6 +91,9 @@ def test_execution_log_keeps_order_defaults_and_first_seen_kernels():
             "peak_rss_kb": 0,
         },
     ]
+    store.cursor_checkpoints[("frame", "cell")] = {
+        "legacy-cell-2": "cp-cell-2"
+    }
 
     payload = _service(store).execution_log("frame")
 
@@ -96,10 +105,21 @@ def test_execution_log_keeps_order_defaults_and_first_seen_kernels():
         "state_revision",
         "generation_id",
         "producing_cell_id",
+        "fork_checkpoint_id",
         "kernel_id",
         "language",
         "origin",
         "source",
+        "code_hash",
+        "visibility",
+        "pin",
+        "replay_policy",
+        "variable_reads",
+        "variable_writes",
+        "variable_deletes",
+        "mutation_uncertain",
+        "stale",
+        "stale_reasons",
         "stdout",
         "stderr",
         "error",
@@ -117,6 +137,7 @@ def test_execution_log_keeps_order_defaults_and_first_seen_kernels():
     }
     assert first == {
         "producing_cell_id": "legacy-cell-2",
+        "fork_checkpoint_id": "cp-cell-2",
         "cell_index": 2,
         "state_revision": 9,
         "generation_id": "generation-python-9",
@@ -124,6 +145,16 @@ def test_execution_log_keeps_order_defaults_and_first_seen_kernels():
         "language": "python",
         "origin": None,
         "source": "",
+        "code_hash": hashlib.sha256(b"").hexdigest(),
+        "visibility": "scientific",
+        "pin": False,
+        "replay_policy": "conditional",
+        "variable_reads": [],
+        "variable_writes": [],
+        "variable_deletes": [],
+        "mutation_uncertain": False,
+        "stale": False,
+        "stale_reasons": [],
         "stdout": "",
         "stderr": "",
         "error": "",
@@ -285,6 +316,93 @@ def test_retry_projection_does_not_cross_runtime_or_non_agent_boundaries():
         "r-error",
         "user-cell",
     ]
+
+
+def test_stale_projection_invalidates_only_old_value_consumers_transitively():
+    store = _Store()
+    store.cells["frame"] = [
+        {
+            "producing_cell_id": "producer-x",
+            "cell_index": 1,
+            "state_revision": 1,
+            "code": "x = 1",
+        },
+        {
+            "producing_cell_id": "consumer-x",
+            "cell_index": 2,
+            "state_revision": 2,
+            "code": "y = x + 1",
+        },
+        {
+            "producing_cell_id": "consumer-y",
+            "cell_index": 3,
+            "state_revision": 3,
+            "code": "z = y * 2",
+        },
+        {
+            "producing_cell_id": "independent",
+            "cell_index": 4,
+            "state_revision": 4,
+            "code": "label = 'independent'",
+        },
+        {
+            "producing_cell_id": "replacement-x",
+            "cell_index": 5,
+            "state_revision": 5,
+            "code": "x = 10",
+        },
+    ]
+
+    entries = _service(store).execution_log("frame")["entries"]
+    projected = {
+        entry["producing_cell_id"]: (
+            entry["stale"],
+            entry["stale_reasons"],
+        )
+        for entry in entries
+    }
+
+    assert projected["producer-x"] == (False, [])
+    assert projected["consumer-x"][0] is True
+    assert projected["consumer-y"][0] is True
+    assert projected["consumer-x"][1] == projected["consumer-y"][1]
+    assert "variable 'x'" in projected["consumer-x"][1][0]
+    assert "replacement-x" in projected["consumer-x"][1][0]
+    assert projected["independent"] == (False, [])
+    assert projected["replacement-x"] == (False, [])
+
+
+def test_notebook_projection_hides_unpinned_non_scientific_cells():
+    store = _Store()
+    store.cells["frame"] = [
+        {
+            "producing_cell_id": "scientific",
+            "code": "result = 1",
+            "visibility": "scientific",
+        },
+        {
+            "producing_cell_id": "scratch-hidden",
+            "code": "probe = 2",
+            "visibility": "scratch",
+        },
+        {
+            "producing_cell_id": "recovery-pinned",
+            "code": "restored = True",
+            "visibility": "recovery",
+            "pin": True,
+            "replay_policy": "safe",
+        },
+    ]
+
+    entries = _service(store).execution_log("frame")["entries"]
+
+    assert [entry["producing_cell_id"] for entry in entries] == [
+        "scientific",
+        "recovery-pinned",
+    ]
+    assert entries[1]["visibility"] == "recovery"
+    assert entries[1]["pin"] is True
+    assert entries[1]["replay_policy"] == "safe"
 
 
 def test_lineage_merges_reads_deduplicates_and_filters_only_dependency_inputs():

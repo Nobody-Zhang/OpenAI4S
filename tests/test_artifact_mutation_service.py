@@ -181,6 +181,28 @@ def test_rename_changes_metadata_only_and_preserves_exact_event_shape(tmp_path):
     )
 
 
+def test_artifact_mutations_fail_closed_on_workspace_escape_metadata(tmp_path):
+    harness = MutationHarness(tmp_path)
+    record = harness.artifact("safe.txt", b"safe", "text/plain")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("sentinel", encoding="utf-8")
+
+    raised_operation(
+        lambda: harness.manager.rename(record["artifact_id"], "../../outside.txt"),
+        400,
+        "artifact live path escapes its workspace",
+    )
+    assert harness.store.get_artifact(record["artifact_id"])["filename"] == "safe.txt"
+
+    harness.store.rename_artifact(record["artifact_id"], "../../outside.txt")
+    raised_operation(
+        lambda: harness.manager.edit(record["artifact_id"], "compromised"),
+        400,
+        "artifact live path escapes its workspace",
+    )
+    assert outside.read_text("utf-8") == "sentinel"
+
+
 def test_upload_keeps_legacy_decode_versioning_and_event_contracts(tmp_path):
     harness = MutationHarness(tmp_path)
 

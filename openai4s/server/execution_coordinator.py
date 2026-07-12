@@ -261,6 +261,56 @@ class WebExecutionCoordinator:
         result["interrupted"] = interrupted
         return result
 
+    def interrupt(
+        self,
+        session_id: str,
+        *,
+        execution_id: str,
+        owner: ExecutionOwner | str,
+        owner_id: str | None = None,
+        reason: str = "interrupted by user",
+    ) -> dict[str, Any]:
+        """Interrupt only an exact *running* ticket/owner pair.
+
+        ``cancel`` intentionally accepts both queued and running tickets.  A
+        kernel interrupt is narrower: a queued ticket has no frozen kernel
+        lease and must remain queued.  Keeping this distinction here avoids a
+        check-then-cancel race in the HTTP adapter and prevents a queued Agent
+        identity from being reported as an interrupted scientific cell.
+        """
+
+        identity = self._owner(owner, owner_id)
+        with self._lock:
+            ticket = self._tickets.get(execution_id)
+        if (
+            ticket is None
+            or ticket.session_id != session_id
+            or ticket.owner != identity
+        ):
+            return self._cancel_result(
+                False, session_id, execution_id, identity, "not_found"
+            )
+        if ticket.state is not TicketState.RUNNING:
+            return self._cancel_result(
+                False, session_id, execution_id, identity, ticket.status
+            )
+        changed = self._coordinator.request_interrupt(
+            session_id=session_id,
+            execution_id=execution_id,
+            owner=identity,
+            reason=reason,
+        )
+        interrupted = self._signal_binding(execution_id) if changed else False
+        result = self._cancel_result(
+            changed,
+            session_id,
+            execution_id,
+            identity,
+            "running" if changed else "already_requested",
+        )
+        result["interrupted"] = interrupted
+        return result
+
     def cancel_current(
         self, session_id: str, *, reason: str = "cancelled by user"
     ) -> dict[str, Any]:

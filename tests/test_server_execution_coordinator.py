@@ -7,7 +7,7 @@ import threading
 import time
 
 from openai4s.config import Config, LLMConfig
-from openai4s.execution import ExecutionCancelled
+from openai4s.execution import ExecutionCancelled, TicketState
 from openai4s.server import gateway as gateway_mod
 from openai4s.server.execution_coordinator import WebExecutionCoordinator
 
@@ -142,6 +142,42 @@ def test_exact_cancel_interrupts_only_matching_ticket_lease():
     assert not thread.is_alive()
 
 
+def test_kernel_interrupt_rejects_queued_ticket_without_cancelling_it():
+    coordinator = WebExecutionCoordinator(lambda *_args: None)
+    active_cancel = threading.Event()
+    active = coordinator.submit("frame-a", owner="user_repl", owner_id="cell-a")
+    queued = coordinator.submit("frame-a", owner="agent", owner_id="job-b")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def run_active() -> None:
+        with coordinator.admitted(active, cancel_event=active_cancel):
+            entered.set()
+            assert release.wait(2)
+
+    thread = threading.Thread(target=run_active)
+    thread.start()
+    assert entered.wait(1)
+
+    result = coordinator.interrupt(
+        "frame-a",
+        execution_id=queued.execution_id,
+        owner=queued.owner,
+        reason="must not interrupt a queued Agent",
+    )
+
+    assert result["ok"] is False
+    assert result["scope"] == "queued"
+    assert queued.state is TicketState.QUEUED
+    assert not queued.cancellation.is_set()
+    assert not active_cancel.is_set()
+    assert coordinator.snapshot("frame-a")["owner"]["execution_id"] == active.execution_id
+
+    release.set()
+    thread.join(1)
+    assert not thread.is_alive()
+
+
 def test_repl_owner_releases_then_queued_agent_continues(monkeypatch, tmp_path):
     runner = _runner(tmp_path)
     frame_id = runner.store.new_frame(
@@ -195,6 +231,45 @@ def test_repl_owner_releases_then_queued_agent_continues(monkeypatch, tmp_path):
     assert job.wait_result()["status"] == "completed"
     assert order == ["repl-enter", "repl-exit", "agent"]
     assert repl_result["status"] == "completed"
+    assert repl_result["cell"]["state_revision"] == 1
+    assert repl_result["cell"]["generation_id"] is None
+    runner.close()
+
+
+def test_submit_repl_returns_ticket_before_cell_finishes(monkeypatch, tmp_path):
+    runner = _runner(tmp_path)
+    frame_id = runner.store.new_frame(
+        kind="turn", project_id="default", status="ready"
+    )
+    entered = threading.Event()
+    release = threading.Event()
+
+    def fake_run_repl(*_args, **_kwargs):
+        entered.set()
+        assert release.wait(2)
+        return {
+            "status": "completed",
+            "frame_id": frame_id,
+            "execution_id": "repl-async",
+        }
+
+    monkeypatch.setattr(runner, "run_repl", fake_run_repl)
+
+    job = runner.submit_repl(
+        frame_id,
+        "default",
+        "print('queued')",
+        execution_id="repl-async",
+    )
+
+    assert job.execution_id == "repl-async"
+    assert job.execution_owner == {"kind": "user_repl", "id": "repl-async"}
+    assert entered.wait(1)
+    assert job.done.is_set() is False
+    snapshot = runner.executions.snapshot(frame_id)
+    assert snapshot["owner"]["execution_id"] == "repl-async"
+    release.set()
+    assert job.wait_result()["status"] == "completed"
     runner.close()
 
 

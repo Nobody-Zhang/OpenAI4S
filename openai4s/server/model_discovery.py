@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 from urllib.parse import urlsplit
-from urllib.request import ProxyHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +58,19 @@ DEFAULT_LOCAL_ENDPOINTS: tuple[LocalModelEndpoint, ...] = (
 )
 
 
+class _RejectRedirects(HTTPRedirectHandler):
+    """Keep a loopback probe on the exact fixed endpoint.
+
+    ``urllib`` follows redirects by default.  A local server must not be able
+    to turn this bounded discovery request into a fetch of another loopback
+    port, a private-network service, or a public URL.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        del req, fp, code, msg, headers, newurl
+        return None
+
+
 def _loopback_http(url: str) -> bool:
     """Return true only for literal loopback HTTP(S) probe URLs."""
 
@@ -66,7 +79,14 @@ def _loopback_http(url: str) -> bool:
         address = ipaddress.ip_address(parsed.hostname or "")
     except (ValueError, TypeError):
         return False
-    return parsed.scheme in {"http", "https"} and address.is_loopback
+    return bool(
+        parsed.scheme in {"http", "https"}
+        and address.is_loopback
+        and not parsed.username
+        and not parsed.password
+        and not parsed.query
+        and not parsed.fragment
+    )
 
 
 class LocalModelDiscoveryService:
@@ -94,7 +114,7 @@ class LocalModelDiscoveryService:
         self.cache_ttl_s = max(0.0, float(cache_ttl_s))
         self.max_response_bytes = max(1024, int(max_response_bytes))
         # Environment proxies are intentionally ignored for loopback discovery.
-        self._opener = opener or build_opener(ProxyHandler({}))
+        self._opener = opener or build_opener(ProxyHandler({}), _RejectRedirects())
         self._clock = clock
         self._lock = threading.RLock()
         self._cached_at = float("-inf")

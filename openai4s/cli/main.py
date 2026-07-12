@@ -6,6 +6,7 @@
   openai4s url      print the local web UI url
   openai4s run "<task>"   run one Code-as-Action task (in-process, no daemon)
   openai4s setup    create the four default conda envs from envs/*.yml
+  openai4s jupyter  describe/export/install the optional Jupyter bridge
 """
 from __future__ import annotations
 
@@ -165,6 +166,69 @@ def cmd_run(args) -> int:
             )
         if result.get("final_message"):
             print("final:", result["final_message"])
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+#  optional Jupyter adapter — stdlib KernelSpec operations, lazy wire import
+# --------------------------------------------------------------------------- #
+
+
+def cmd_jupyter_describe(args) -> int:
+    from openai4s.adapters.jupyter import adapter_status
+
+    status = adapter_status()
+    if args.json:
+        print(json.dumps(status, ensure_ascii=False, indent=2))
+        return 0
+    bridge = "available" if status["bridge_available"] else "not installed"
+    print(f"Jupyter bridge: {bridge}")
+    print("  scope      : standalone (not a Web-session attachment)")
+    print("  host RPC   : unavailable")
+    print("  protocol   : Jupyter wire adapter -> hardened OpenAI4S JSON-line worker")
+    for kernel in status["kernels"]:
+        print(f"  kernelspec : {kernel['name']} ({kernel['language']})")
+    if not status["bridge_available"]:
+        print("  install    : python -m pip install 'ipykernel>=7,<8'")
+    return 0
+
+
+def _print_kernelspec_writes(written: list[dict], action: str) -> None:
+    for item in written:
+        print(f"{action} {item['name']}: {item['kernel_json']}")
+
+
+def cmd_jupyter_export(args) -> int:
+    from openai4s.adapters.jupyter import write_kernelspecs
+    from openai4s.adapters.jupyter.kernelspec import KernelSpecError
+
+    try:
+        written = write_kernelspecs(
+            args.output,
+            languages=args.language,
+            replace=args.replace,
+        )
+    except (KernelSpecError, OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    _print_kernelspec_writes(written, "exported")
+    return 0
+
+
+def cmd_jupyter_install(args) -> int:
+    from openai4s.adapters.jupyter import install_kernelspecs
+    from openai4s.adapters.jupyter.kernelspec import KernelSpecError
+
+    try:
+        written = install_kernelspecs(
+            prefix=args.prefix,
+            languages=args.language,
+            replace=args.replace,
+        )
+    except (KernelSpecError, OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    _print_kernelspec_writes(written, "installed")
     return 0
 
 
@@ -337,6 +401,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="print the commands that would run, without executing",
     )
     pu.set_defaults(fn=cmd_setup)
+
+    pj = sub.add_parser(
+        "jupyter",
+        help="describe/export/install the optional Jupyter adapter",
+    )
+    jsub = pj.add_subparsers(dest="jupyter_action", required=True)
+    jd = jsub.add_parser("describe", help="show adapter capabilities and limits")
+    jd.add_argument("--json", action="store_true", help="emit JSON")
+    jd.set_defaults(fn=cmd_jupyter_describe)
+    je = jsub.add_parser("export", help="export standard KernelSpec directories")
+    je.add_argument("output", type=Path, help="destination kernels directory")
+    je.add_argument(
+        "--language",
+        choices=("all", "python", "r"),
+        default="all",
+    )
+    je.add_argument(
+        "--replace",
+        action="store_true",
+        help="replace kernel.json in an existing spec directory",
+    )
+    je.set_defaults(fn=cmd_jupyter_export)
+    ji = jsub.add_parser("install", help="install KernelSpecs for Jupyter clients")
+    ji.add_argument(
+        "--prefix",
+        type=Path,
+        help="install below PREFIX/share/jupyter/kernels (default: user data dir)",
+    )
+    ji.add_argument(
+        "--language",
+        choices=("all", "python", "r"),
+        default="all",
+    )
+    ji.add_argument(
+        "--replace",
+        action="store_true",
+        help="replace kernel.json in an existing spec directory",
+    )
+    ji.set_defaults(fn=cmd_jupyter_install)
     return p
 
 

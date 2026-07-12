@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from openai4s.agent.actions import (
+    INCOMPLETE_CELL_NUDGE,
     MULTI_CELL_NOTE,
     NO_CODE_NUDGE,
     Action,
@@ -14,6 +15,8 @@ from openai4s.agent.actions import (
     FinalizeAction,
     NativeToolBatch,
     count_code_blocks,
+    has_incomplete_code_block,
+    is_completion_only_cell,
 )
 from openai4s.agent.control import execute_native_batch, tool_parallel_policy
 from openai4s.agent.events import (
@@ -66,6 +69,118 @@ def _public_prose_before_action(text: str) -> str:
         len(text),
     )
     return strip_fenced_blocks(text[:cutoff])
+
+
+def _first_code_draft(text: str) -> tuple[str, str, bool] | None:
+    """Project the first Python/R action fence, including an open live draft."""
+
+    for block in scan_fenced_blocks(text):
+        if not _is_action_fence(block.fence_char, block.info):
+            continue
+        # A legacy ``tool`` fence is not a Python/R draft and does not prevent
+        # the real action router from selecting a later executable Cell.
+        # Continue scanning so the live Notebook projection cannot drift from
+        # ``route_action`` for replies that contain both forms.
+        if block.fence_char != "`" or block.info == "tool":
+            continue
+        language = "r" if block.info == "r" else "python"
+        return language, block.body, block.closed
+    return None
+
+
+class CodeDraftStreamer:
+    """Publish one replace-in-place Notebook draft while the model writes.
+
+    Drafts are transient UI projections, never Cells or execution records.  A
+    stable ``draft_id`` lets the browser replace the last block as tokens arrive
+    instead of appending a succession of broken-looking fragments.
+    """
+
+    _MAX_REPLY_CHARS = 200_000
+    # Once a Cell fence is active, projecting the complete accumulated source
+    # on every streamed newline makes both scanning and WebSocket traffic
+    # quadratic for long scientific cells.  The initial scan remains eager so
+    # a newly opened fence appears quickly; active drafts update in bounded
+    # chunks and always receive one final projection at ReplyReceived.
+    _INITIAL_SCAN_STEP = 128
+    _SCAN_STEP = 512
+
+    def __init__(self, send: Callable[[dict], None], root_frame_id: str, turn: int):
+        self.send = send
+        self.rid = root_frame_id
+        self.draft_id = f"draft:{root_frame_id}:{turn}"
+        self.acc = ""
+        self.last_scan_at = 0
+        self.last_source: str | None = None
+        self.last_complete = False
+        self.revision = 0
+        self.active = False
+
+    def feed(self, delta: str) -> None:
+        if not delta or len(self.acc) >= self._MAX_REPLY_CHARS:
+            return
+        remaining = self._MAX_REPLY_CHARS - len(self.acc)
+        self.acc += str(delta)[:remaining]
+        distance = len(self.acc) - self.last_scan_at
+        should_scan = (
+            (
+                not self.active
+                and ("\n" in str(delta) or distance >= self._INITIAL_SCAN_STEP)
+            )
+            or (
+                self.active
+                and (distance >= self._SCAN_STEP or "```" in str(delta))
+            )
+        )
+        if should_scan:
+            self._project()
+
+    def finalize(self, content: str) -> None:
+        self.acc = str(content or "")[: self._MAX_REPLY_CHARS]
+        self._project()
+
+    def clear(self, reason: str) -> None:
+        if not self.active:
+            return
+        self.revision += 1
+        self.send(
+            {
+                "type": "notebook_cell_draft",
+                "frame_id": self.rid,
+                "root_frame_id": self.rid,
+                "draft_id": self.draft_id,
+                "revision": self.revision,
+                "status": "discarded",
+                "reason": str(reason or "discarded")[:80],
+            }
+        )
+        self.active = False
+
+    def _project(self) -> None:
+        self.last_scan_at = len(self.acc)
+        draft = _first_code_draft(self.acc)
+        if draft is None:
+            return
+        language, source, complete = draft
+        if source == self.last_source and complete == self.last_complete:
+            return
+        self.revision += 1
+        self.last_source = source
+        self.last_complete = complete
+        self.active = True
+        self.send(
+            {
+                "type": "notebook_cell_draft",
+                "frame_id": self.rid,
+                "root_frame_id": self.rid,
+                "draft_id": self.draft_id,
+                "revision": self.revision,
+                "language": language,
+                "source": source,
+                "complete": complete,
+                "status": "ready" if complete else "drafting",
+            }
+        )
 
 
 class ProseStreamer:
@@ -164,6 +279,7 @@ class WebEventSink:
     current_prose: str = field(default="", init=False)
     model_prose: str = field(default="", init=False)
     _streamer: ProseStreamer | None = field(default=None, init=False)
+    _code_draft: CodeDraftStreamer | None = field(default=None, init=False)
     _current_action: Action | None = field(default=None, init=False)
 
     def emit(self, event: AgentEvent) -> None:
@@ -181,11 +297,20 @@ class WebEventSink:
                 self.root_frame_id,
                 before_first_action=True,
             )
+            self._code_draft = CodeDraftStreamer(
+                self.send,
+                self.root_frame_id,
+                event.turn,
+            )
         elif isinstance(event, TextDelta):
             self._ensure_streamer().feed(event.text)
+            if self._code_draft is not None:
+                self._code_draft.feed(event.text)
         elif isinstance(event, ReplyReceived):
             streamer = self._ensure_streamer()
             streamer.finalize()
+            if self._code_draft is not None:
+                self._code_draft.finalize(event.reply.content)
             if event.reply.usage:
                 self.add_usage(event.reply.usage)
             prose = _public_prose_before_action(event.reply.content).strip()
@@ -206,6 +331,11 @@ class WebEventSink:
                     )
         elif isinstance(event, ActionRouted):
             self._current_action = event.action
+            if self._code_draft is not None and (
+                not isinstance(event.action, CodeCell)
+                or is_completion_only_cell(event.action)
+            ):
+                self._code_draft.clear("not_executed")
             if (
                 self.narrate_actions
                 and not self.current_prose
@@ -214,20 +344,19 @@ class WebEventSink:
                 self._publish(
                     action_narration(event.action, self.language), before_action=True
                 )
-        elif (
-            isinstance(event, OutcomeProduced)
-            and self.narrate_actions
-            and not self.cancelled()
-        ):
-            self._publish(
-                outcome_narration(
-                    self._current_action,
-                    event.outcome,
-                    self.language,
-                    had_public_prose=bool(self.model_prose),
-                ),
-                before_action=False,
-            )
+        elif isinstance(event, OutcomeProduced):
+            if self._code_draft is not None:
+                self._code_draft.clear("action_finished")
+            if self.narrate_actions and not self.cancelled():
+                self._publish(
+                    outcome_narration(
+                        self._current_action,
+                        event.outcome,
+                        self.language,
+                        had_public_prose=bool(self.model_prose),
+                    ),
+                    before_action=False,
+                )
 
     def _ensure_streamer(self) -> ProseStreamer:
         if self._streamer is None:
@@ -329,7 +458,10 @@ class WebActionExecutor:
             self.apply_pending()
             result = self.execute_cell(action)
             observation = format_observation(result)
-            if count_code_blocks(reply.content) > 1:
+            if (
+                count_code_blocks(reply.content) > 1
+                or has_incomplete_code_block(reply.content)
+            ):
                 observation += MULTI_CELL_NOTE
             completion = getattr(self.dispatcher(), "last_output", None)
             return self._user_observation(observation, completion=completion)
@@ -446,6 +578,8 @@ class WebActionExecutor:
                 except Exception as exc:  # noqa: BLE001
                     errors.append(f"pending environment switch failed: {exc}")
             observation = finalize_tool_batch(parts, len(calls), errors)
+        elif has_incomplete_code_block(reply.content):
+            observation = INCOMPLETE_CELL_NUDGE
         elif self.events.current_prose:
             observation = self.explore_nudge if self.explore_mode else self.prose_nudge
         else:
@@ -464,6 +598,7 @@ class WebActionExecutor:
 
 
 __all__ = [
+    "CodeDraftStreamer",
     "EventCancellation",
     "ProseStreamer",
     "WebActionExecutor",

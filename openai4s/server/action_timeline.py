@@ -10,6 +10,7 @@ accidentally turn a debugging endpoint into a credential or protocol dump.
 from __future__ import annotations
 
 import re
+import math
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from typing import Any, Protocol
@@ -121,6 +122,15 @@ class ActionTimelineService:
             "model": group.get("model"),
             "title": _safe_text(_title(group, title_events), 160),
             "status": _status(group, events, public_attempts),
+            "owner": _owner(group),
+            "permission": _permission_summary(raw_events),
+            "usage": _public_usage(group.get("usage")),
+            # Cost is persisted with the model reply using the deployment's
+            # explicit capability price metadata. Historical rows without a
+            # price remain unknown instead of displaying a fabricated zero.
+            "cost": _public_cost(group.get("cost_usd")),
+            "replay_policy": _replay_policy(events),
+            "language": _language(group, raw_events),
             "events": events,
             "attempts": public_attempts,
             "created_at": group.get("created_at"),
@@ -164,6 +174,8 @@ class ActionTimelineService:
             "producing_cell_id": attempt.get("producing_cell_id"),
             "attempt_ordinal": attempt.get("attempt_ordinal"),
             "generation_id": attempt.get("generation_id"),
+            "owner_instance_id": attempt.get("owner_instance_id"),
+            "state_revision": attempt.get("state_revision"),
             "allocated_at": attempt.get("allocated_at"),
             "started_at": attempt.get("started_at"),
             "response_at": attempt.get("response_at"),
@@ -173,6 +185,60 @@ class ActionTimelineService:
             "error": _safe_text(attempt.get("error"), 500),
             "replayed_from_cell_id": attempt.get("replayed_from_cell_id"),
         }
+
+
+def _owner(group: Mapping[str, Any]) -> str:
+    kind = str(group.get("kind") or "")
+    if kind == "user":
+        return "user"
+    if kind in {"terminal", "permission_resolution", "checkpoint", "recovery"}:
+        return "system"
+    return "agent"
+
+
+def _permission_summary(events: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
+    pending = None
+    resolved = None
+    for event in events:
+        event_type = str(event.get("type") or "")
+        result = event.get("result")
+        if event_type == "permission_pending" and isinstance(result, Mapping):
+            pending = result
+        elif event_type == "permission_resolved" and isinstance(result, Mapping):
+            resolved = result
+    selected = resolved or pending
+    if not isinstance(selected, Mapping):
+        return None
+    return {
+        "decision_id": _safe_text(selected.get("decision_id"), 120),
+        "state": _safe_text(selected.get("state"), 40),
+        "scope": _safe_text(selected.get("scope"), 40),
+    }
+
+
+def _replay_policy(events: Sequence[Mapping[str, Any]]) -> str:
+    effects = {
+        str(event.get("side_effect_class") or "unknown") for event in events
+    }
+    if effects <= {"read_only"}:
+        return "safe"
+    if effects & {"external_side_effect", "irreversible"}:
+        return "never"
+    return "requires_review"
+
+
+def _language(
+    group: Mapping[str, Any], raw_events: Sequence[Mapping[str, Any]]
+) -> str | None:
+    if str(group.get("kind") or "") != "code":
+        return None
+    for event in raw_events:
+        arguments = event.get("canonical_arguments")
+        if isinstance(arguments, Mapping):
+            language = str(arguments.get("language") or "").lower()
+            if language in {"python", "r"}:
+                return language
+    return None
 
 
 _SECRET_RE = re.compile(
@@ -186,6 +252,40 @@ def _safe_text(value: Any, limit: int) -> str | None:
         return None
     text = _SECRET_RE.sub("<redacted>", str(value))
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _public_usage(value: Any) -> dict[str, int] | None:
+    if not isinstance(value, Mapping):
+        return None
+    output: dict[str, int] = {}
+    for key in (
+        "input_tokens",
+        "output_tokens",
+        "cache_read",
+        "cache_write",
+        "reasoning_tokens",
+        "total_tokens",
+    ):
+        raw = value.get(key)
+        if raw is None or isinstance(raw, bool):
+            continue
+        try:
+            number = int(raw)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if number >= 0:
+            output[key] = number
+    return output or None
+
+
+def _public_cost(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) and number >= 0 else None
 
 
 def _public_outcome(result: Any) -> str | None:

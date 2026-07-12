@@ -595,12 +595,25 @@ class ReviewService:
                             "status": "processing",
                         }
                     )
-                    message_count = self.store.message_count(root_frame_id)
-                    messages = self.store.list_messages(
-                        root_frame_id,
-                        start=max(0, message_count - 1000),
-                        limit=1000,
+                    branch_reader = getattr(
+                        self.store, "list_branch_messages", None
                     )
+                    active_branch = getattr(
+                        self.store, "active_session_branch", None
+                    )
+                    if callable(branch_reader) and callable(active_branch):
+                        messages = branch_reader(
+                            root_frame_id,
+                            branch_id=active_branch(root_frame_id),
+                            limit=None,
+                        )[-1000:]
+                    else:
+                        message_count = self.store.message_count(root_frame_id)
+                        messages = self.store.list_messages(
+                            root_frame_id,
+                            start=max(0, message_count - 1000),
+                            limit=1000,
+                        )
                     last_user = max(
                         (
                             index

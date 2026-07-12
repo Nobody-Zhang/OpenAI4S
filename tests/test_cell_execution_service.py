@@ -9,6 +9,7 @@ import pytest
 
 from openai4s.execution import CaptureResult, CellRequest
 from openai4s.kernel import KernelSupervisor
+from openai4s.server import cell_run
 from openai4s.server.cell_run import CellExecutionPorts, CellExecutionService
 
 
@@ -213,6 +214,78 @@ def test_live_and_finished_events_use_the_exact_persistent_generation(tmp_path):
     assert result.generation_id == lease.generation_id
 
 
+def test_live_cell_output_is_bounded_once_for_notebook_and_activity(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(cell_run, "LIVE_CELL_OUTPUT_CHARS", 8)
+    harness = Harness()
+
+    def run(session, request, cell_id, on_chunk, lease):
+        del session, request, cell_id, lease
+        harness.order.append("run")
+        assert on_chunk is not None
+        on_chunk("123456")
+        on_chunk("7890")
+        on_chunk("must-not-appear")
+        harness.completion = {"ok": True}
+        return dict(harness.run_result)
+
+    service = CellExecutionService(
+        replace(harness.ports(), run=run), id_factory=lambda: "cell-bounded"
+    )
+    events = []
+
+    service.execute(
+        _session(tmp_path), CellRequest("print('bounded')", "agent"), events.append
+    )
+
+    notebook_chunks = [
+        event["chunk"]
+        for event in events
+        if event["type"] == "notebook_cell_chunk"
+    ]
+    activity_chunks = [
+        event["chunk"]
+        for event in events
+        if event["type"] == "text_chunk"
+        and event.get("producing_cell_id") == "cell-bounded"
+        and not event.get("cell_index")
+        and cell_run.NOTEBOOK_DIVIDER not in event.get("chunk", "")
+    ]
+    expected = ["123456", "78" + cell_run.LIVE_OUTPUT_TRUNCATION]
+    assert notebook_chunks == expected
+    assert activity_chunks == expected
+    assert "must-not-appear" not in "".join(notebook_chunks + activity_chunks)
+
+
+def test_finished_event_is_bounded_without_mutating_result_or_record(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(cell_run, "LIVE_CELL_OUTPUT_CHARS", 8)
+    harness = Harness()
+    original = {
+        "stdout": "stdout-more-than-eight",
+        "stderr": "stderr-more-than-eight",
+        "error": "error-more-than-eight",
+    }
+    harness.run_result = dict(original)
+    service = CellExecutionService(harness.ports(), id_factory=lambda: "cell-terminal")
+    events = []
+
+    result = service.execute(
+        _session(tmp_path), CellRequest("raise RuntimeError()", "agent"), events.append
+    )
+
+    finished = events[-1]
+    assert finished["type"] == "notebook_cell_finished"
+    for field, value in original.items():
+        assert finished[field] == value[:8] + cell_run.LIVE_OUTPUT_TRUNCATION
+        assert finished[field].count(cell_run.LIVE_OUTPUT_TRUNCATION) == 1
+    assert result.result == {**original, "id": "cell-terminal"}
+    assert harness.records[0]["result"] is result.result
+    assert harness.records[0]["result"] == {**original, "id": "cell-terminal"}
+
+
 def test_interrupted_result_wins_over_its_error_text_in_notebook_event(tmp_path):
     harness = Harness()
     harness.run_result = {
@@ -266,6 +339,32 @@ def test_protocol_only_submit_is_audited_without_streaming_a_notebook_cell(tmp_p
     assert events == []
     assert result.cell_id == "cell-submit"
     assert harness.records[0]["code"].startswith("host.submit_output")
+    assert harness.records[0]["visibility"] == "system"
+    assert harness.records[0]["pin"] is False
+    assert harness.records[0]["replay_policy"] == "never"
+
+
+def test_cell_projection_labels_are_forwarded_to_the_immutable_record(tmp_path):
+    harness = Harness()
+    service = CellExecutionService(harness.ports(), id_factory=lambda: "cell-labels")
+
+    service.execute(
+        _session(tmp_path),
+        CellRequest(
+            "probe = inspect_state()",
+            "user",
+            stream=False,
+            visibility="scratch",
+            pin=True,
+            replay_policy="conditional",
+        ),
+        lambda event: None,
+    )
+
+    record = harness.records[0]
+    assert record["visibility"] == "scratch"
+    assert record["pin"] is True
+    assert record["replay_policy"] == "conditional"
 
 
 def test_safety_refusal_is_a_logged_soft_error_without_runtime_or_capture(tmp_path):

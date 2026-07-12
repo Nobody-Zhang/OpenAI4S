@@ -17,8 +17,19 @@ from openai4s.execution import CaptureResult, CellExecutionResult, CellRequest
 from openai4s.kernel import KernelLease, KernelSupervisor
 
 NOTEBOOK_DIVIDER = "----- output -----"
+LIVE_CELL_OUTPUT_CHARS = 1_000_000
+LIVE_OUTPUT_TRUNCATION = "\n...(live output truncated)"
 EventSink = Callable[[dict[str, Any]], None]
 ChunkSink = Callable[[str], None]
+
+
+def _bounded_live_output(value: Any) -> str:
+    """Bound one transient WebSocket field without mutating the real result."""
+
+    text = str(value or "")
+    if len(text) <= LIVE_CELL_OUTPUT_CHARS:
+        return text
+    return text[:LIVE_CELL_OUTPUT_CHARS] + LIVE_OUTPUT_TRUNCATION
 
 
 def _no_attempt_allocate(
@@ -105,6 +116,7 @@ class CellExecutionService:
         *,
         action_group_id: str | None = None,
     ) -> CellExecutionResult:
+        action_group_id = action_group_id or request.action_group_id
         session.cell_index += 1
         index = session.cell_index
         cell_id = self.id_factory()
@@ -354,7 +366,21 @@ class CellExecutionService:
             }
         )
 
+        streamed_chars = 0
+        stream_truncated = False
+
         def on_chunk(text: str) -> None:
+            nonlocal streamed_chars, stream_truncated
+            if stream_truncated:
+                return
+            value = str(text or "")
+            remaining = max(0, LIVE_CELL_OUTPUT_CHARS - streamed_chars)
+            if len(value) > remaining:
+                value = value[:remaining] + LIVE_OUTPUT_TRUNCATION
+                stream_truncated = True
+            streamed_chars += min(len(str(text or "")), remaining)
+            if not value:
+                return
             emit(
                 {
                     "type": "notebook_cell_chunk",
@@ -362,7 +388,7 @@ class CellExecutionService:
                     "root_frame_id": session.root_frame_id,
                     "producing_cell_id": cell_id,
                     "stream": "stdout",
-                    "chunk": text,
+                    "chunk": value,
                 }
             )
             emit(
@@ -370,7 +396,7 @@ class CellExecutionService:
                     "type": "text_chunk",
                     "frame_id": session.root_frame_id,
                     "block_type": "tool",
-                    "chunk": text,
+                    "chunk": value,
                     "producing_cell_id": cell_id,
                 }
             )
@@ -491,9 +517,13 @@ class CellExecutionService:
                 "language": request.language,
                 "origin": request.origin,
                 "source": request.code,
-                "stdout": result.get("stdout") or "",
-                "stderr": result.get("stderr") or "",
-                "error": result.get("error") or "",
+                # The execution result and durable Cell record retain the full
+                # observation.  Only this transient WS projection is bounded,
+                # otherwise a large terminal frame can overflow and disconnect
+                # an otherwise healthy client after its live chunks were capped.
+                "stdout": _bounded_live_output(result.get("stdout")),
+                "stderr": _bounded_live_output(result.get("stderr")),
+                "error": _bounded_live_output(result.get("error")),
                 "status": status,
                 "figures": list(capture.figures),
                 "files_written": list(capture.files_written),
@@ -512,6 +542,9 @@ class CellExecutionService:
         result: dict[str, Any],
         capture: CaptureResult,
     ) -> None:
+        completion_only = request.origin == "agent" and is_completion_only_cell(
+            request.code, request.language
+        )
         self.ports.record_cell(
             frame_id=session.root_frame_id,
             root_frame_id=session.root_frame_id,
@@ -527,6 +560,11 @@ class CellExecutionService:
             figures=capture.figures,
             files_written=capture.files_written,
             files_read=[],
+            visibility=("system" if completion_only else request.visibility),
+            pin=(False if completion_only else request.pin),
+            replay_policy=(
+                "never" if completion_only else request.replay_policy
+            ),
         )
 
     @staticmethod

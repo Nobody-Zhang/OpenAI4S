@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 import threading
 from types import SimpleNamespace
 
@@ -237,7 +239,23 @@ def test_python_bootstrap_runs_outside_supervisor_lock(monkeypatch, tmp_path):
         def execute(self, code, origin="agent", on_chunk=None):
             self.entered.set()
             assert self.release.wait(2)
-            return {"stdout": "", "stderr": "", "error": None}
+            probe = re.search(r"__OPENAI4S_PY_ENV_[0-9a-f]+__", code)
+            payload = {
+                "runtime_version": "3.14-test",
+                "interpreter": "base-python",
+                "prefix": "/test-env",
+                "base_prefix": "/test-env",
+                "sdk_version": "0.1.0",
+                "provenance_version": "1",
+                "host_capability_version": "1",
+                "package_manifest": [],
+                "locale": {"preferred_encoding": "UTF-8"},
+            }
+            return {
+                "stdout": (probe.group(0) + json.dumps(payload)) if probe else "",
+                "stderr": "",
+                "error": None,
+            }
 
         def interrupt(self) -> None:
             self.release.set()

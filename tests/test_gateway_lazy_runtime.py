@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from types import SimpleNamespace
 
 from openai4s.config import Config, LLMConfig
@@ -101,6 +102,26 @@ def _install_fake_runtime(monkeypatch, runner, *, expect_attempt_for=None):
 
         def execute(self, code, origin="agent", on_chunk=None, *, cell_id=None):
             del origin
+            probe = re.search(r"__OPENAI4S_PY_ENV_[0-9a-f]+__", code)
+            if probe:
+                payload = {
+                    "runtime_version": "3.14-test",
+                    "interpreter": str(self.options.get("python") or "test-python"),
+                    "prefix": "/test-env",
+                    "base_prefix": "/test-env",
+                    "sdk_version": "0.1.0",
+                    "provenance_version": "1",
+                    "host_capability_version": "1",
+                    "package_manifest": [],
+                    "locale": {"preferred_encoding": "UTF-8"},
+                }
+                return {
+                    "id": cell_id,
+                    "stdout": probe.group(0) + json.dumps(payload),
+                    "stderr": "",
+                    "error": None,
+                    "usage": {},
+                }
             if "host.submit_output" in code:
                 self.dispatcher.last_output = {"output": {"ok": True}}
             if on_chunk is not None:

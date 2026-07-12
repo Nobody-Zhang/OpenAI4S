@@ -7,7 +7,12 @@ import re
 from typing import Any, Iterable
 from urllib.parse import quote
 
-from openai4s.agent.actions import Action, CodeCell, NativeToolBatch
+from openai4s.agent.actions import (
+    Action,
+    CodeCell,
+    NativeToolBatch,
+    is_completion_only_cell,
+)
 
 _CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 _SUMMARY_KEYS = (
@@ -28,7 +33,7 @@ _STRUCTURED_KEYS = set(
     (*_SUMMARY_KEYS, *_FINDING_KEYS, *_METRIC_KEYS, *_LIMITATION_KEYS)
 )
 _ERROR_SECTION = re.compile(
-    r"(?:^|\n)ERROR(?: \(cell line \d+\))?:\n(?P<body>.*?)(?=\n\[usage|\Z)",
+    r"(?:^|\n)ERROR(?: \(cell line \d+\))?:\n(?P<body>.*?)(?=\n\[system\]|\n\[usage|\Z)",
     re.DOTALL,
 )
 _SECRET_ASSIGNMENT = re.compile(
@@ -47,11 +52,19 @@ def action_narration(action: Action | None, language: str = "en") -> str:
     """Describe an action without inventing reasoning or scientific results."""
     zh = language == "zh"
     if isinstance(action, CodeCell):
-        # A code action has no trustworthy outcome until its kernel result is
-        # available.  Narrating it here produced the same generic sentence for
-        # every code-only turn and, worse, made that sentence look like a
-        # result.  ``outcome_narration`` owns the post-execution projection.
-        return ""
+        # This is explicitly an in-progress status, never a result claim.  It
+        # prevents long scientific cells from leaving the conversation blank
+        # while the replace-in-place Notebook draft and kernel execution run.
+        # A protocol-only submit cell stays silent because its structured
+        # completion projection is the user-facing result.
+        if is_completion_only_cell(action):
+            return ""
+        label = "R" if action.language == "r" else "Python"
+        return (
+            f"我已经准备好一个 {label} Cell，正在执行；真实输出会持续记录到 Notebook。"
+            if zh
+            else f"I have prepared a {label} cell and am running it now; its actual output will be recorded in the Notebook."
+        )
     if not isinstance(action, NativeToolBatch) or not action.calls:
         return ""
 
@@ -110,9 +123,9 @@ def outcome_narration(
     """Project a real execution outcome without exposing code or reasoning.
 
     Error text is reduced to one bounded, redacted exception headline.  A
-    successful code turn gets a deterministic notice only when the model gave
-    no public pre-action prose; this prevents both silent code-only loops and a
-    second boilerplate sentence after every well-narrated action.
+    successful code turn always gets a short deterministic post-execution
+    notice unless that Cell itself completed the task.  Pre-action model prose
+    can only describe intent; it is never evidence that the Cell succeeded.
     """
     if not isinstance(action, CodeCell):
         return ""
@@ -128,7 +141,7 @@ def outcome_narration(
             if zh
             else f"This cell failed: `{error}`. The next step will repair it from the actual traceback."
         )
-    if getattr(outcome, "completion", None) is not None or had_public_prose:
+    if getattr(outcome, "completion", None) is not None:
         return ""
 
     stdout_lines = _section_line_count(observation, "stdout:")

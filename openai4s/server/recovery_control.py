@@ -501,7 +501,7 @@ def _restorable(checkpoint: Mapping[str, Any] | None) -> tuple[bool, str | None]
             if isinstance(value, Mapping)
             else None
         )
-        if not isinstance(manifest, Mapping) or int(manifest.get("version") or 0) != 1:
+        if not isinstance(manifest, Mapping):
             return False, f"checkpoint lacks a verifiable {language} bootstrap manifest"
         try:
             parsed = BootstrapManifest.from_record(manifest)

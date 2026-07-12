@@ -675,16 +675,18 @@ def test_submit_manual_review_repairs_stale_processing_status(monkeypatch, tmp_p
 def test_submit_manual_review_reads_tail_of_long_conversation(monkeypatch, tmp_path):
     _cfg_obj, _hub, runner, store, fid, _st = _review_context(tmp_path)
     list_call: dict = {}
-    monkeypatch.setattr(store, "message_count", lambda _fid: 1_205)
-
-    def tail_messages(_fid, *, start, limit):
-        list_call.update(start=start, limit=limit)
+    def tail_messages(_fid, *, branch_id, limit):
+        list_call.update(branch_id=branch_id, limit=limit)
         return [
+            *(
+                {"role": "assistant", "content": f"old {index}"}
+                for index in range(1_003)
+            ),
             {"role": "user", "content": "latest request"},
             {"role": "assistant", "content": "latest answer"},
         ]
 
-    monkeypatch.setattr(store, "list_messages", tail_messages)
+    monkeypatch.setattr(store, "list_branch_messages", tail_messages)
     captured: dict = {}
     monkeypatch.setattr(
         runner,
@@ -694,7 +696,7 @@ def test_submit_manual_review_reads_tail_of_long_conversation(monkeypatch, tmp_p
 
     runner.submit_review(fid, "default").wait_result()
 
-    assert list_call == {"start": 205, "limit": 1000}
+    assert list_call == {"branch_id": fid, "limit": None}
     assert captured["user_text"] == "latest request"
     assert captured["assistant_text"] == "latest answer"
 

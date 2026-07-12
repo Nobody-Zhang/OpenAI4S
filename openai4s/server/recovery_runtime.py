@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import platform
 import sys
+import urllib.parse
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from openai4s.kernel import Kernel, KernelLease, KernelSupervisor
-from openai4s.kernel.recovery import BootstrapManifest
+from openai4s.kernel.recovery import BootstrapManifest, frozen_sidecar_bootstrap_code
 from openai4s.server.recovery_control import RecoveryActionPlan, RecoveryControlService
 from openai4s.server.recovery_execution import (
     RecoveryExecutionPorts,
@@ -193,24 +193,27 @@ class SessionRecoveryRuntime:
                 )
 
         def publish(candidate, manifest, source_generation_id):
+            published_manifest = manifest.with_observed_environment(
+                candidate.observed_environment
+            )
             lease = self.ports.kernels.publish_candidate(
-                manifest.language,
+                published_manifest.language,
                 candidate.key,
                 candidate.kernel,
                 factory=candidate.factory,
                 generation_id=candidate.generation_id,
-                expected=expected.get(manifest.language),
+                expected=expected.get(published_manifest.language),
                 recovered_from_generation_id=source_generation_id,
-                bootstrap=manifest.record(),
+                bootstrap=published_manifest.record(),
             )
             candidate.adopted = True
-            if manifest.language == "python":
+            if published_manifest.language == "python":
                 name = str(
-                    manifest.environment.get("environment_name")
-                    or manifest.environment.get("name")
+                    published_manifest.environment.get("environment_name")
+                    or published_manifest.environment.get("name")
                     or "base"
                 )
-                root = manifest.environment.get("environment_root")
+                root = published_manifest.environment.get("environment_root")
                 bin_dir = Path(str(root)) / "bin" if root else None
                 self.ports.python_published(
                     name,
@@ -333,62 +336,46 @@ class SessionRecoveryRuntime:
     ) -> None:
         if manifest.language == "r" and manifest.sidecars:
             raise RuntimeError("Python sidecars cannot be loaded into an R recovery")
-        for sidecar in manifest.sidecars:
-            try:
-                source = sidecar.source.decode("utf-8")
-            except UnicodeDecodeError as error:
-                raise RuntimeError(
-                    f"sidecar {sidecar.name!r} is not UTF-8"
-                ) from error
-            result = candidate.kernel.execute(source, origin="recovery")
-            if result.get("error"):
-                raise RuntimeError(
-                    f"sidecar {sidecar.name!r} failed: {result['error']}"
-                )
+        # Bootstrap hooks establish the exact capability snapshot/import gate
+        # that existed before any original sidecar import.  Frozen modules are
+        # then installed from manifest bytes; recovery never follows their
+        # informational source_path back to a mutable disk copy.
         for index, hook in enumerate(manifest.init_hooks):
             result = candidate.kernel.execute(str(hook), origin="recovery")
             if result.get("error"):
                 raise RuntimeError(
                     f"bootstrap hook {index} failed: {result['error']}"
                 )
+        for sidecar in manifest.sidecars:
+            source = frozen_sidecar_bootstrap_code(sidecar)
+            result = candidate.kernel.execute(source, origin="recovery")
+            if result.get("error"):
+                raise RuntimeError(
+                    f"sidecar {sidecar.name!r} failed: {result['error']}"
+                )
 
-        marker = f"__OPENAI4S_RECOVERY_ENV_{uuid.uuid4().hex}__"
         if manifest.language == "python":
-            probe = candidate.kernel.execute(
-                "import json as __o4s_json, platform as __o4s_platform, "
-                "openai4s as __o4s_sdk\n"
-                f"print({marker!r} + __o4s_json.dumps(dict("
-                "runtime_version=__o4s_platform.python_version(), "
-                "interpreter=__import__('sys').executable, "
-                "sdk_version=getattr(__o4s_sdk, '__version__', None))))",
-                origin="recovery",
+            payload = _probe_python_environment(
+                candidate.kernel, origin="recovery"
             )
-            if probe.get("error"):
-                raise RuntimeError(
-                    f"Python recovery health check failed: {probe['error']}"
-                )
-            payload = _json_after_marker(str(probe.get("stdout") or ""), marker)
         else:
-            probe = candidate.kernel.execute(
-                f'cat("{marker}", R.version.string, "\\n", sep="")',
+            payload = _probe_r_environment(
+                candidate.kernel,
+                interpreter=manifest.interpreter,
                 origin="recovery",
             )
-            if probe.get("error"):
-                raise RuntimeError(
-                    f"R recovery health check failed: {probe['error']}"
-                )
-            output = str(probe.get("stdout") or "")
-            payload = {
-                "runtime_version": (
-                    output.split(marker, 1)[1].strip() if marker in output else ""
-                ),
-                "interpreter": manifest.interpreter,
-            }
         if not payload.get("runtime_version"):
             raise RuntimeError("recovery runtime health check returned no version")
+        observed_manifest = manifest.with_observed_environment(payload)
         candidate.observed_environment = {
-            **dict(manifest.environment),
+            **dict(observed_manifest.environment),
             **payload,
+            "environment_hash": observed_manifest.environment_hash,
+            "package_manifest": [
+                {"name": name, "version": version}
+                for name, version in observed_manifest.package_manifest
+            ],
+            "locale": dict(observed_manifest.locale),
         }
 
     @staticmethod
@@ -450,6 +437,121 @@ class SessionRecoveryRuntime:
         return live if self.workspace in live.parents else None
 
 
+def _probe_python_environment(kernel: Kernel, *, origin: str) -> dict[str, Any]:
+    """Collect the runtime manifest inside the exact Python worker."""
+
+    marker = f"__OPENAI4S_PY_ENV_{uuid.uuid4().hex}__"
+    source = (
+        "def __o4s_environment_probe():\n"
+        " import importlib.metadata as metadata, json, locale, platform, sys\n"
+        " packages = {}\n"
+        " try:\n"
+        "  distributions = metadata.distributions()\n"
+        "  for distribution in distributions:\n"
+        "   try:\n"
+        "    name = str(distribution.metadata.get('Name') or '').strip()\n"
+        "    version = str(distribution.version) if distribution.version is not None else None\n"
+        "   except Exception:\n"
+        "    continue\n"
+        "   if name:\n"
+        "    packages.setdefault(name.casefold(), {'name': name, 'version': version})\n"
+        " except Exception:\n"
+        "  pass\n"
+        " try:\n"
+        "  import openai4s as sdk\n"
+        "  sdk_version = getattr(sdk, '__version__', None)\n"
+        " except Exception:\n"
+        "  sdk_version = None\n"
+        " try:\n"
+        "  from openai4s.kernel.provenance import PROVENANCE_VERSION as provenance_version\n"
+        " except Exception:\n"
+        "  provenance_version = None\n"
+        " try:\n"
+        "  from openai4s.sdk.host import HOST_CAPABILITY_VERSION as host_capability_version\n"
+        " except Exception:\n"
+        "  host_capability_version = None\n"
+        " locale_manifest = {\n"
+        "  'default_encoding': sys.getdefaultencoding(),\n"
+        "  'filesystem_encoding': sys.getfilesystemencoding(),\n"
+        "  'filesystem_errors': sys.getfilesystemencodeerrors(),\n"
+        "  'preferred_encoding': locale.getpreferredencoding(False),\n"
+        "  'lc_ctype': locale.setlocale(locale.LC_CTYPE),\n"
+        " }\n"
+        " return {\n"
+        "  'runtime_version': platform.python_version(),\n"
+        "  'interpreter': sys.executable, 'prefix': sys.prefix,\n"
+        "  'base_prefix': getattr(sys, 'base_prefix', sys.prefix),\n"
+        "  'sdk_version': sdk_version,\n"
+        "  'provenance_version': provenance_version,\n"
+        "  'host_capability_version': host_capability_version,\n"
+        "  'package_manifest': sorted(packages.values(), key=lambda item: item['name'].casefold()),\n"
+        "  'locale': locale_manifest,\n"
+        " }\n"
+        f"print({marker!r} + __import__('json').dumps(__o4s_environment_probe(), sort_keys=True, separators=(',', ':')))\n"
+        "del __o4s_environment_probe\n"
+    )
+    result = kernel.execute(source, origin=origin)
+    if result.get("error"):
+        raise RuntimeError(
+            f"Python environment probe failed: {result['error']}"
+        )
+    value = _json_after_marker(str(result.get("stdout") or ""), marker)
+    if not isinstance(value, dict):
+        raise RuntimeError("Python environment probe returned no object")
+    return value
+
+
+def _probe_r_environment(
+    kernel: Kernel, *, interpreter: str, origin: str
+) -> dict[str, Any]:
+    """Collect installed packages and locale inside the exact R worker."""
+
+    marker = f"__OPENAI4S_R_ENV_{uuid.uuid4().hex}__"
+    source = (
+        "local({\n"
+        " enc <- function(value) utils::URLencode(enc2utf8(as.character(value)), reserved=TRUE)\n"
+        f' cat("{marker}META\\truntime_version\\t", enc(R.version.string), "\\n", sep="")\n'
+        f' cat("{marker}META\\tr_home\\t", enc(R.home()), "\\n", sep="")\n'
+        f' cat("{marker}META\\tr_locale\\t", enc(Sys.getlocale()), "\\n", sep="")\n'
+        " packages <- tryCatch(installed.packages()[, c('Package','Version'), drop=FALSE], error=function(e) matrix(character(), nrow=0, ncol=2))\n"
+        " if (nrow(packages)) {\n"
+        "  packages <- packages[order(tolower(packages[, 'Package'])), , drop=FALSE]\n"
+        "  for (index in seq_len(nrow(packages))) {\n"
+        f'   cat("{marker}PACKAGE\\t", enc(packages[index, "Package"]), "\\t", enc(packages[index, "Version"]), "\\n", sep="")\n'
+        "  }\n"
+        " }\n"
+        "})"
+    )
+    result = kernel.execute(source, origin=origin)
+    if result.get("error"):
+        raise RuntimeError(f"R environment probe failed: {result['error']}")
+    metadata: dict[str, str] = {}
+    packages: list[dict[str, str]] = []
+    for line in str(result.get("stdout") or "").splitlines():
+        if line.startswith(marker + "META\t"):
+            parts = line[len(marker) :].split("\t", 2)
+            if len(parts) == 3:
+                metadata[parts[1]] = urllib.parse.unquote(parts[2])
+        elif line.startswith(marker + "PACKAGE\t"):
+            parts = line[len(marker) :].split("\t", 2)
+            if len(parts) == 3:
+                packages.append(
+                    {
+                        "name": urllib.parse.unquote(parts[1]),
+                        "version": urllib.parse.unquote(parts[2]),
+                    }
+                )
+    if not metadata.get("runtime_version"):
+        raise RuntimeError("R environment probe returned no runtime version")
+    return {
+        "runtime_version": metadata["runtime_version"],
+        "interpreter": interpreter,
+        "r_home": metadata.get("r_home"),
+        "package_manifest": packages,
+        "locale": {"r_locale": metadata.get("r_locale", "")},
+    }
+
+
 def bootstrap_r_generation(
     kernels: KernelSupervisor,
     workspace: str | Path,
@@ -458,27 +560,23 @@ def bootstrap_r_generation(
     """Probe and persist a complete manifest for a newly spawned R slot."""
 
     workspace = Path(workspace).resolve()
-    marker = f"__OPENAI4S_R_BOOTSTRAP_{uuid.uuid4().hex}__"
-    result = lease.kernel.execute(
-        f'cat("{marker}", R.version.string, "\\n", sep="")',
-        origin="system",
-    )
-    output = str(result.get("stdout") or "")
-    if result.get("error") or marker not in output:
+    argv = getattr(lease.kernel, "argv", None) or ()
+    interpreter = str(argv[-2]) if len(argv) >= 2 else "Rscript"
+    try:
+        observed = _probe_r_environment(
+            lease.kernel, interpreter=interpreter, origin="system"
+        )
+    except Exception as error:
         kernels.shutdown_if_current(
             lease,
             reason="bootstrap_failed",
             terminal_state="failed",
         )
-        raise RuntimeError(
-            "R kernel bootstrap failed: "
-            + str(result.get("error") or "runtime version probe failed")
-        )
-    argv = getattr(lease.kernel, "argv", None) or ()
-    manifest = BootstrapManifest(
+        raise RuntimeError(f"R kernel bootstrap failed: {error}") from error
+    base_manifest = BootstrapManifest(
         language="r",
-        interpreter=str(argv[-2]) if len(argv) >= 2 else "Rscript",
-        runtime_version=output.split(marker, 1)[1].strip(),
+        interpreter=interpreter,
+        runtime_version=str(observed["runtime_version"]),
         working_directory=str(workspace),
         environment={
             "environment_name": getattr(lease.kernel, "env_name", None),
@@ -486,6 +584,7 @@ def bootstrap_r_generation(
         },
         random_seed_policy="namespace_process_state",
     )
+    manifest = base_manifest.with_observed_environment(observed)
     metadata = {**manifest.record(), "status": "active"}
     kernels.record_bootstrap_if_current(
         "r", lease.kernel, metadata, state="active"
@@ -515,27 +614,28 @@ def bootstrap_python_generation(
         status = "failed"
         error_text = str(error)[:500]
 
-    runtime_version = "unknown"
     try:
-        interpreter = str(getattr(kernel, "python", None) or "")
-        if interpreter and Path(interpreter).resolve() == Path(sys.executable).resolve():
-            runtime_version = platform.python_version()
-        else:
-            from openai4s.kernel import environments as envmod
-
-            environment = envmod.get_environment(getattr(kernel, "env_name", None))
-            if environment is not None:
-                runtime_version = str(environment.python_version() or "unknown")
-    except Exception:  # noqa: BLE001 - unknown stays explicit
-        pass
-    try:
-        from openai4s import __version__ as sdk_version
-    except Exception:  # noqa: BLE001 - optional metadata
-        sdk_version = None
-    manifest = BootstrapManifest(
+        observed = _probe_python_environment(kernel, origin="system")
+    except Exception as error:  # noqa: BLE001 - failure stays durable
+        observed = {
+            "runtime_version": "unknown",
+            "interpreter": str(getattr(kernel, "python", None) or sys.executable),
+            "package_manifest": [],
+            "locale": {},
+        }
+        status = "failed"
+        probe_error = str(error)[:500]
+        error_text = (
+            f"{error_text}; {probe_error}" if error_text else probe_error
+        )
+    base_manifest = BootstrapManifest(
         language="python",
-        interpreter=str(getattr(kernel, "python", None) or sys.executable),
-        runtime_version=runtime_version,
+        interpreter=str(
+            observed.get("interpreter")
+            or getattr(kernel, "python", None)
+            or sys.executable
+        ),
+        runtime_version=str(observed.get("runtime_version") or "unknown"),
         working_directory=str(
             Path(getattr(kernel, "cwd", None) or workspace).resolve()
         ),
@@ -543,10 +643,15 @@ def bootstrap_python_generation(
             "environment_name": getattr(kernel, "env_name", None),
             "environment_root": getattr(kernel, "env_root", None),
         },
-        sdk_version=sdk_version,
+        sdk_version=(
+            str(observed["sdk_version"])
+            if observed.get("sdk_version") is not None
+            else None
+        ),
         init_hooks=((code,) if code.strip() else ()),
         random_seed_policy="namespace_process_state",
     )
+    manifest = base_manifest.with_observed_environment(observed)
     metadata = {
         **manifest.record(),
         "status": status,
@@ -554,6 +659,7 @@ def bootstrap_python_generation(
             hashlib.sha256(code.encode("utf-8")).hexdigest() if code else None
         ),
         "loaded_sidecars": [],
+        "sidecar_capture_status": "complete",
         "project_init_hooks": [],
         "environment_name": getattr(kernel, "env_name", None),
         "environment_root": getattr(kernel, "env_root", None),

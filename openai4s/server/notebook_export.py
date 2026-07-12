@@ -8,9 +8,17 @@ import json
 import zipfile
 from typing import Any, Mapping, Protocol
 
+from openai4s.storage.branch_projection import project_branch_records
+
 
 class CellStore(Protocol):
-    def list_cells(self, root_frame_id: str) -> list[dict]: ...
+    def list_cells(
+        self, root_frame_id: str, *, branch_id: str | None = None
+    ) -> list[dict]: ...
+
+    def get_session_branch(self, branch_id: str) -> dict | None: ...
+
+    def get_session_checkpoint(self, checkpoint_id: str) -> dict | None: ...
 
 
 _LANGUAGE = {
@@ -37,13 +45,19 @@ class NotebookExportService:
     def __init__(self, store: CellStore) -> None:
         self.store = store
 
-    def notebook(self, root_frame_id: str, language: str) -> dict[str, Any]:
+    def notebook(
+        self,
+        root_frame_id: str,
+        language: str,
+        *,
+        branch_id: str | None = None,
+    ) -> dict[str, Any]:
         language = language.lower()
         if language not in _LANGUAGE:
             raise ValueError("notebook language must be python or r")
         source_cells = [
             cell
-            for cell in self.store.list_cells(root_frame_id)
+            for cell in self._branch_cells(root_frame_id, branch_id or root_frame_id)
             if str(cell.get("language") or "python").lower() == language
         ]
         cells = [
@@ -69,6 +83,7 @@ class NotebookExportService:
                 },
                 "openai4s": {
                     "root_frame_id": root_frame_id,
+                    "branch_id": branch_id or root_frame_id,
                     "language": language,
                     "history_is_read_only": True,
                     "completion_contract": (
@@ -80,21 +95,22 @@ class NotebookExportService:
             "nbformat_minor": 5,
         }
 
-    def bundle(self, root_frame_id: str) -> bytes:
+    def bundle(self, root_frame_id: str, *, branch_id: str | None = None) -> bytes:
         """Return a stable ZIP with separate Python and R notebooks."""
 
         stem = self._safe_stem(root_frame_id)
         documents = {
             f"{stem}.python.ipynb": self._encode(
-                self.notebook(root_frame_id, "python")
+                self.notebook(root_frame_id, "python", branch_id=branch_id)
             ),
             f"{stem}.r.ipynb": self._encode(
-                self.notebook(root_frame_id, "r")
+                self.notebook(root_frame_id, "r", branch_id=branch_id)
             ),
         }
         manifest = {
             "version": 1,
             "root_frame_id": root_frame_id,
+            "branch_id": branch_id or root_frame_id,
             "files": [
                 {
                     "name": name,
@@ -117,18 +133,24 @@ class NotebookExportService:
         return output.getvalue()
 
     def export(
-        self, root_frame_id: str, *, language: str | None = None
+        self,
+        root_frame_id: str,
+        *,
+        language: str | None = None,
+        branch_id: str | None = None,
     ) -> dict[str, Any]:
         """Return immutable bytes plus the exact HTTP descriptor Gateway needs."""
 
         stem = self._safe_stem(root_frame_id)
         if language is None or str(language).lower() == "bundle":
-            data = self.bundle(root_frame_id)
+            data = self.bundle(root_frame_id, branch_id=branch_id)
             filename = f"{stem}.notebooks.zip"
             content_type = "application/zip"
         else:
             normalized = str(language).lower()
-            data = self._encode(self.notebook(root_frame_id, normalized))
+            data = self._encode(
+                self.notebook(root_frame_id, normalized, branch_id=branch_id)
+            )
             filename = f"{stem}.{normalized}.ipynb"
             content_type = "application/x-ipynb+json"
         return {
@@ -139,6 +161,26 @@ class NotebookExportService:
             "sha256": hashlib.sha256(data).hexdigest(),
             "immutable": True,
         }
+
+    def _branch_cells(self, root_frame_id: str, branch_id: str) -> list[dict]:
+        def local(selected: str) -> list[dict]:
+            try:
+                return self.store.list_cells(root_frame_id, branch_id=selected)
+            except TypeError as error:
+                if selected != root_frame_id or "branch_id" not in str(error):
+                    raise
+                return self.store.list_cells(root_frame_id)
+
+        return project_branch_records(
+            self.store,
+            root_frame_id,
+            branch_id,
+            list_local=local,
+            record_position=lambda cell: int(
+                cell.get("state_revision") or cell.get("cell_index") or 0
+            ),
+            cursor_key="cell_cursor",
+        )
 
     @classmethod
     def _cell(cls, cell: Mapping[str, Any], *, revision: int) -> dict[str, Any]:

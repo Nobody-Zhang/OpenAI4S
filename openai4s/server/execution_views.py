@@ -5,10 +5,30 @@ from __future__ import annotations
 from typing import Callable, Protocol
 
 from openai4s.agent.actions import is_completion_only_cell
+from openai4s.execution.dependencies import (
+    REPLAY_POLICIES,
+    VISIBILITIES,
+    analyze_code,
+    compute_stale_cells,
+    default_replay_policy,
+    default_visibility,
+    normalize_string_list,
+)
+from openai4s.storage.branch_projection import project_branch_records
 
 
 class ExecutionViewStore(Protocol):
-    def list_cells(self, root_frame_id: str) -> list[dict]: ...
+    def list_cells(
+        self, root_frame_id: str, *, branch_id: str | None = None
+    ) -> list[dict]: ...
+
+    def get_session_branch(self, branch_id: str) -> dict | None: ...
+
+    def get_session_checkpoint(self, checkpoint_id: str) -> dict | None: ...
+
+    def session_checkpoint_source_map(
+        self, root_frame_id: str, *, source_kind: str
+    ) -> dict[str, str]: ...
 
     def get_artifact(self, artifact_id: str) -> dict | None: ...
 
@@ -31,12 +51,30 @@ class ExecutionViewService:
         self.store = store
         self.format_timestamp = format_timestamp
 
-    def execution_log(self, root_frame_id: str) -> dict:
+    def execution_log(
+        self, root_frame_id: str, *, branch_id: str | None = None
+    ) -> dict:
+        branch_id = branch_id or root_frame_id
         kernels: list[str] = []
         entries: list[dict] = []
-        for ordinal, cell in enumerate(self.store.list_cells(root_frame_id), 1):
+        source_map = getattr(self.store, "session_checkpoint_source_map", None)
+        fork_checkpoints = (
+            source_map(root_frame_id, source_kind="cell")
+            if callable(source_map)
+            else {}
+        )
+        cells = [
+            _with_dependency_defaults(cell)
+            for cell in self._branch_cells(root_frame_id, branch_id)
+        ]
+        stale_projection = compute_stale_cells(cells)
+        for ordinal, (cell, stale) in enumerate(
+            zip(cells, stale_projection), 1
+        ):
             language = cell.get("language") or "python"
             if is_completion_only_cell(cell.get("code") or "", language):
+                continue
+            if cell["visibility"] != "scientific" and not cell["pin"]:
                 continue
             kernel_id = cell.get("kernel_id") or "python"
             if kernel_id not in kernels:
@@ -55,6 +93,7 @@ class ExecutionViewService:
             entries.append(
                 {
                     "producing_cell_id": identity,
+                    "fork_checkpoint_id": fork_checkpoints.get(str(identity)),
                     "cell_index": cell_index,
                     "state_revision": (
                         cell.get("state_revision")
@@ -68,6 +107,16 @@ class ExecutionViewService:
                     "language": language,
                     "origin": cell.get("origin"),
                     "source": cell.get("code") or "",
+                    "code_hash": cell["code_hash"],
+                    "visibility": cell["visibility"],
+                    "pin": cell["pin"],
+                    "replay_policy": cell["replay_policy"],
+                    "variable_reads": cell["variable_reads"],
+                    "variable_writes": cell["variable_writes"],
+                    "variable_deletes": cell["variable_deletes"],
+                    "mutation_uncertain": cell["mutation_uncertain"],
+                    "stale": stale["stale"],
+                    "stale_reasons": stale["stale_reasons"],
                     "stdout": cell.get("stdout") or "",
                     "stderr": cell.get("stderr") or "",
                     "error": cell.get("error") or "",
@@ -96,6 +145,28 @@ class ExecutionViewService:
                 entry["attempt_count"] = count
                 entry["is_latest_attempt"] = position == count
         return {"kernels": kernels, "entries": entries}
+
+    def _branch_cells(self, root_frame_id: str, branch_id: str) -> list[dict]:
+        def local(selected: str) -> list[dict]:
+            try:
+                return self.store.list_cells(root_frame_id, branch_id=selected)
+            except TypeError as error:
+                # Lightweight compatibility stores predate branch filtering.
+                # They can still truthfully represent the canonical root.
+                if selected != root_frame_id or "branch_id" not in str(error):
+                    raise
+                return self.store.list_cells(root_frame_id)
+
+        return project_branch_records(
+            self.store,
+            root_frame_id,
+            branch_id,
+            list_local=local,
+            record_position=lambda cell: int(
+                cell.get("state_revision") or cell.get("cell_index") or 0
+            ),
+            cursor_key="cell_cursor",
+        )
 
     def artifact_lineage(self, artifact_id: str) -> dict:
         artifact = self.store.get_artifact(artifact_id)
@@ -173,6 +244,44 @@ class ExecutionViewService:
 
 
 __all__ = ["ExecutionViewService"]
+
+
+def _with_dependency_defaults(cell: dict) -> dict:
+    """Keep the view compatible with legacy/fake stores during migrations."""
+
+    projected = dict(cell)
+    source = projected.get("code") or ""
+    language = projected.get("language") or "python"
+    static = analyze_code(source, language)
+    projected["code_hash"] = projected.get("code_hash") or static.code_hash
+    for key, fallback in (
+        ("variable_reads", static.reads),
+        ("variable_writes", static.writes),
+        ("variable_deletes", static.deletes),
+    ):
+        value = projected.get(key)
+        projected[key] = list(
+            normalize_string_list(fallback if value is None else value)
+        )
+    projected["mutation_uncertain"] = bool(
+        projected.get("mutation_uncertain", static.uncertain)
+    )
+    visibility = projected.get("visibility") or default_visibility(
+        projected.get("origin")
+    )
+    projected["visibility"] = (
+        visibility if visibility in VISIBILITIES else "scientific"
+    )
+    projected["pin"] = bool(projected.get("pin"))
+    replay_policy = projected.get("replay_policy") or default_replay_policy(
+        projected["visibility"]
+    )
+    projected["replay_policy"] = (
+        replay_policy
+        if replay_policy in REPLAY_POLICIES
+        else default_replay_policy(projected["visibility"])
+    )
+    return projected
 
 
 def _continues_failed_attempt(

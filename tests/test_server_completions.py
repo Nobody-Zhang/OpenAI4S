@@ -115,17 +115,24 @@ def test_code_outcome_narration_uses_real_error_and_redacts_secrets():
     assert "hidden source" not in text
 
 
-def test_code_only_success_narrates_actual_output_shape_not_generic_action():
+def test_code_only_success_has_honest_running_and_actual_output_status():
     action = CodeCell("python", "print('a')\nprint('b')")
     outcome = ExecutionOutcome(
         observation="[Observation]\nstdout:\na\nb\n[usage wall=0.1s cpu=0.1s rss=1kb]"
     )
 
-    assert action_narration(action) == ""
+    running = action_narration(action)
+    assert "running it now" in running
+    assert "actual output" in running
+    assert "print('a')" not in running
     text = outcome_narration(action, outcome, "en", had_public_prose=False)
     assert "2 stdout line(s)" in text
     assert "running this analysis stage" not in text
-    assert outcome_narration(action, outcome, had_public_prose=True) == ""
+    # Pre-action prose describes intent, not the execution result, so it must
+    # not suppress the short post-Cell status.
+    assert "2 stdout line(s)" in outcome_narration(
+        action, outcome, had_public_prose=True
+    )
 
 
 def test_agent_prompt_never_claims_post_fence_prose_runs_after_submit():
@@ -133,6 +140,8 @@ def test_agent_prompt_never_claims_post_fence_prose_runs_after_submit():
     assert "Only prose BEFORE the action fence is user-visible" in SYSTEM_PROMPT
     assert "NEVER `import host`" in SYSTEM_PROMPT
     assert "1-4 completed" in SYSTEM_PROMPT
+    assert "complete repair cell" in SYSTEM_PROMPT
+    assert "only the tail" in SYSTEM_PROMPT
     assert all(
         key in SYSTEM_PROMPT
         for key in ("summary", "findings", "metrics", "limitations")

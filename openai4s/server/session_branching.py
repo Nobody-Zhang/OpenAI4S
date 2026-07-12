@@ -30,6 +30,10 @@ class SnapshotRepository(Protocol):
 
     def get_checkpoint(self, checkpoint_id: str) -> dict[str, Any] | None: ...
 
+    def get_checkpoint_for_source(
+        self, root_frame_id: str, *, source_kind: str, source_id: str
+    ) -> dict[str, Any] | None: ...
+
     def get_branch(self, branch_id: str) -> dict[str, Any] | None: ...
 
     def list_branches(self, root_frame_id: str) -> list[dict[str, Any]]: ...
@@ -53,6 +57,9 @@ class CheckpointRequest:
     reason: str
     expected_head: str | None = None
     metadata: Mapping[str, Any] | None = None
+    source_kind: str | None = None
+    source_id: str | None = None
+    internal: bool = False
 
 
 class SessionBranchingService:
@@ -81,6 +88,9 @@ class SessionBranchingService:
         reason: str = "manual",
         expected_head: str | None = None,
         metadata: Mapping[str, Any] | None = None,
+        source_kind: str | None = None,
+        source_id: str | None = None,
+        internal: bool = False,
     ) -> dict[str, Any]:
         branch_id = branch_id or root_frame_id
         request = CheckpointRequest(
@@ -89,6 +99,9 @@ class SessionBranchingService:
             reason=reason,
             expected_head=expected_head,
             metadata=metadata,
+            source_kind=source_kind,
+            source_id=source_id,
+            internal=internal,
         )
         return self._capture_checkpoint(request)
 
@@ -99,6 +112,8 @@ class SessionBranchingService:
         from_checkpoint_id: str,
         branch_id: str | None = None,
         name: str | None = None,
+        source_kind: str = "checkpoint",
+        source_id: str | None = None,
     ) -> dict[str, Any]:
         source = self._checkpoint(root_frame_id, from_checkpoint_id)
         branch_id = branch_id or f"br-{uuid.uuid4().hex[:16]}"
@@ -125,6 +140,8 @@ class SessionBranchingService:
                 "root_frame_id": root_frame_id,
                 "branch_id": created["branch_id"],
                 "from_checkpoint_id": from_checkpoint_id,
+                "source_kind": source_kind,
+                "source_id": source_id or from_checkpoint_id,
             }
         )
         return created
@@ -140,10 +157,7 @@ class SessionBranchingService:
         source = Path(self._workspace(root_frame_id, source_branch_id)).resolve()
         destination = Path(self._workspace(root_frame_id, branch_id)).resolve()
         if destination == source:
-            return {
-                "workspace_isolated": False,
-                "workspace_materialized": False,
-            }
+            raise RuntimeError("fork workspace must be isolated from its source")
         if destination.exists() and any(destination.iterdir()):
             raise RuntimeError("fork workspace already exists and is not empty")
         destination.mkdir(parents=True, exist_ok=True)
@@ -361,6 +375,23 @@ class SessionBranchingService:
                 "reverted_to": target_checkpoint_id,
                 "undo_checkpoint_id": undo["checkpoint_id"],
                 "requires_kernel_recovery": True,
+                # The checkpoint's public cursors describe the restored target,
+                # while these physical cursors mark where new append-only rows
+                # resume on the current branch.  Readers project the target
+                # prefix and append only rows after this boundary, leaving the
+                # abandoned interval auditable but invisible to the next turn.
+                "history_projection": {
+                    "version": 1,
+                    "base_checkpoint_id": target_checkpoint_id,
+                    "resume_cursors": {
+                        key: undo.get(key)
+                        for key in (
+                            "action_cursor",
+                            "message_cursor",
+                            "cell_cursor",
+                        )
+                    },
+                },
             },
             expected_head=undo["checkpoint_id"],
         )
@@ -439,42 +470,56 @@ class SessionBranchingService:
     def _capture_checkpoint(self, request: CheckpointRequest) -> dict[str, Any]:
         state = dict(self._read_state(request.root_frame_id, request.branch_id) or {})
         workspace = self._workspace(request.root_frame_id, request.branch_id)
-        tree = self.cas.capture(workspace, exclude=state.get("snapshot_exclude") or ())
-        metadata = dict(state.get("metadata") or {})
-        metadata.update(dict(request.metadata or {}))
-        if tree.get("skipped"):
-            metadata["workspace_skipped"] = tree["skipped"]
-        recovery_recipe = self._checkpoint_recipe(
-            state.get("recovery_recipe"),
-            tree_id=tree["tree_id"],
-            artifact_versions=state.get("artifact_versions") or [],
-        )
-        checkpoint = self.repository.create_checkpoint(
-            root_frame_id=request.root_frame_id,
-            branch_id=request.branch_id,
-            reason=request.reason,
-            workspace_tree_id=tree["tree_id"],
-            action_cursor=state.get("action_cursor"),
-            message_cursor=state.get("message_cursor"),
-            cell_cursor=state.get("cell_cursor"),
-            artifact_versions=state.get("artifact_versions") or [],
-            environment_pins=state.get("environment_pins") or {},
-            generation_refs=state.get("generation_refs") or {},
-            capability_state=state.get("capability_state") or {},
-            permission_state=state.get("permission_state") or {},
-            recovery_recipe=recovery_recipe,
-            metadata=metadata,
-            expected_head=request.expected_head,
-        )
-        self._emit(
-            {
-                "type": "checkpoint_created",
-                "root_frame_id": request.root_frame_id,
-                "branch_id": request.branch_id,
-                "checkpoint_id": checkpoint["checkpoint_id"],
-                "reason": request.reason,
-            }
-        )
+        # The CAS lock spans both sides of the CAS -> SQLite publication
+        # boundary.  Session deletion takes the same lock before refreshing
+        # surviving checkpoint references, preventing an in-flight capture
+        # from losing its tree between these two operations.
+        with self.cas.locked():
+            tree = self.cas.capture(
+                workspace, exclude=state.get("snapshot_exclude") or ()
+            )
+            metadata = dict(state.get("metadata") or {})
+            metadata.update(dict(request.metadata or {}))
+            if tree.get("skipped"):
+                metadata["workspace_skipped"] = tree["skipped"]
+            recovery_recipe = self._checkpoint_recipe(
+                state.get("recovery_recipe"),
+                tree_id=tree["tree_id"],
+                artifact_versions=state.get("artifact_versions") or [],
+            )
+            checkpoint = self.repository.create_checkpoint(
+                root_frame_id=request.root_frame_id,
+                branch_id=request.branch_id,
+                reason=request.reason,
+                workspace_tree_id=tree["tree_id"],
+                action_cursor=state.get("action_cursor"),
+                message_cursor=state.get("message_cursor"),
+                cell_cursor=state.get("cell_cursor"),
+                artifact_versions=state.get("artifact_versions") or [],
+                environment_pins=state.get("environment_pins") or {},
+                generation_refs=state.get("generation_refs") or {},
+                capability_state=state.get("capability_state") or {},
+                permission_state=state.get("permission_state") or {},
+                recovery_recipe=recovery_recipe,
+                metadata=metadata,
+                source_kind=request.source_kind,
+                source_id=request.source_id,
+                internal=request.internal,
+                expected_head=request.expected_head,
+            )
+        # Cursor checkpoints are implementation history.  Their durable row is
+        # the audit proof; emitting one Timeline group per Cell/message would
+        # drown the scientific actions they protect.
+        if not request.internal:
+            self._emit(
+                {
+                    "type": "checkpoint_created",
+                    "root_frame_id": request.root_frame_id,
+                    "branch_id": request.branch_id,
+                    "checkpoint_id": checkpoint["checkpoint_id"],
+                    "reason": request.reason,
+                }
+            )
         return checkpoint
 
     @staticmethod
