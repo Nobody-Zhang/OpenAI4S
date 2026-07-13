@@ -336,7 +336,11 @@ def test_normalize_metrics_and_formulas():
         dG_O=2.0, dG_OH=1.0, dG_OOH=3.8
     )
     assert isinstance(op, float)
+    assert op == pytest.approx(0.23)
     assert rds in steps
+    # RDS is the bottleneck (max-dG) step that sets the limiting potential,
+    # NOT the most-downhill (min-dG) step. Locks the argmax fix in place.
+    assert rds == "deltaG_OH - deltaG_O"
 
 
 def test_lean_pipeline_deliverables(tmp_path: Path, monkeypatch):
@@ -425,3 +429,84 @@ def test_metal_center_ranking_and_report_helpers():
     assert "uma-s-1p1" in md
     html = funcs["render_sar_dashboard"](analysis)
     assert "sar-data" in html
+
+
+def test_all_catalog_metals_are_recognized_and_dissolution_support():
+    """Every advertised catalog metal must be a recognized center; U_diss support
+    is gated on vendored data (never fabricated)."""
+    funcs = _import_skill()
+    sys.path.insert(0, str(get_config().skills_dir))
+    from catalyst_sar_screening import kernel as k  # noqa: PLC0415
+
+    catalog = funcs["load_contcar_catalog"]()
+    catalog_metals = {e["metal"] for e in catalog["entries"]}
+    # Guards the get_vnn_idx IndexError: the active center is found via METALS.
+    assert catalog_metals.issubset(set(k.METALS)), catalog_metals - set(k.METALS)
+
+    supported = k.supported_dissolution_metals()
+    assert {"Fe", "Mn", "Cu"}.issubset(supported)
+    for metal in supported:
+        assert metal.lower() in k.METAL_REDUCTION_POTENTIAL
+        assert metal.lower() in k.METAL_REFERENCE_ENERGIES
+    # Rh/Os are catalog metals with no vendored reduction/reference data.
+    assert k.unsupported_dissolution_metals(["Fe", "Rh", "Cu", "Os"]) == ["Os", "Rh"]
+    assert k.unsupported_dissolution_metals(["Fe", "Mn", "Cu"]) == []
+
+
+def test_adsorption_mode_still_exports_a_figure(tmp_path: Path):
+    """metrics=['adsorption'] must yield a statistical figure, not a RuntimeError."""
+    sys.path.insert(0, str(get_config().skills_dir))
+    from catalyst_sar_screening import kernel as k  # noqa: PLC0415
+
+    analysis = {
+        "mode": "adsorption",
+        "ranked": [
+            {
+                "name": "Fe-N4",
+                "metal": "Fe",
+                "adsorption_energies": {"*OH": 0.9},
+                "converged": True,
+            },
+            {
+                "name": "Co-N4",
+                "metal": "Co",
+                "adsorption_energies": {"*OH": 1.4},
+                "converged": True,
+            },
+        ],
+    }
+    figures = k.export_publication_figures(analysis, tmp_path / "figures")
+    assert figures, "adsorption mode must still produce a statistical figure"
+    assert Path(figures[0]["png_path"]).is_file()
+    assert figures[0]["id"] == "fig01_oh_adsorption"
+
+
+def test_parse_poscar_negative_scale_and_truncation():
+    sys.path.insert(0, str(get_config().skills_dir))
+    from catalyst_sar_screening import kernel as k  # noqa: PLC0415
+
+    # Negative scale is the target cell VOLUME (VASP convention), not a multiplier:
+    # a 3x3x3 raw cell (V=27) with scale -216 rescales uniformly to V=216 (6x6x6).
+    poscar = "cube\n-216.0\n3 0 0\n0 3 0\n0 0 3\nH\n1\nCartesian\n0 0 0\n"
+    parsed = k.parse_poscar(poscar)
+    assert parsed["lattice"][0][0] == pytest.approx(6.0)
+    assert abs(k._lattice_determinant(parsed["lattice"])) == pytest.approx(216.0)
+
+    # More declared atoms than coordinate lines -> clear ValueError, not IndexError.
+    truncated = "cube\n1.0\n3 0 0\n0 3 0\n0 0 3\nH\n2\nCartesian\n0 0 0\n"
+    with pytest.raises(ValueError):
+        k.parse_poscar(truncated)
+
+
+def test_build_poscars_sanitizes_structured_names(tmp_path: Path):
+    """A structured description name cannot escape the output dir via '..'."""
+    sys.path.insert(0, str(get_config().skills_dir))
+    from catalyst_sar_screening import kernel as k  # noqa: PLC0415
+
+    out = tmp_path / "poscars"
+    built = k.build_poscars_from_descriptions(
+        [{"metal": "Fe", "name": "../../../../evil"}], out
+    )
+    written = Path(built[0]["poscar_path"]).resolve()
+    assert out.resolve() in written.parents
+    assert "/" not in Path(written).name.replace(".POSCAR", "")

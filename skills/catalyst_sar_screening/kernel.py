@@ -61,6 +61,20 @@ METALS = [
     "Zn",
     "Sn",
     "Bi",
+    # Remaining metal centers present in contcar_catalog.json. Listed so the
+    # active center is detected (get_vnn_idx keys off METALS) for every vendored
+    # slab; dissolution screening additionally requires the energy tables below.
+    "Rh",
+    "Os",
+    "Re",
+    "W",
+    "Sc",
+    "Y",
+    "Zr",
+    "Nb",
+    "Tc",
+    "Cd",
+    "Hf",
 ]
 COORDATOMS = ["N", "S", "O", "C", "H"]
 HETEROATOMS = ["N", "S", "P", "B", "C"]
@@ -303,7 +317,10 @@ def build_poscars_from_descriptions(
     used: dict[str, int] = {}
     for description in descriptions:
         recipe = parse_structure_description(description)
-        base = recipe["name"]
+        # Sanitize before using the name as a filename so a structured
+        # description cannot escape output_dir via path separators or '..'
+        # (mirrors export_structure_collage). recipe["name"] itself is untouched.
+        base = re.sub(r"[^\w.\-]+", "_", str(recipe["name"])) or "struct"
         count = used.get(base, 0)
         used[base] = count + 1
         filename = f"{base}.POSCAR" if count == 0 else f"{base}_{count + 1}.POSCAR"
@@ -963,7 +980,9 @@ class CalculationTools:
             "deltaG_OH - deltaG_O",
             "0.00 - deltaG_OH",
         ]
-        rds = labels[int(np.argmax(-dGs))]
+        # The potential/rate-determining step is the bottleneck (largest dG),
+        # the same step that sets U_L = -max(dGs) below — hence argmax, not argmin.
+        rds = labels[int(np.argmax(dGs))]
         return float(ORR_EQUILIBRIUM_POTENTIAL - (-np.max(dGs))), rds
 
     def evaluate_structure(
@@ -1040,7 +1059,9 @@ def calculate_orr_overpotential(
         "0.00 - deltaG_OH": 0.0 - dG_OH,
     }
     values = list(steps.values())
-    rds = list(steps.keys())[int(max(range(len(values)), key=lambda i: -values[i]))]
+    # RDS is the bottleneck step (largest dG), the same one that fixes
+    # u_lim = -max(values) below; select argmax over the raw step energies.
+    rds = list(steps.keys())[int(max(range(len(values)), key=lambda i: values[i]))]
     u_lim = -max(values)
     return float(ORR_EQUILIBRIUM_POTENTIAL - u_lim), rds, steps
 
@@ -1253,6 +1274,30 @@ def normalize_metrics(metrics: list[str] | None) -> list[str]:
     return out
 
 
+def supported_dissolution_metals() -> set[str]:
+    """Metal centers with BOTH a vendored reduction potential and reference energy.
+
+    Dissolution potential is ``U_diss = SRP - E_bind / n_e``; a metal missing
+    from either table cannot be screened and no value is fabricated for it.
+    """
+    return {
+        _canonical_metal(metal)
+        for metal in METAL_REDUCTION_POTENTIAL
+        if metal in METAL_REFERENCE_ENERGIES
+    }
+
+
+def unsupported_dissolution_metals(metals: Iterable[str]) -> list[str]:
+    """Requested metals that lack the vendored data needed for U_diss (sorted, unique)."""
+    supported = supported_dissolution_metals()
+    missing: dict[str, None] = {}
+    for metal in metals:
+        symbol = _canonical_metal(str(metal))
+        if symbol not in supported:
+            missing[symbol] = None
+    return sorted(missing)
+
+
 # ---------------------------------------------------------------------------
 # Evaluation + SAR analysis
 # ---------------------------------------------------------------------------
@@ -1266,6 +1311,24 @@ def evaluate_poscars(
     reaction: str = DEFAULT_REACTION,
 ) -> list[dict[str, Any]]:
     """Evaluate POSCARs with UMA only. Raises ask-user errors on readiness failure."""
+    requested = normalize_metrics(metrics)
+    # Dissolution (and ORR, which also computes U_diss) needs vendored reduction
+    # + reference energies. Fail fast with a clear message for metals we cannot
+    # screen, rather than IndexError/KeyError deep in the UMA path — and never
+    # fabricate the missing constants.
+    if "dissolution" in requested or "orr" in requested:
+        unsupported = unsupported_dissolution_metals(
+            str(meta.get("metal") or "") for meta in built
+        )
+        if unsupported:
+            raise ValueError(
+                "Dissolution potential needs vendored reduction + reference "
+                "energies (U_diss = SRP - E_bind / n_e); none are fabricated. "
+                "No reference data for: " + ", ".join(unsupported) + ". "
+                "Choose metals from the supported set: "
+                + ", ".join(sorted(supported_dissolution_metals()))
+                + "."
+            )
     require_uma_ready(require_cuda=False)
     try:
         calc = CalculationTools(calculator_name="UMA")
@@ -1278,7 +1341,6 @@ def evaluate_poscars(
 
     from ase.io import read
 
-    requested = normalize_metrics(metrics)
     results = []
     for meta in built:
         atoms = read(str(meta["poscar_path"]))
@@ -1510,12 +1572,25 @@ def _build_insights(
 # ---------------------------------------------------------------------------
 
 
+def _lattice_determinant(matrix: list[list[float]]) -> float:
+    (a, b, c), (d, e, f), (g, h, i) = matrix
+    return a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+
+
 def parse_poscar(text: str) -> dict[str, Any]:
     raw = text.splitlines()
     if len(raw) < 8:
         raise ValueError("POSCAR is too short")
     scale = float(raw[1].split()[0])
-    lattice = [[scale * float(x) for x in raw[i].split()[:3]] for i in range(2, 5)]
+    lattice_raw = [[float(x) for x in raw[i].split()[:3]] for i in range(2, 5)]
+    if scale < 0:
+        # VASP convention: a negative value is the target cell VOLUME, not a
+        # linear multiplier — rescale the lattice vectors uniformly to it.
+        volume = abs(_lattice_determinant(lattice_raw))
+        factor = (abs(scale) / volume) ** (1.0 / 3.0) if volume else 1.0
+    else:
+        factor = scale
+    lattice = [[factor * component for component in row] for row in lattice_raw]
     species = raw[5].split()
     if not species or not re.search(r"[A-Za-z]", species[0]):
         raise ValueError("POSCAR missing species names")
@@ -1530,7 +1605,11 @@ def parse_poscar(text: str) -> dict[str, Any]:
     symbols = [sym for sym, count in zip(species, counts) for _ in range(count)]
     coords = []
     for i, _symbol in enumerate(symbols):
+        if idx + i >= len(raw):
+            raise ValueError("POSCAR declares more atoms than it has coordinate lines")
         parts = raw[idx + i].split()
+        if len(parts) < 3:
+            raise ValueError("POSCAR coordinate line has fewer than 3 components")
         vec = [float(parts[0]), float(parts[1]), float(parts[2])]
         if coord_mode == "d":
             coords.append(
@@ -1602,6 +1681,37 @@ def export_publication_figures(
                     "id": "fig01_udiss_by_metal",
                     "title": "Dissolution potential by metal center",
                     "caption": f"U_diss for {len(metals)} metal centers.",
+                    "png": png.name,
+                    "relative_png": f"figures/{png.name}",
+                    "png_path": str(png.resolve()),
+                }
+            )
+    elif mode == "adsorption":
+        usable = [
+            r
+            for r in ranked
+            if (r.get("adsorption_energies") or {}).get("*OH") is not None
+            and r.get("name")
+        ]
+        if usable:
+            names = [str(r["name"]) for r in usable]
+            vals = [float(r["adsorption_energies"]["*OH"]) for r in usable]
+            fig, ax = plt.subplots(figsize=(max(4.8, 0.42 * len(names) + 1.2), 3.4))
+            ax.bar(range(len(names)), vals, color="#1f4e79", width=0.72)
+            ax.set_xticks(range(len(names)))
+            ax.set_xticklabels(names, rotation=30, ha="right")
+            ax.set_ylabel(r"$\Delta G_{\mathrm{*OH}}$ / eV")
+            ax.set_title("*OH adsorption free energy by candidate")
+            ax.axhline(0.0, color="#7a8b84", linewidth=0.6)
+            fig.tight_layout()
+            png = out / "fig01_oh_adsorption.png"
+            fig.savefig(png, dpi=200)
+            plt.close(fig)
+            figures.append(
+                {
+                    "id": "fig01_oh_adsorption",
+                    "title": "*OH adsorption free energy by candidate",
+                    "caption": f"OH adsorption free energy for {len(names)} candidates.",
                     "png": png.name,
                     "relative_png": f"figures/{png.name}",
                     "png_path": str(png.resolve()),
