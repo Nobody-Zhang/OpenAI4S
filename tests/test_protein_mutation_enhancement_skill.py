@@ -119,3 +119,51 @@ def test_suggest_next_positions_uses_rank_order(pm):
     ]
 
     assert pm.suggest_next_positions(ranked, max_positions=2) == [2, 1]
+
+
+def test_selection_round_seeds_feed_back_into_enumerate(pm):
+    # Regression: the documented Loop Pattern feeds next_round_seeds straight
+    # back into enumerate_mutants. This previously raised TypeError because the
+    # seeds were ranked dicts without a top-level position.
+    seq = "ACDEFGHIKL"
+    library = pm.enumerate_mutants(seq, positions=[2, 5], max_order=1)
+    scores = {item["id"]: {"esm_delta": 0.0, "plddt": 50.0} for item in library}
+    result = pm.run_selection_round(
+        candidates=library,
+        score_tables=[scores],
+        acceptance_thresholds={"esm_delta": 5.0},
+    )
+    seeds = result["next_round_seeds"]
+    assert seeds
+    assert all(isinstance(s, str) for s in seeds)
+    next_library = pm.enumerate_mutants(
+        seq, positions=[2, 5, 7], max_order=2, seeds=seeds
+    )
+    assert next_library
+    next_ids = {item["id"] for item in next_library}
+    assert set(seeds) <= next_ids
+
+
+def test_rank_mutants_rejects_explicit_empty_weights(pm):
+    candidates = [
+        {
+            "id": "A1V",
+            "sequence": "VCDEF",
+            "mutations": [{"from": "A", "position": 1, "to": "V"}],
+            "order": 1,
+        }
+    ]
+    scores = {"A1V": {"esm_delta": 1.0}}
+    with pytest.raises(ValueError, match="weights must not be empty"):
+        pm.rank_mutants(candidates, score_tables=[scores], weights={})
+
+
+def test_out_of_range_tuple_mutation_raises_clear_error(pm):
+    with pytest.raises(ValueError, match="exceeds sequence length"):
+        pm.normalize_mutations([(99, "V")], "ACDEF")
+
+
+def test_variant_dict_without_position_raises_clear_error(pm):
+    variant = {"id": "A1V", "mutations": [{"from": "A", "position": 1, "to": "V"}]}
+    with pytest.raises(ValueError, match="missing a position"):
+        pm.normalize_mutations(variant)

@@ -139,8 +139,11 @@ def normalize_mutations(
 ) -> list[dict]:
     """Normalize mutation strings, dicts, or tuples into sorted mutation dicts.
 
-    Accepted forms include `"A12V+G47D"`, `{"from":"A","position":12,"to":"V"}`,
-    `(12, "V")` when `sequence` is available, and `("A", 12, "V")`.
+    Accepted forms: the string `"A12V+G47D"`; a single mapping
+    `{"from":"A","position":12,"to":"V"}`; or a list whose items are each a
+    string, mapping, or tuple such as `("A", 12, "V")` / `(12, "V")` (the
+    2-tuple requires `sequence`). A bare top-level tuple is iterated as a
+    sequence of items, so wrap a single tuple in a list, e.g. `[("A", 12, "V")]`.
     """
     if mutations is None:
         return []
@@ -312,11 +315,11 @@ def rank_mutants(
     acceptance_thresholds: Mapping[str, float] | None = None,
 ) -> list[dict]:
     """Merge score tables, normalize metrics, and rank candidates."""
+    if weights is not None and not weights:
+        raise ValueError("weights must not be empty")
     weights = dict(weights or {"esm_delta": 0.5, "plddt": 0.3, "property_score": 0.2})
     directions = {k: v.lower() for k, v in (directions or {}).items()}
     thresholds = dict(acceptance_thresholds or {})
-    if not weights:
-        raise ValueError("weights must not be empty")
     if any(v < 0 for v in weights.values()):
         raise ValueError("weights must be non-negative; use directions for low metrics")
     total_weight = sum(weights.values())
@@ -381,7 +384,9 @@ def run_selection_round(
         "ranked": ranked,
         "accepted": accepted,
         "should_continue": not bool(accepted),
-        "next_round_seeds": ranked[:top_k] if not accepted else [],
+        "next_round_seeds": (
+            [row["id"] for row in ranked[:top_k]] if not accepted else []
+        ),
     }
 
 
@@ -415,11 +420,14 @@ def _coerce_mutation(item, sequence: str | None) -> dict:
     if isinstance(item, str):
         return parse_mutation(item, sequence)
     if isinstance(item, Mapping):
-        pos = int(item.get("position", item.get("pos")))
+        pos_raw = item.get("position", item.get("pos"))
+        if pos_raw is None:
+            raise ValueError(f"mutation mapping is missing a position: {item!r}")
+        pos = int(pos_raw)
         wt = str(item.get("from", item.get("wt", ""))).upper()
         aa = str(item.get("to", item.get("mutant", item.get("aa", "")))).upper()
         if not wt and sequence is not None:
-            wt = validate_sequence(sequence)[pos - 1]
+            wt = _residue_at(sequence, pos)
         if not wt or not aa:
             raise ValueError(f"mutation mapping is missing from/to: {item!r}")
         return parse_mutation(f"{wt}{pos}{aa}", sequence)
@@ -428,7 +436,7 @@ def _coerce_mutation(item, sequence: str | None) -> dict:
             if sequence is None:
                 raise ValueError("(position, to) mutations require sequence")
             pos = int(item[0])
-            wt = validate_sequence(sequence)[pos - 1]
+            wt = _residue_at(sequence, pos)
             return parse_mutation(f"{wt}{pos}{str(item[1]).upper()}", sequence)
         if len(item) == 3:
             wt, pos, aa = item
@@ -585,3 +593,11 @@ def _is_number(value) -> bool:
 
 def _clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, float(value)))
+
+
+def _residue_at(sequence: str, pos: int) -> str:
+    """Return the 1-indexed wild-type residue, raising on out-of-range positions."""
+    seq = validate_sequence(sequence)
+    if pos < 1 or pos > len(seq):
+        raise ValueError(f"mutation position {pos} exceeds sequence length")
+    return seq[pos - 1]
